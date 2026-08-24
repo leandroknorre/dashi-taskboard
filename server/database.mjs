@@ -4,6 +4,11 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { DEFAULT_LABEL_NAMES, JIRA_PROJECT_ID } from "../shared/domain.mjs";
+import {
+  DEFAULT_PARENT_RELATION_METADATA_JSON,
+  parentRelationMetadataFromStored,
+  parentRelationMetadataJson,
+} from "../shared/relation-metadata.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
 const TASK_TREE_MAX_NODES = 1_000;
@@ -196,12 +201,13 @@ function taskFieldChanges(task, changes) {
   });
 }
 
-function relationActivityValue(type, task) {
+function relationActivityValue(type, task, metadata) {
   return {
     type,
     identifier: task.identifier,
     externalKey: task.externalKey ?? null,
     title: task.title,
+    ...(type === "parent" ? { metadata } : {}),
   };
 }
 
@@ -287,6 +293,9 @@ function taskRelationSummaryFromRow(row) {
       avatarUrl: row.assignee_avatar_url,
     },
     archivedAt: row.archived_at,
+    ...(row.relation_metadata === undefined ? {} : {
+      metadata: parentRelationMetadataFromStored(row.relation_metadata),
+    }),
   };
 }
 
@@ -810,6 +819,7 @@ export class TaskboardDatabase {
         source_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
         target_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
         origin TEXT NOT NULL DEFAULT 'manual' CHECK (origin IN ('manual', 'mention')),
+        metadata TEXT NOT NULL DEFAULT '${DEFAULT_PARENT_RELATION_METADATA_JSON}',
         created_at TEXT NOT NULL,
         CHECK (source_task_id <> target_task_id),
         CHECK (relation_type <> 'related' OR source_task_id < target_task_id),
@@ -863,6 +873,12 @@ export class TaskboardDatabase {
         ALTER TABLE task_relations
         ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'
           CHECK (origin IN ('manual', 'mention'))
+      `);
+    }
+    if (!taskRelationColumns.some((column) => column.name === "metadata")) {
+      this.database.exec(`
+        ALTER TABLE task_relations
+        ADD COLUMN metadata TEXT NOT NULL DEFAULT '${DEFAULT_PARENT_RELATION_METADATA_JSON}'
       `);
     }
 
@@ -2337,7 +2353,7 @@ export class TaskboardDatabase {
     }
   }
 
-  addTaskRelation(id, version, type, relatedId, threadId, threadBinding, actor, origin = "manual") {
+  addTaskRelation(id, version, type, relatedId, threadId, threadBinding, actor, origin = "manual", metadata) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
@@ -2350,15 +2366,34 @@ export class TaskboardDatabase {
         task.id,
         relatedTask.id,
       );
+      const metadataJson = relationType === "parent"
+        ? parentRelationMetadataJson(metadata)
+        : DEFAULT_PARENT_RELATION_METADATA_JSON;
       if (relationType === "parent") {
         this.#assertNoParentCycle(task.id, relatedTask.id);
         const existing = this.database.prepare(`
-          SELECT source_task_id
+          SELECT source_task_id, metadata
           FROM task_relations
           WHERE relation_type = 'parent' AND target_task_id = ?
         `).get(task.id);
         if (existing?.source_task_id === relatedTask.id) {
-          throw new ApiError(409, "RELATION_EXISTS", "This parent relation already exists");
+          if (existing.metadata === metadataJson) {
+            this.database.exec("COMMIT");
+            return { task: this.getTask(task.id), relatedTask: this.getTask(relatedTask.id) };
+          }
+          this.database.prepare(`
+            UPDATE task_relations SET metadata = ?
+            WHERE relation_type = 'parent' AND target_task_id = ?
+          `).run(metadataJson, task.id);
+          const timestamp = now();
+          this.#touchTask(task.id, version, threadId, threadBinding, timestamp);
+          this.#recordTaskActivity(task.id, actor, [{
+            field: "relation",
+            before: relationActivityValue(type, relatedTask, parentRelationMetadataFromStored(existing.metadata)),
+            after: relationActivityValue(type, relatedTask, parentRelationMetadataFromStored(metadataJson)),
+          }], timestamp);
+          this.database.exec("COMMIT");
+          return { task: this.getTask(task.id), relatedTask: this.getTask(relatedTask.id) };
         }
         if (existing) {
           this.database.prepare(`
@@ -2379,24 +2414,68 @@ export class TaskboardDatabase {
 
       const timestamp = now();
       const previousRelation = type === "parent" && task.relations.parent
-        ? relationActivityValue(type, task.relations.parent)
+        ? relationActivityValue(type, task.relations.parent, task.relations.parent.metadata)
         : null;
       this.database.prepare(`
         INSERT INTO task_relations (
-          relation_type, source_task_id, target_task_id, origin, created_at
-        ) VALUES (?, ?, ?, ?, ?)
-      `).run(relationType, sourceTaskId, targetTaskId, origin, timestamp);
+          relation_type, source_task_id, target_task_id, origin, metadata, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `).run(relationType, sourceTaskId, targetTaskId, origin, metadataJson, timestamp);
       this.#touchTask(task.id, version, threadId, threadBinding, timestamp);
       this.#recordTaskActivity(task.id, actor, [{
         field: "relation",
         before: previousRelation,
-        after: relationActivityValue(type, relatedTask),
+        after: relationActivityValue(
+          type,
+          relatedTask,
+          relationType === "parent" ? parentRelationMetadataFromStored(metadataJson) : undefined,
+        ),
       }], timestamp);
       this.database.exec("COMMIT");
       return {
         task: this.getTask(task.id),
         relatedTask: this.getTask(relatedTask.id),
       };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  updateTaskRelation(id, version, type, relatedId, metadata, threadId, threadBinding, actor) {
+    if (type !== "parent") {
+      throw new ApiError(400, "INVALID_FIELD", "Only parent relations have composition metadata");
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(id);
+      const relatedTask = this.#requireTask(relatedId);
+      this.#requireVersion(task, version);
+      this.#validateRelationTasks(task, relatedTask);
+      const { relationType, sourceTaskId, targetTaskId } = this.#relationEndpoints(type, task.id, relatedTask.id);
+      const relation = this.database.prepare(`
+        SELECT metadata FROM task_relations
+        WHERE relation_type = ? AND source_task_id = ? AND target_task_id = ?
+      `).get(relationType, sourceTaskId, targetTaskId);
+      if (!relation) throw new ApiError(404, "RELATION_NOT_FOUND", "This issue relation does not exist");
+      const metadataJson = parentRelationMetadataJson(metadata, { required: true });
+      if (relation.metadata === metadataJson) {
+        this.database.exec("COMMIT");
+        return { task: this.getTask(task.id), relatedTask: this.getTask(relatedTask.id) };
+      }
+      const timestamp = now();
+      this.database.prepare(`
+        UPDATE task_relations SET metadata = ?
+        WHERE relation_type = ? AND source_task_id = ? AND target_task_id = ?
+      `).run(metadataJson, relationType, sourceTaskId, targetTaskId);
+      this.#touchTask(task.id, version, threadId, threadBinding, timestamp);
+      this.#recordTaskActivity(task.id, actor, [{
+        field: "relation",
+        before: relationActivityValue(type, relatedTask, parentRelationMetadataFromStored(relation.metadata)),
+        after: relationActivityValue(type, relatedTask, parentRelationMetadataFromStored(metadataJson)),
+      }], timestamp);
+      this.database.exec("COMMIT");
+      return { task: this.getTask(task.id), relatedTask: this.getTask(relatedTask.id) };
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
@@ -2416,7 +2495,7 @@ export class TaskboardDatabase {
         relatedTask.id,
       );
       const relation = this.database.prepare(`
-        SELECT origin
+        SELECT origin, metadata
         FROM task_relations
         WHERE relation_type = ? AND source_task_id = ? AND target_task_id = ?
       `).get(relationType, sourceTaskId, targetTaskId);
@@ -2486,7 +2565,11 @@ export class TaskboardDatabase {
       this.#touchTask(task.id, version, threadId, threadBinding, timestamp);
       this.#recordTaskActivity(task.id, actor, [{
         field: "relation",
-        before: relationActivityValue(type, relatedTask),
+        before: relationActivityValue(
+          type,
+          relatedTask,
+          relationType === "parent" ? parentRelationMetadataFromStored(relation.metadata) : undefined,
+        ),
         after: null,
       }], timestamp);
       this.database.exec("COMMIT");
@@ -2823,14 +2906,14 @@ export class TaskboardDatabase {
   #taskWithRelations(row) {
     const task = taskFromRow(row);
     const parent = this.database.prepare(`
-      SELECT tasks.*
+      SELECT tasks.*, task_relations.metadata AS relation_metadata
       FROM task_relations
       JOIN tasks ON tasks.id = task_relations.source_task_id
       WHERE task_relations.relation_type = 'parent'
         AND task_relations.target_task_id = ?
     `).get(task.id);
     const subIssues = this.database.prepare(`
-      SELECT tasks.*
+      SELECT tasks.*, task_relations.metadata AS relation_metadata
       FROM task_relations
       JOIN tasks ON tasks.id = task_relations.target_task_id
       WHERE task_relations.relation_type = 'parent'
@@ -2882,6 +2965,7 @@ export class TaskboardDatabase {
       throw new ApiError(400, "SELF_RELATION", "An issue cannot be related to itself");
     }
     if (task.projectId !== relatedTask.projectId) {
+      // Cross-project composition remains intentionally unavailable pending an ownership policy.
       throw new ApiError(400, "CROSS_PROJECT_RELATION", "Issue relations must stay within one project");
     }
   }

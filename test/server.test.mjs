@@ -774,6 +774,67 @@ test("issues support parent, sub-issue, blocking, and related issue relationship
   assert.equal(crossProjectRelation.body.error.code, "CROSS_PROJECT_RELATION");
 });
 
+test("parent composition metadata defaults, updates atomically, and leaves lateral relations inert", async () => {
+  const baseUrl = await startServer();
+  const createIssue = async (title) => (
+    (await request(baseUrl, "/api/tasks", { method: "POST", body: { title } })).body.task
+  );
+  const parent = await createIssue("Composition parent");
+  const child = await createIssue("Optional composition child");
+  const blocker = await createIssue("Composition blocker");
+  const relationPath = (type, related) => (
+    `/api/tasks/${child.id}/relations/${type}/${related.id}`
+  );
+
+  const added = await request(baseUrl, relationPath("parent", parent), {
+    method: "POST",
+    body: { version: child.version },
+  });
+  assert.equal(added.response.status, 200);
+  assert.deepEqual(added.body.task.relations.parent.metadata, { required: true, rollup: true });
+
+  const updated = await request(baseUrl, relationPath("parent", parent), {
+    method: "PATCH",
+    body: { version: added.body.task.version, metadata: { required: false, rollup: false } },
+  });
+  assert.equal(updated.response.status, 200);
+  assert.deepEqual(updated.body.task.relations.parent.metadata, { required: false, rollup: false });
+  assert.deepEqual((await request(baseUrl, `/api/tasks/${child.id}/activities`)).body.activities.at(-1).changes[0].after.metadata, {
+    required: false,
+    rollup: false,
+  });
+
+  const replay = await request(baseUrl, relationPath("parent", parent), {
+    method: "PATCH",
+    body: { version: updated.body.task.version, metadata: { required: false, rollup: false } },
+  });
+  assert.equal(replay.response.status, 200);
+  assert.equal(replay.body.task.version, updated.body.task.version);
+
+  const stale = await request(baseUrl, relationPath("parent", parent), {
+    method: "PATCH",
+    body: { version: added.body.task.version, metadata: { required: true, rollup: true } },
+  });
+  assert.equal(stale.response.status, 409);
+  for (const metadata of [
+    { required: true },
+    { required: true, rollup: true, extra: false },
+  ]) {
+    const invalid = await request(baseUrl, relationPath("parent", parent), {
+      method: "PATCH",
+      body: { version: updated.body.task.version, metadata },
+    });
+    assert.equal(invalid.response.status, 400);
+  }
+
+  const lateral = await request(baseUrl, relationPath("blocks", blocker), {
+    method: "POST",
+    body: { version: updated.body.task.version, metadata: { required: false, rollup: false } },
+  });
+  assert.equal(lateral.response.status, 200);
+  assert.equal(Object.hasOwn(lateral.body.task.relations.blocks[0], "metadata"), false);
+});
+
 test("issue tree returns deterministic direct and nested parent paths without changing relation APIs", async () => {
   const baseUrl = await startServer();
   const createIssue = async (title, projectId = "local") => {

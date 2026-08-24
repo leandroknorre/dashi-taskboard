@@ -1,6 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
 
 import { DEFAULT_LABEL_NAMES } from "../../shared/domain.mjs";
+import {
+  DEFAULT_PARENT_RELATION_METADATA_JSON,
+  normalizeParentRelationMetadata,
+  parentRelationMetadataFromStored,
+  parentRelationMetadataJson,
+} from "../../shared/relation-metadata.mjs";
 
 const JSON_BODY_LIMIT = 1024 * 1024;
 const PROJECT_README_BODY_LIMIT = 3 * 1024 * 1024;
@@ -847,11 +853,12 @@ function taskFieldChanges(task, changes) {
   });
 }
 
-function relationActivityValue(type, task) {
+function relationActivityValue(type, task, metadata) {
   return {
     type,
     identifier: task.identifier,
     title: task.title,
+    ...(type === "parent" ? { metadata } : {}),
   };
 }
 
@@ -907,6 +914,9 @@ function taskRelationSummaryFromRow(row) {
       avatarUrl: row.assignee_avatar_url,
     },
     archivedAt: row.archived_at,
+    ...(row.relation_metadata === undefined ? {} : {
+      metadata: parentRelationMetadataFromStored(row.relation_metadata),
+    }),
   };
 }
 
@@ -1054,14 +1064,14 @@ async function hydrateTask(env, row, activityComments = null, activityChanges = 
   const task = taskFromRow(row);
   const [parent, subIssues, blockedBy, blocks, related, previewImageRow] = await Promise.all([
     env.DB.prepare(`
-      SELECT tasks.*
+      SELECT tasks.*, task_relations.metadata AS relation_metadata
       FROM task_relations
       JOIN tasks ON tasks.id = task_relations.source_task_id
       WHERE task_relations.relation_type = 'parent'
         AND task_relations.target_task_id = ?
     `).bind(task.id).first(),
     all(env.DB.prepare(`
-      SELECT tasks.*
+      SELECT tasks.*, task_relations.metadata AS relation_metadata
       FROM task_relations
       JOIN tasks ON tasks.id = task_relations.target_task_id
       WHERE task_relations.relation_type = 'parent'
@@ -1397,14 +1407,23 @@ function parseRelationOrigin(value) {
   return value;
 }
 
-function parseRelationMutation(body) {
+function parseRelationMutation(body, type, method) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["version", "threadId", "threadBinding", "origin"]));
+  assertAllowedKeys(body, new Set(["version", "threadId", "threadBinding", "origin", "metadata"]));
+  let metadata;
+  if (type === "parent" && method !== "DELETE") {
+    try {
+      metadata = normalizeParentRelationMetadata(body.metadata, { required: method === "PATCH" });
+    } catch (error) {
+      throw new ApiError(400, "INVALID_FIELD", error.message);
+    }
+  }
   return {
     version: parseVersion(body.version),
     threadId: parseThreadId(body.threadId),
     threadBinding: parseThreadBinding(body.threadBinding),
     origin: parseRelationOrigin(body.origin),
+    metadata,
   };
 }
 
@@ -2271,6 +2290,7 @@ async function assertRelationTasks(env, taskId, relatedTaskId, expectedVersion) 
     throw new ApiError(400, "SELF_RELATION", "An issue cannot be related to itself");
   }
   if (task.project_id !== relatedTask.project_id) {
+    // Cross-project composition remains intentionally unavailable pending an ownership policy.
     throw new ApiError(
       400,
       "CROSS_PROJECT_RELATION",
@@ -2288,6 +2308,9 @@ async function addRelation(env, taskId, type, relatedTaskId, input, actor) {
     input.version,
   );
   const endpoints = relationEndpoints(type, task.id, relatedTask.id);
+  const metadataJson = endpoints.relationType === "parent"
+    ? parentRelationMetadataJson(input.metadata)
+    : DEFAULT_PARENT_RELATION_METADATA_JSON;
   const timestamp = now();
   const storedBinding = storedThreadBindingForExisting(task, input.threadBinding, input.threadId);
   const threadAssignment = storedBinding
@@ -2314,16 +2337,26 @@ async function addRelation(env, taskId, type, relatedTaskId, input, actor) {
       throw new ApiError(409, "RELATION_CYCLE", "This parent would create a cycle");
     }
     const existing = await env.DB.prepare(`
-      SELECT source_task_id
+      SELECT source_task_id, metadata
       FROM task_relations
       WHERE relation_type = 'parent' AND target_task_id = ?
     `).bind(task.id).first();
     if (existing?.source_task_id === relatedTask.id) {
-      throw new ApiError(409, "RELATION_EXISTS", "This parent relation already exists");
+      if (existing.metadata === metadataJson) {
+        return { task: await getTask(env, task.id), relatedTask: await getTask(env, relatedTask.id) };
+      }
+      return updateRelation(env, taskId, type, relatedTaskId, {
+        ...input,
+        metadata: parentRelationMetadataFromStored(metadataJson),
+      }, actor);
     }
     if (existing) {
       const previousParent = await requireTaskRow(env, existing.source_task_id);
-      previousRelation = relationActivityValue(type, taskFromRow(previousParent));
+      previousRelation = relationActivityValue(
+        type,
+        taskFromRow(previousParent),
+        parentRelationMetadataFromStored(existing.metadata),
+      );
       statements.push(
         env.DB.prepare(`
           DELETE FROM task_relations
@@ -2352,9 +2385,9 @@ async function addRelation(env, taskId, type, relatedTaskId, input, actor) {
   statements.push(
     env.DB.prepare(`
       INSERT INTO task_relations (
-        relation_type, source_task_id, target_task_id, origin, created_at
+        relation_type, source_task_id, target_task_id, origin, metadata, created_at
       )
-      SELECT ?, ?, ?, ?, ?
+      SELECT ?, ?, ?, ?, ?, ?
       WHERE EXISTS (
         SELECT 1 FROM tasks WHERE id = ? AND version = ?
       )
@@ -2363,6 +2396,7 @@ async function addRelation(env, taskId, type, relatedTaskId, input, actor) {
       endpoints.sourceTaskId,
       endpoints.targetTaskId,
       input.origin ?? "manual",
+      metadataJson,
       timestamp,
       task.id,
       input.version,
@@ -2384,7 +2418,11 @@ async function addRelation(env, taskId, type, relatedTaskId, input, actor) {
     [{
       field: "relation",
       before: previousRelation,
-      after: relationActivityValue(type, taskFromRow(relatedTask)),
+      after: relationActivityValue(
+        type,
+        taskFromRow(relatedTask),
+        endpoints.relationType === "parent" ? parentRelationMetadataFromStored(metadataJson) : undefined,
+      ),
     }],
     timestamp,
     input.version + 1,
@@ -2427,6 +2465,53 @@ async function addRelation(env, taskId, type, relatedTaskId, input, actor) {
   };
 }
 
+async function updateRelation(env, taskId, type, relatedTaskId, input, actor) {
+  if (type !== "parent") {
+    throw new ApiError(400, "INVALID_FIELD", "Only parent relations have composition metadata");
+  }
+  const { task, relatedTask } = await assertRelationTasks(env, taskId, relatedTaskId, input.version);
+  const endpoints = relationEndpoints(type, task.id, relatedTask.id);
+  const relation = await env.DB.prepare(`
+    SELECT metadata FROM task_relations
+    WHERE relation_type = ? AND source_task_id = ? AND target_task_id = ?
+  `).bind(endpoints.relationType, endpoints.sourceTaskId, endpoints.targetTaskId).first();
+  if (!relation) throw new ApiError(404, "RELATION_NOT_FOUND", "This issue relation does not exist");
+  const metadataJson = parentRelationMetadataJson(input.metadata, { required: true });
+  if (relation.metadata === metadataJson) {
+    return { task: await getTask(env, task.id), relatedTask: await getTask(env, relatedTask.id) };
+  }
+  const timestamp = now();
+  const storedBinding = storedThreadBindingForExisting(task, input.threadBinding, input.threadId);
+  const threadAssignment = storedBinding
+    ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
+      thread_codex_host_id = ?, thread_workspace_path = ?,`
+    : "";
+  const results = await env.DB.batch([
+    env.DB.prepare(`
+      UPDATE task_relations SET metadata = ?
+      WHERE relation_type = ? AND source_task_id = ? AND target_task_id = ?
+        AND EXISTS (SELECT 1 FROM tasks WHERE id = ? AND version = ?)
+    `).bind(metadataJson, endpoints.relationType, endpoints.sourceTaskId, endpoints.targetTaskId, task.id, input.version),
+    env.DB.prepare(`
+      UPDATE tasks SET ${threadAssignment} version = version + 1, updated_at = ?
+      WHERE id = ? AND version = ?
+    `).bind(...(storedBinding ?? []), timestamp, task.id, input.version),
+    taskActivityStatement(env, task.id, actor, [{
+      field: "relation",
+      before: relationActivityValue(type, taskFromRow(relatedTask), parentRelationMetadataFromStored(relation.metadata)),
+      after: relationActivityValue(type, taskFromRow(relatedTask), parentRelationMetadataFromStored(metadataJson)),
+    }], timestamp, input.version + 1),
+  ]);
+  if (!changed(results[1])) {
+    const latest = await requireTaskRow(env, task.id);
+    throw new ApiError(409, "VERSION_CONFLICT", "Task was changed by another client", {
+      expectedVersion: input.version,
+      actualVersion: latest.version,
+    });
+  }
+  return { task: await getTask(env, task.id), relatedTask: await getTask(env, relatedTask.id) };
+}
+
 async function removeRelation(env, taskId, type, relatedTaskId, input, actor) {
   const { task, relatedTask } = await assertRelationTasks(
     env,
@@ -2436,7 +2521,7 @@ async function removeRelation(env, taskId, type, relatedTaskId, input, actor) {
   );
   const endpoints = relationEndpoints(type, task.id, relatedTask.id);
   const relation = await env.DB.prepare(`
-    SELECT origin
+    SELECT origin, metadata
     FROM task_relations
     WHERE relation_type = ? AND source_task_id = ? AND target_task_id = ?
   `).bind(
@@ -2537,7 +2622,11 @@ async function removeRelation(env, taskId, type, relatedTaskId, input, actor) {
       actor,
       [{
         field: "relation",
-        before: relationActivityValue(type, taskFromRow(relatedTask)),
+        before: relationActivityValue(
+          type,
+          taskFromRow(relatedTask),
+          endpoints.relationType === "parent" ? parentRelationMetadataFromStored(relation.metadata) : undefined,
+        ),
         after: null,
       }],
       timestamp,
@@ -3206,14 +3295,17 @@ async function routeApi(request, env, actor, url) {
     const taskId = decodePathPart(relationMatch[1], "Task id");
     const type = decodePathPart(relationMatch[2], "Relation type");
     const relatedTaskId = decodePathPart(relationMatch[3], "Related task id");
-    const input = parseRelationMutation(await readJson(request));
+    const input = parseRelationMutation(await readJson(request), type, request.method);
     if (request.method === "POST") {
       return json(200, await addRelation(env, taskId, type, relatedTaskId, input, actor));
     }
     if (request.method === "DELETE") {
       return json(200, await removeRelation(env, taskId, type, relatedTaskId, input, actor));
     }
-    methodNotAllowed(["POST", "DELETE"]);
+    if (request.method === "PATCH") {
+      return json(200, await updateRelation(env, taskId, type, relatedTaskId, input, actor));
+    }
+    methodNotAllowed(["POST", "PATCH", "DELETE"]);
   }
 
   const taskActivitiesMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/activities$/);
