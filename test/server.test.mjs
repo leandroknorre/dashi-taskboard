@@ -915,6 +915,138 @@ test("issues support parent, sub-issue, blocking, and related issue relationship
   assert.equal(crossProjectRelation.body.error.code, "CROSS_PROJECT_RELATION");
 });
 
+test("issue tree returns deterministic direct and nested parent paths without changing relation APIs", async () => {
+  const baseUrl = await startServer();
+  const createIssue = async (title, projectId = "local") => {
+    const result = await request(baseUrl, "/api/tasks", {
+      method: "POST",
+      body: { projectId, title },
+    });
+    assert.equal(result.response.status, 201);
+    return result.body.task;
+  };
+  const latest = async (id) => (await request(baseUrl, `/api/tasks/${id}`)).body.task;
+  const addParent = async (child, parent) => request(
+    baseUrl,
+    `/api/tasks/${child.id}/relations/parent/${parent.id}`,
+    { method: "POST", body: { version: child.version } },
+  );
+
+  const root = await createIssue("Tree root");
+  const first = await createIssue("Tree first");
+  const second = await createIssue("Tree second");
+  const grandchild = await createIssue("Tree grandchild");
+  const greatGrandchild = await createIssue("Tree great-grandchild");
+  for (const [child, parent] of [
+    [first, root],
+    [second, root],
+    [grandchild, first],
+    [greatGrandchild, grandchild],
+  ]) {
+    assert.equal((await addParent(child, parent)).response.status, 200);
+  }
+
+  const direct = await request(
+    baseUrl,
+    `/api/tasks/${root.id}/tree?direction=descendants&depth=1`,
+  );
+  assert.equal(direct.response.status, 200);
+  assert.equal(direct.body.tree.nodeCount, 3);
+  const directChildIds = direct.body.tree.nodes.slice(1).map((node) => node.id);
+  assert.deepEqual([...directChildIds].sort(), [first.id, second.id].sort());
+  assert.ok(direct.body.tree.nodes.every((node) => (
+    node.depth === 0 ? node.parentId === null : node.parentId === root.id
+  )));
+  const directRepeat = await request(
+    baseUrl,
+    `/api/tasks/${root.id}/tree?direction=descendants&depth=1`,
+  );
+  assert.deepEqual(directRepeat.body.tree.nodes, direct.body.tree.nodes);
+
+  const descendants = await request(
+    baseUrl,
+    `/api/tasks/${root.id}/tree?direction=descendants&depth=3`,
+  );
+  assert.equal(descendants.response.status, 200);
+  assert.deepEqual(descendants.body.tree.nodes.map((node) => node.id), [
+    root.id,
+    ...directChildIds,
+    grandchild.id,
+    greatGrandchild.id,
+  ]);
+  assert.deepEqual(descendants.body.tree.nodes.slice(-2).map((node) => [node.parentId, node.depth]), [
+    [first.id, 2],
+    [grandchild.id, 3],
+  ]);
+  assert.deepEqual(descendants.body.tree.nodes.at(-1).path, [
+    root.id,
+    first.id,
+    grandchild.id,
+    greatGrandchild.id,
+  ]);
+  assert.deepEqual(descendants.body.tree.nodes.at(-1).summary, {
+    identifier: greatGrandchild.identifier,
+    title: "Tree great-grandchild",
+    status: "backlog",
+    priority: "none",
+    archivedAt: null,
+  });
+
+  const ancestors = await request(
+    baseUrl,
+    `/api/tasks/${greatGrandchild.id}/tree?direction=ancestors&depth=3`,
+  );
+  assert.equal(ancestors.response.status, 200);
+  assert.deepEqual(ancestors.body.tree.nodes.map((node) => [node.id, node.parentId, node.depth]), [
+    [greatGrandchild.id, null, 0],
+    [grandchild.id, greatGrandchild.id, 1],
+    [first.id, grandchild.id, 2],
+    [root.id, first.id, 3],
+  ]);
+
+  const reparented = await addParent(await latest(grandchild.id), await latest(second.id));
+  assert.equal(reparented.response.status, 200);
+  const afterReparent = await request(
+    baseUrl,
+    `/api/tasks/${root.id}/tree?direction=descendants&depth=3`,
+  );
+  assert.deepEqual(afterReparent.body.tree.nodes.map((node) => node.id), [
+    root.id,
+    ...directChildIds,
+    grandchild.id,
+    greatGrandchild.id,
+  ]);
+  assert.deepEqual(afterReparent.body.tree.nodes.find((node) => node.id === grandchild.id).path, [
+    root.id,
+    second.id,
+    grandchild.id,
+  ]);
+
+  const invalidDepth = await request(
+    baseUrl,
+    `/api/tasks/${root.id}/tree?direction=descendants&depth=26`,
+  );
+  assert.equal(invalidDepth.response.status, 400);
+  assert.equal(invalidDepth.body.error.code, "INVALID_TREE_QUERY");
+
+  const database = runningApps.at(-1).app.database.database;
+  assert.throws(() => database.prepare(`
+    INSERT INTO task_relations (relation_type, source_task_id, target_task_id, origin, created_at)
+    VALUES ('parent', ?, ?, 'manual', ?)
+  `).run(greatGrandchild.id, root.id, new Date().toISOString()), /RELATION_CYCLE/);
+
+  const otherProject = await request(baseUrl, "/api/projects", {
+    method: "POST",
+    body: { id: "tree-other", name: "Tree other" },
+  });
+  assert.equal(otherProject.response.status, 201);
+  const external = await createIssue("Tree external", "tree-other");
+  assert.throws(() => database.prepare(`
+    INSERT INTO task_relations (relation_type, source_task_id, target_task_id, origin, created_at)
+    VALUES ('blocks', ?, ?, 'manual', ?)
+  `).run(root.id, external.id, new Date().toISOString()), /CROSS_PROJECT_RELATION/);
+});
+
 test("issue relationship changes are broadcast in realtime", async () => {
   const baseUrl = await startServer();
   const first = (await request(baseUrl, "/api/tasks", {

@@ -878,6 +878,28 @@ function parseTaskFilters(searchParams) {
   return { projectId, status: statusValue ?? undefined, archived };
 }
 
+function parseTaskTreeQuery(searchParams) {
+  const allowed = new Set(["direction", "depth"]);
+  for (const key of searchParams.keys()) {
+    if (!allowed.has(key)) {
+      throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", `Unknown query parameter '${key}'`);
+    }
+    if (searchParams.getAll(key).length !== 1) {
+      throw new ApiError(400, "INVALID_TREE_QUERY", `Query parameter '${key}' cannot be repeated`);
+    }
+  }
+  const direction = searchParams.get("direction");
+  if (direction !== "descendants" && direction !== "ancestors") {
+    throw new ApiError(400, "INVALID_TREE_QUERY", "'direction' must be descendants or ancestors");
+  }
+  const rawDepth = searchParams.get("depth");
+  const depth = Number(rawDepth);
+  if (!/^\d+$/.test(rawDepth ?? "") || !Number.isSafeInteger(depth) || depth < 1 || depth > 25) {
+    throw new ApiError(400, "INVALID_TREE_QUERY", "'depth' must be an integer from 1 to 25");
+  }
+  return { direction, depth };
+}
+
 function parseAiSandbox(value) {
   if (value === undefined) return undefined;
   if (!["read-only", "workspace-write", "danger-full-access"].includes(value)) {
@@ -3020,6 +3042,22 @@ export function createTaskboardServer(options = {}) {
         const task = database.getTask(attachment.taskId);
         events.emit("attachment.deleted", { attachment, task });
         return sendEmpty(response, 204);
+      }
+
+      const taskTreeRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/tree$/);
+      if (taskTreeRoute) {
+        let id;
+        try {
+          id = decodeURIComponent(taskTreeRoute[1]);
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Task id contains invalid encoding");
+        }
+        if (id.length === 0 || id.length > 128) {
+          throw new ApiError(400, "INVALID_PATH", "Task id is invalid");
+        }
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        const { direction, depth } = parseTaskTreeQuery(url.searchParams);
+        return sendJson(response, 200, { tree: database.getTaskTree(id, direction, depth) });
       }
 
       const taskRoute = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(archive|restore|move))?$/);
