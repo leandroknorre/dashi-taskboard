@@ -20,6 +20,7 @@ import {
 import { resolveCodexExecutable } from "../shared/codex-executable.mjs";
 import { normalizeStageWorkflowDefinition } from "../shared/board-workflow.mjs";
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
+import { normalizeParentRelationMetadata } from "../shared/relation-metadata.mjs";
 import { AiChatService } from "./ai-chat.mjs";
 import { resolveAiWorkspace, resolveMappedAiWorkspace } from "./ai-chat-catalog.mjs";
 import { decodeComposerReferenceKey } from "./composer-reference.mjs";
@@ -723,14 +724,23 @@ function parseRelationOrigin(value) {
   return value;
 }
 
-function parseRelationMutation(body) {
+function parseRelationMutation(body, type, method) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["version", "threadId", "threadBinding", "origin"]));
+  assertAllowedKeys(body, new Set(["version", "threadId", "threadBinding", "origin", "metadata"]));
+  let metadata;
+  if (type === "parent" && method !== "DELETE") {
+    try {
+      metadata = normalizeParentRelationMetadata(body.metadata, { required: method === "PATCH" });
+    } catch (error) {
+      throw new ApiError(400, "INVALID_FIELD", error.message);
+    }
+  }
   return {
     version: parseVersion(body.version),
     threadId: parseThreadId(body.threadId),
     threadBinding: parseThreadBinding(body.threadBinding),
     origin: parseRelationOrigin(body.origin),
+    metadata,
   };
 }
 
@@ -2755,8 +2765,8 @@ export function createTaskboardServer(options = {}) {
         }
         const relationType = parseIssueRelationType(type);
         if (request.method === "POST") {
-          const { version, threadId, threadBinding, origin } = resolveInputThreadBinding(
-            parseRelationMutation(await readJson(request)),
+          const { version, threadId, threadBinding, origin, metadata } = resolveInputThreadBinding(
+            parseRelationMutation(await readJson(request), relationType, request.method),
           );
           const result = database.addTaskRelation(
             taskId,
@@ -2767,13 +2777,14 @@ export function createTaskboardServer(options = {}) {
             threadBinding,
             actorFromRequest(request),
             origin,
+            metadata,
           );
           events.emit("task.relation.updated", result);
           return sendJson(response, 200, result);
         }
         if (request.method === "DELETE") {
           const { version, threadId, threadBinding, origin } = resolveInputThreadBinding(
-            parseRelationMutation(await readJson(request)),
+            parseRelationMutation(await readJson(request), relationType, request.method),
           );
           const result = database.removeTaskRelation(
             taskId,
@@ -2788,7 +2799,24 @@ export function createTaskboardServer(options = {}) {
           events.emit("task.relation.updated", result);
           return sendJson(response, 200, result);
         }
-        return methodNotAllowed(response, ["POST", "DELETE"]);
+        if (request.method === "PATCH") {
+          const { version, threadId, threadBinding, metadata } = resolveInputThreadBinding(
+            parseRelationMutation(await readJson(request), relationType, request.method),
+          );
+          const result = database.updateTaskRelation(
+            taskId,
+            version,
+            relationType,
+            relatedTaskId,
+            metadata,
+            threadId,
+            threadBinding,
+            actorFromRequest(request),
+          );
+          events.emit("task.relation.updated", result);
+          return sendJson(response, 200, result);
+        }
+        return methodNotAllowed(response, ["POST", "PATCH", "DELETE"]);
       }
 
       const taskActivitiesRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/activities$/);

@@ -427,6 +427,28 @@ test("issue relation add and remove use typed relation endpoints", async () => {
   });
 });
 
+test("issue relation update sends canonical parent composition metadata", async () => {
+  let call;
+  const result = await run(
+    [
+      "issue", "relation", "update", "TASK-1", "--type", "parent", "--issue", "TASK-2",
+      "--metadata", '{"required":false,"rollup":true}', "--if-version", "4",
+    ],
+    async (url, init) => {
+      call = { url, init };
+      return response({ task: { id: "TASK-1", version: 5 }, relatedTask: { id: "TASK-2" } });
+    },
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(call.url.pathname, "/api/tasks/TASK-1/relations/parent/TASK-2");
+  assert.equal(call.init.method, "PATCH");
+  assert.deepEqual(JSON.parse(call.init.body), {
+    threadId: "thread-current",
+    version: 4,
+    metadata: { required: false, rollup: true },
+  });
+});
+
 test("issue tree uses the bounded directional tree endpoint", async () => {
   let requestedUrl;
   const result = await run(

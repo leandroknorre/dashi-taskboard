@@ -977,6 +977,58 @@ test("relation direction, deletion, and parent-cycle checks match the local cont
   assert.equal(cycle.body.error.code, "RELATION_CYCLE");
 });
 
+test("cloud parent composition metadata defaults, validates, updates, and round-trips", async () => {
+  const projectId = "composition-cloud";
+  await createProject(projectId);
+  const parent = await createTask(projectId, "Composition parent");
+  const child = await createTask(projectId, "Composition child");
+  const blocker = await createTask(projectId, "Composition blocker");
+  const pathFor = (type, related) => (
+    `/api/tasks/${child.body.task.id}/relations/${type}/${related.body.task.id}`
+  );
+  const added = await cloud.request(pathFor("parent", parent), {
+    method: "POST", actorName: alice, json: { version: child.body.task.version },
+  });
+  assert.equal(added.response.status, 200);
+  assert.deepEqual(added.body.task.relations.parent.metadata, { required: true, rollup: true });
+
+  const updated = await cloud.request(pathFor("parent", parent), {
+    method: "PATCH",
+    actorName: alice,
+    json: { version: added.body.task.version, metadata: { required: false, rollup: true } },
+  });
+  assert.equal(updated.response.status, 200);
+  assert.deepEqual(updated.body.task.relations.parent.metadata, { required: false, rollup: true });
+  const replay = await cloud.request(pathFor("parent", parent), {
+    method: "PATCH",
+    actorName: alice,
+    json: { version: updated.body.task.version, metadata: { required: false, rollup: true } },
+  });
+  assert.equal(replay.response.status, 200);
+  assert.equal(replay.body.task.version, updated.body.task.version);
+
+  const invalid = await cloud.request(pathFor("parent", parent), {
+    method: "PATCH",
+    actorName: alice,
+    json: { version: updated.body.task.version, metadata: { required: false, rollup: true, extra: true } },
+  });
+  assert.equal(invalid.response.status, 400);
+  const stale = await cloud.request(pathFor("parent", parent), {
+    method: "PATCH",
+    actorName: alice,
+    json: { version: added.body.task.version, metadata: { required: true, rollup: true } },
+  });
+  assert.equal(stale.response.status, 409);
+
+  const lateral = await cloud.request(pathFor("blocks", blocker), {
+    method: "POST",
+    actorName: alice,
+    json: { version: updated.body.task.version, metadata: { required: false, rollup: false } },
+  });
+  assert.equal(lateral.response.status, 200);
+  assert.equal(Object.hasOwn(lateral.body.task.relations.blocks[0], "metadata"), false);
+});
+
 test("tree queries keep direct and nested ancestor/descendant traversal in cloud parity", async () => {
   const projectId = "tree-cloud-parity";
   await createProject(projectId);

@@ -16,6 +16,7 @@ import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 
 import { DEFAULT_LABEL_NAMES } from "../shared/domain.mjs";
+import { DEFAULT_PARENT_RELATION_METADATA_JSON } from "../shared/relation-metadata.mjs";
 
 const SCHEMA_VERSION = 3;
 const WRANGLER_D1_STATEMENT_MAX_BYTES = 90_000;
@@ -449,7 +450,7 @@ const CLOUD_COLUMNS = {
     "author_type", "author_id", "author_name",
     "author_avatar_url", "version", "created_at", "updated_at", "change_revision",
   ],
-  task_relations: ["relation_type", "source_task_id", "target_task_id", "created_at"],
+  task_relations: ["relation_type", "source_task_id", "target_task_id", "metadata", "created_at"],
   attachments: [
     "id", "task_id", "comment_id", "kind", "filename", "content_type", "size", "created_at",
     "change_revision",
@@ -488,7 +489,11 @@ export function createCloudD1ImportPlan(tables) {
     const values = cloudRows(table, tables).map((row) => (
       Object.fromEntries(columns.map((column) => [
         column,
-        column === "change_revision" ? row[column] ?? 0 : row[column] ?? null,
+        column === "change_revision"
+          ? row[column] ?? 0
+          : table === "task_relations" && column === "metadata"
+            ? row[column] ?? DEFAULT_PARENT_RELATION_METADATA_JSON
+            : row[column] ?? null,
       ]))
     ));
     return { table, sql: insertTableSql(table), json: JSON.stringify(values) };

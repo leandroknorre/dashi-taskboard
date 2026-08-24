@@ -93,7 +93,7 @@ const COMMAND_OPTIONS = new Map([
   ["issue archive", new Set(["thread-id", "if-version", "json"])],
   ["issue restore", new Set(["thread-id", "if-version", "json"])],
   ["issue tree", new Set(["direction", "depth", "json"])],
-  ["issue relation", new Set(["type", "issue", "thread-id", "if-version", "json"])],
+  ["issue relation", new Set(["type", "issue", "metadata", "thread-id", "if-version", "json"])],
   ["comment list", new Set(["after", "json"])],
   ["comment add", new Set([
     "body",
@@ -176,8 +176,9 @@ Actions:
   archive ISSUE_ID [--thread-id ID] [--if-version N] [--json]
   restore ISSUE_ID [--thread-id ID] [--if-version N] [--json]
   tree ISSUE_ID --direction descendants|ancestors --depth N [--json]
-  relation add|remove ISSUE_ID --type parent|blocks|blocked_by|related
-    --issue RELATED_ISSUE_ID [--thread-id ID] [--if-version N] [--json]
+  relation add|update|remove ISSUE_ID --type parent|blocks|blocked_by|related
+    --issue RELATED_ISSUE_ID [--metadata '{"required":true,"rollup":true}']
+    [--thread-id ID] [--if-version N] [--json]
 
 Statuses: backlog, todo, in_progress, in_review, blocked, done, canceled
 Priorities: none, urgent, high, medium, low
@@ -991,8 +992,8 @@ async function getIssueTree(api, taskId, options) {
 }
 
 async function mutateIssueRelation(api, action, taskId, options, overrides) {
-  if (action !== "add" && action !== "remove") {
-    throw usageError("issue relation action must be add or remove");
+  if (action !== "add" && action !== "update" && action !== "remove") {
+    throw usageError("issue relation action must be add, update, or remove");
   }
   const type = requiredOption(options, "type");
   if (!["parent", "blocks", "blocked_by", "related"].includes(type)) {
@@ -1001,10 +1002,24 @@ async function mutateIssueRelation(api, action, taskId, options, overrides) {
   const relatedTaskId = requiredOption(options, "issue");
   const threadId = resolveThreadId(options, overrides);
   const version = await resolveVersion(api, taskId, options["if-version"]);
+  let metadata;
+  if (options.metadata !== undefined) {
+    try {
+      metadata = JSON.parse(options.metadata);
+    } catch {
+      throw usageError("--metadata must be a JSON object");
+    }
+  }
+  if (action === "update" && type !== "parent") {
+    throw usageError("issue relation update only supports --type parent");
+  }
+  if (action === "update" && metadata === undefined) {
+    throw usageError("issue relation update requires --metadata");
+  }
   return api.request(
-    action === "add" ? "POST" : "DELETE",
+    action === "add" ? "POST" : action === "update" ? "PATCH" : "DELETE",
     `${taskPath(taskId)}/relations/${type}/${encodeURIComponent(relatedTaskId)}`,
-    { threadId, version },
+    { threadId, version, ...(metadata === undefined ? {} : { metadata }) },
   );
 }
 
