@@ -21,6 +21,7 @@ import { resolveCodexExecutable } from "../shared/codex-executable.mjs";
 import { normalizeStageWorkflowDefinition } from "../shared/board-workflow.mjs";
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
 import { normalizeParentRelationMetadata } from "../shared/relation-metadata.mjs";
+import { parseNestedWorkspaceQuery } from "../shared/nested-workspace.mjs";
 import { AiChatService } from "./ai-chat.mjs";
 import { resolveAiWorkspace, resolveMappedAiWorkspace } from "./ai-chat-catalog.mjs";
 import { decodeComposerReferenceKey } from "./composer-reference.mjs";
@@ -3104,6 +3105,25 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Task rollup routes do not accept query parameters");
         }
         return sendJson(response, 200, { rollup: database.getTaskRollup(id) });
+      }
+
+      const nestedWorkspaceRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/workspace$/);
+      if (nestedWorkspaceRoute) {
+        let id;
+        try {
+          id = decodeURIComponent(nestedWorkspaceRoute[1]);
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Task id contains invalid encoding");
+        }
+        if (id.length === 0 || id.length > 128) {
+          throw new ApiError(400, "INVALID_PATH", "Task id is invalid");
+        }
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        const options = parseNestedWorkspaceQuery(
+          url.searchParams,
+          (code, message) => new ApiError(400, code, message),
+        );
+        return sendJson(response, 200, { workspace: database.getNestedWorkspace(id, options) });
       }
 
       const taskRoute = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(archive|restore|move))?$/);

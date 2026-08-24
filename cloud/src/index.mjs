@@ -8,6 +8,13 @@ import {
   parentRelationMetadataJson,
 } from "../../shared/relation-metadata.mjs";
 import { calculateTaskRollup } from "../../shared/task-rollup.mjs";
+import {
+  NESTED_WORKSPACE_MAX_NODES,
+  paginateWorkspaceItems,
+  parseNestedWorkspaceQuery,
+  workspaceItemFromRow,
+  workspaceOverviewFromTask,
+} from "../../shared/nested-workspace.mjs";
 
 const JSON_BODY_LIMIT = 1024 * 1024;
 const PROJECT_README_BODY_LIMIT = 3 * 1024 * 1024;
@@ -1270,6 +1277,93 @@ async function getTaskRollup(env, id) {
     )),
     maxNodes: TASK_TREE_MAX_NODES,
   });
+}
+
+async function getNestedWorkspace(env, id, options) {
+  const root = await requireTaskRow(env, id);
+  const error = (code, message) => new ApiError(409, code, message);
+  const parentRow = async (taskId) => env.DB.prepare(`
+    SELECT tasks.*
+    FROM task_relations
+    JOIN tasks ON tasks.id = task_relations.source_task_id
+    WHERE task_relations.relation_type = 'parent'
+      AND task_relations.target_task_id = ?
+  `).bind(taskId).first();
+  const childRows = async (parentId) => all(env.DB.prepare(`
+    SELECT tasks.*
+    FROM task_relations
+    JOIN tasks ON tasks.id = task_relations.target_task_id
+    WHERE task_relations.relation_type = 'parent'
+      AND task_relations.source_task_id = ?
+    ORDER BY tasks.sort_order, tasks.created_at, tasks.id
+  `).bind(parentId));
+  const ancestorRows = [root];
+  const seenAncestors = new Set([root.id]);
+  let current = root;
+  while (true) {
+    const parent = await parentRow(current.id);
+    if (!parent) break;
+    if (parent.project_id !== root.project_id) {
+      throw error("CROSS_PROJECT_WORKSPACE", "Nested workspace items must stay within one project");
+    }
+    if (seenAncestors.has(parent.id)) {
+      throw error("NESTED_WORKSPACE_CYCLE", "Nested workspace contains a parent cycle");
+    }
+    seenAncestors.add(parent.id);
+    ancestorRows.unshift(parent);
+    current = parent;
+  }
+  const breadcrumb = ancestorRows.map((row, depth) => workspaceItemFromRow(row, {
+    depth,
+    path: ancestorRows.slice(0, depth + 1).map((entry) => entry.id),
+  }));
+  const directChildren = (await childRows(root.id)).map((row) => {
+    if (row.project_id !== root.project_id) {
+      throw error("CROSS_PROJECT_WORKSPACE", "Nested workspace items must stay within one project");
+    }
+    return workspaceItemFromRow(row, { parentId: root.id, depth: 1, path: [root.id, row.id] });
+  });
+  const workspace = {
+    overview: workspaceOverviewFromTask(await getTask(env, root.id)),
+    breadcrumb,
+    children: paginateWorkspaceItems(directChildren, options, error),
+  };
+  if (!options.descendants) return workspace;
+
+  const descendants = [];
+  const seen = new Set([root.id]);
+  let frontier = [{ id: root.id, path: [root.id] }];
+  while (frontier.length > 0) {
+    const next = [];
+    for (const parent of frontier) {
+      for (const row of await childRows(parent.id)) {
+        if (row.project_id !== root.project_id) {
+          throw error("CROSS_PROJECT_WORKSPACE", "Nested workspace items must stay within one project");
+        }
+        if (seen.has(row.id)) {
+          throw error("NESTED_WORKSPACE_CYCLE", "Nested workspace contains a parent cycle");
+        }
+        if (descendants.length >= NESTED_WORKSPACE_MAX_NODES) {
+          throw new ApiError(
+            413,
+            "NESTED_WORKSPACE_TOO_LARGE",
+            `Nested workspace cannot exceed ${NESTED_WORKSPACE_MAX_NODES} descendants`,
+          );
+        }
+        const node = workspaceItemFromRow(row, {
+          parentId: parent.id,
+          depth: parent.path.length,
+          path: [...parent.path, row.id],
+        });
+        descendants.push(node);
+        seen.add(row.id);
+        next.push(node);
+      }
+    }
+    frontier = next;
+  }
+  workspace.descendants = paginateWorkspaceItems(descendants, options, error);
+  return workspace;
 }
 
 async function taskActivityComments(env, taskIds) {
@@ -3555,6 +3649,17 @@ async function routeApi(request, env, actor, url) {
     requireNoQuery(url, "Task rollup routes");
     const taskId = decodePathPart(taskRollupMatch[1], "Task id");
     return json(200, { rollup: await getTaskRollup(env, taskId) });
+  }
+
+  const nestedWorkspaceMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/workspace$/);
+  if (nestedWorkspaceMatch) {
+    if (request.method !== "GET") methodNotAllowed(["GET"]);
+    const taskId = decodePathPart(nestedWorkspaceMatch[1], "Task id");
+    const options = parseNestedWorkspaceQuery(
+      url.searchParams,
+      (code, message) => new ApiError(400, code, message),
+    );
+    return json(200, { workspace: await getNestedWorkspace(env, taskId, options) });
   }
 
   const relationMatch = pathname.match(

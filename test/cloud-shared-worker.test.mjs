@@ -1185,6 +1185,72 @@ test("tree queries keep direct and nested ancestor/descendant traversal in cloud
   assert.equal(invalid.body.error.code, "INVALID_TREE_QUERY");
 });
 
+test("nested workspace keeps the local read-model contract in cloud", async () => {
+  const projectId = "nested-workspace-cloud";
+  await createProject(projectId);
+  const program = await createTask(projectId, "Program");
+  const area = await createTask(projectId, "Area");
+  const composite = await createTask(projectId, "Composite", alice, { status: "todo" });
+  const child = await createTask(projectId, "Child", alice, { status: "in_progress" });
+  const grandchild = await createTask(projectId, "Grandchild", alice, { status: "in_review" });
+  const addParent = async (nested, parent) => cloud.request(
+    `/api/tasks/${nested.id}/relations/parent/${parent.id}`,
+    { method: "POST", actorName: alice, json: { version: nested.version } },
+  );
+  for (const [nested, parent] of [
+    [area.body.task, program.body.task],
+    [composite.body.task, area.body.task],
+    [child.body.task, composite.body.task],
+    [grandchild.body.task, child.body.task],
+  ]) {
+    assert.equal((await addParent(nested, parent)).response.status, 200);
+  }
+
+  const direct = await cloud.request(
+    `/api/tasks/${composite.body.task.id}/workspace?limit=1`,
+    { actorName: alice },
+  );
+  assert.equal(direct.response.status, 200);
+  assert.deepEqual(direct.body.workspace.breadcrumb.map((item) => item.id), [
+    program.body.task.id,
+    area.body.task.id,
+    composite.body.task.id,
+  ]);
+  assert.equal(direct.body.workspace.overview.status, "todo");
+  assert.equal(direct.body.workspace.overview.macroBucket, "ready");
+  assert.equal(Object.hasOwn(direct.body.workspace.overview, "relations"), false);
+  assert.deepEqual(direct.body.workspace.children.items.map((item) => [item.id, item.status, item.macroBucket]), [
+    [child.body.task.id, "in_progress", "active"],
+  ]);
+  assert.equal(Object.hasOwn(direct.body.workspace, "descendants"), false);
+  assert.equal(Object.hasOwn(direct.body.workspace, "rollup"), false);
+
+  const descendants = await cloud.request(
+    `/api/tasks/${composite.body.task.id}/workspace?descendants=true&limit=1`,
+    { actorName: alice },
+  );
+  assert.deepEqual(descendants.body.workspace.descendants.items.map((item) => item.id), [child.body.task.id]);
+  const next = await cloud.request(
+    `/api/tasks/${composite.body.task.id}/workspace?descendants=true&limit=1&cursor=${encodeURIComponent(descendants.body.workspace.descendants.nextCursor)}`,
+    { actorName: alice },
+  );
+  assert.deepEqual(next.body.workspace.descendants.items.map((item) => [item.id, item.status, item.macroBucket]), [
+    [grandchild.body.task.id, "in_review", "review"],
+  ]);
+
+  const mutation = await cloud.request(`/api/tasks/${composite.body.task.id}/workspace`, {
+    method: "POST",
+    actorName: alice,
+  });
+  assert.equal(mutation.response.status, 405);
+  const invalidLimit = await cloud.request(
+    `/api/tasks/${composite.body.task.id}/workspace?limit=101`,
+    { actorName: alice },
+  );
+  assert.equal(invalidLimit.response.status, 400);
+  assert.equal(invalidLimit.body.error.code, "INVALID_NESTED_WORKSPACE_QUERY");
+});
+
 test("cloud tree rejects a breadth that exceeds the 1,000-node cap", async () => {
   const projectId = "tree-cloud-cap";
   await createProject(projectId);

@@ -1163,6 +1163,72 @@ test("issue tree returns deterministic direct and nested parent paths without ch
   `).run(root.id, external.id, new Date().toISOString()), /CROSS_PROJECT_RELATION/);
 });
 
+test("nested workspace is a read-only projection with a deep breadcrumb and paged descendants", async () => {
+  const baseUrl = await startServer();
+  const createIssue = async (title, status = "backlog") => {
+    const result = await request(baseUrl, "/api/tasks", {
+      method: "POST",
+      body: { projectId: "local", title, status },
+    });
+    assert.equal(result.response.status, 201);
+    return result.body.task;
+  };
+  const addParent = async (child, parent) => request(
+    baseUrl,
+    `/api/tasks/${child.id}/relations/parent/${parent.id}`,
+    { method: "POST", body: { version: child.version } },
+  );
+
+  const program = await createIssue("Program");
+  const area = await createIssue("Area");
+  const composite = await createIssue("Composite", "todo");
+  const child = await createIssue("Child", "in_progress");
+  const grandchild = await createIssue("Grandchild", "in_review");
+  for (const [nested, parent] of [
+    [area, program],
+    [composite, area],
+    [child, composite],
+    [grandchild, child],
+  ]) {
+    assert.equal((await addParent(nested, parent)).response.status, 200);
+  }
+
+  const direct = await request(baseUrl, `/api/tasks/${composite.id}/workspace?limit=1`);
+  assert.equal(direct.response.status, 200);
+  assert.deepEqual(direct.body.workspace.breadcrumb.map((item) => item.id), [
+    program.id,
+    area.id,
+    composite.id,
+  ]);
+  assert.equal(direct.body.workspace.overview.status, "todo");
+  assert.equal(direct.body.workspace.overview.macroBucket, "ready");
+  assert.equal(Object.hasOwn(direct.body.workspace.overview, "relations"), false);
+  assert.deepEqual(direct.body.workspace.children.items.map((item) => [item.id, item.status, item.macroBucket]), [
+    [child.id, "in_progress", "active"],
+  ]);
+  assert.equal(Object.hasOwn(direct.body.workspace, "descendants"), false);
+  assert.equal(Object.hasOwn(direct.body.workspace, "rollup"), false);
+
+  const descendants = await request(
+    baseUrl,
+    `/api/tasks/${composite.id}/workspace?descendants=true&limit=1`,
+  );
+  assert.deepEqual(descendants.body.workspace.descendants.items.map((item) => item.id), [child.id]);
+  const next = await request(
+    baseUrl,
+    `/api/tasks/${composite.id}/workspace?descendants=true&limit=1&cursor=${encodeURIComponent(descendants.body.workspace.descendants.nextCursor)}`,
+  );
+  assert.deepEqual(next.body.workspace.descendants.items.map((item) => [item.id, item.status, item.macroBucket]), [
+    [grandchild.id, "in_review", "review"],
+  ]);
+
+  const mutation = await request(baseUrl, `/api/tasks/${composite.id}/workspace`, { method: "POST" });
+  assert.equal(mutation.response.status, 405);
+  const invalidLimit = await request(baseUrl, `/api/tasks/${composite.id}/workspace?limit=101`);
+  assert.equal(invalidLimit.response.status, 400);
+  assert.equal(invalidLimit.body.error.code, "INVALID_NESTED_WORKSPACE_QUERY");
+});
+
 test("issue relationship changes are broadcast in realtime", async () => {
   const baseUrl = await startServer();
   const first = (await request(baseUrl, "/api/tasks", {
