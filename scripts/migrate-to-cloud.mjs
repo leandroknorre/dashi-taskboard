@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmod,
   lstat,
@@ -17,12 +17,14 @@ import { DatabaseSync } from "node:sqlite";
 
 import { DEFAULT_LABEL_NAMES } from "../shared/domain.mjs";
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const WRANGLER_D1_STATEMENT_MAX_BYTES = 90_000;
 const PROJECT_README_D1_CHUNK_CHARACTERS = 10_000;
 const TABLE_ORDER = [
   "projects",
   "project_readmes",
+  "project_stage_workflows",
+  "workflow_stages",
   "tasks",
   "comments",
   "task_relations",
@@ -31,6 +33,8 @@ const TABLE_ORDER = [
 const SORT_FIELDS = {
   projects: ["id"],
   project_readmes: ["project_id"],
+  project_stage_workflows: ["project_id"],
+  workflow_stages: ["project_id", "sort_order", "id"],
   tasks: ["project_id", "identifier", "id"],
   comments: ["task_id", "created_at", "id"],
   task_relations: ["source_task_id", "target_task_id", "relation_type"],
@@ -81,6 +85,8 @@ function buildProjectCounts(tables) {
     counts[project.id] = {
       projects: 1,
       project_readmes: 0,
+      project_stage_workflows: 0,
+      workflow_stages: 0,
       tasks: 0,
       comments: 0,
       attachments: 0,
@@ -95,12 +101,31 @@ function buildProjectCounts(tables) {
     counts[readme.project_id].project_readmes += 1;
   }
 
+  for (const workflow of tables.project_stage_workflows) {
+    if (!counts[workflow.project_id]) {
+      throw new Error(`Project stage workflow references unknown project '${workflow.project_id}'`);
+    }
+    counts[workflow.project_id].project_stage_workflows += 1;
+  }
+  const stages = new Map();
+  for (const stage of tables.workflow_stages) {
+    if (!counts[stage.project_id]) {
+      throw new Error(`Workflow stage '${stage.id}' references unknown project '${stage.project_id}'`);
+    }
+    stages.set(stage.id, stage);
+    counts[stage.project_id].workflow_stages += 1;
+  }
+
   const taskProjects = new Map();
   for (const task of tables.tasks) {
     if (!counts[task.project_id]) {
       throw new Error(`Task '${task.id}' references unknown project '${task.project_id}'`);
     }
     taskProjects.set(task.id, task.project_id);
+    const stage = stages.get(task.stage_id);
+    if (!stage || stage.project_id !== task.project_id) {
+      throw new Error(`Task '${task.id}' references a stage outside its project`);
+    }
     counts[task.project_id].tasks += 1;
   }
   for (const comment of tables.comments) {
@@ -212,12 +237,15 @@ async function readSnapshot(databasePath) {
         `SQLite snapshot failed PRAGMA foreign_key_check (${foreignKeyViolations.length} violation(s))`,
       );
     }
-    const tables = Object.fromEntries(
-      TABLE_ORDER.map((table) => [
-        table,
-        sortRows(table, snapshot.prepare(`SELECT * FROM "${table}"`).all()),
-      ]),
-    );
+    const presentTables = new Set(snapshot.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table'",
+    ).all().map((row) => row.name));
+    const tables = Object.fromEntries(TABLE_ORDER.map((table) => [
+      table,
+      presentTables.has(table)
+        ? sortRows(table, snapshot.prepare(`SELECT * FROM "${table}"`).all())
+        : [],
+    ]));
     snapshot.close();
     snapshot = null;
     return tables;
@@ -226,6 +254,45 @@ async function readSnapshot(databasePath) {
     source?.close();
     await rm(snapshotDirectory, { recursive: true, force: true });
   }
+}
+
+const DEFAULT_STAGES = [
+  ["todo", "To do", true], ["in_progress", "In progress", true],
+  ["blocked", "Blocked", true], ["in_review", "In review", true],
+  ["backlog", "Backlog", false], ["done", "Done", false], ["canceled", "Canceled", false],
+];
+
+function stageRowsFromLegacyTables(tables) {
+  const workflowProjects = new Set(tables.project_stage_workflows.map((row) => row.project_id));
+  tables.project_stage_workflows.push(...tables.projects
+    .filter((project) => !workflowProjects.has(project.id))
+    .map((project) => ({ project_id: project.id, version: 1, updated_at: project.updated_at })));
+  const stagesByProject = new Map();
+  for (const stage of tables.workflow_stages) {
+    const entries = stagesByProject.get(stage.project_id) ?? [];
+    entries.push(stage);
+    stagesByProject.set(stage.project_id, entries);
+  }
+  for (const project of tables.projects) {
+    if (stagesByProject.has(project.id)) continue;
+    const defaults = DEFAULT_STAGES.map(([canonical_status, name, board_visible], sort_order) => ({
+      id: randomUUID(), project_id: project.id, canonical_status, name, sort_order,
+      board_visible: board_visible ? 1 : 0, active: 1, is_default_for_status: 1,
+      terminal_kind: canonical_status === "done" ? "done" : canonical_status === "canceled" ? "canceled" : "none",
+      created_at: project.created_at, updated_at: project.updated_at,
+    }));
+    tables.workflow_stages.push(...defaults);
+    stagesByProject.set(project.id, defaults);
+  }
+  const defaultStages = new Map(tables.workflow_stages
+    .filter((stage) => stage.is_default_for_status)
+    .map((stage) => [`${stage.project_id}:${stage.canonical_status}`, stage]));
+  tables.tasks = tables.tasks.map((task) => ({
+    ...task,
+    stage_id: task.stage_id ?? defaultStages.get(`${task.project_id}:${task.status}`)?.id,
+  }));
+  sortRows("project_stage_workflows", tables.project_stage_workflows);
+  sortRows("workflow_stages", tables.workflow_stages);
 }
 
 function fillMissingAttachmentKinds(tables) {
@@ -336,6 +403,7 @@ export async function createCloudMigrationBundle({
   attachmentsDirectory,
 }) {
   const tables = await readSnapshot(databasePath);
+  stageRowsFromLegacyTables(tables);
   fillMissingAttachmentKinds(tables);
   tables.projects = projectRowsWithLabels(tables).map((project) => ({
     ...project,
@@ -361,8 +429,13 @@ const CLOUD_COLUMNS = {
     "id", "name", "workspace_path", "labels", "next_task_number", "created_at", "updated_at",
   ],
   project_readmes: ["project_id", "content", "version", "created_at", "updated_at"],
+  project_stage_workflows: ["project_id", "version", "updated_at"],
+  workflow_stages: [
+    "id", "project_id", "canonical_status", "name", "sort_order", "board_visible",
+    "active", "is_default_for_status", "terminal_kind", "created_at", "updated_at",
+  ],
   tasks: [
-    "id", "identifier", "project_id", "title", "description", "status", "priority", "labels",
+    "id", "identifier", "project_id", "title", "description", "status", "stage_id", "priority", "labels",
     "sort_order", "thread_id", "thread_codex_project_id", "thread_codex_project_kind",
     "thread_codex_host_id", "thread_workspace_path", "creator_type", "creator_id", "creator_name",
     "creator_avatar_url", "assignee_type", "assignee_id", "assignee_name",
@@ -493,6 +566,10 @@ export const CLOUD_PROJECT_COUNTS_SQL = `
   SELECT p.id AS project_id, 1 AS projects,
     (SELECT COUNT(*) FROM project_readmes r
       WHERE r.project_id = p.id) AS project_readmes,
+    (SELECT COUNT(*) FROM project_stage_workflows w
+      WHERE w.project_id = p.id) AS project_stage_workflows,
+    (SELECT COUNT(*) FROM workflow_stages s
+      WHERE s.project_id = p.id) AS workflow_stages,
     (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) AS tasks,
     (SELECT COUNT(*) FROM comments c JOIN tasks t ON t.id = c.task_id
       WHERE t.project_id = p.id) AS comments,
@@ -609,7 +686,11 @@ export async function importCloudMigrationBundle(bundle, { d1, r2 }) {
   const hasOnlyGlobalBaseline = existingProjects.length === 1
     && existingProjects[0] === "local"
     && TABLE_ORDER.every((table) => (
-      Number(localCounts?.[table]) === (table === "projects" ? 1 : 0)
+      Number(localCounts?.[table]) === (
+        table === "projects" || table === "project_stage_workflows" ? 1
+          : table === "workflow_stages" ? 7
+            : 0
+      )
     ));
   if (existingProjects.length > 0 && !hasOnlyGlobalBaseline) {
     throw new Error("Cloud migration target D1 is not empty");

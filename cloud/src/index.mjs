@@ -17,6 +17,11 @@ const TASK_STATUSES = [
   "canceled",
 ];
 const TASK_PRIORITIES = ["none", "urgent", "high", "medium", "low"];
+const DEFAULT_STAGE_WORKFLOW = [
+  ["todo", "To do", true], ["in_progress", "In progress", true],
+  ["blocked", "Blocked", true], ["in_review", "In review", true],
+  ["backlog", "Backlog", false], ["done", "Done", false], ["canceled", "Canceled", false],
+];
 const INLINE_ATTACHMENT_TYPES = new Set([
   "application/pdf",
   "image/avif",
@@ -341,6 +346,15 @@ function parseThreadBinding(value) {
     throw new ApiError(400, "INVALID_FIELD", "Thread project identity is invalid");
   }
   return { threadId, codexProjectId, codexProjectKind, codexHostId, workspacePath };
+}
+
+function parseStageId(value) {
+  if (value === undefined) return undefined;
+  const stageId = stringField(value, "stageId", { maxLength: 36 });
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(stageId)) {
+    throw new ApiError(400, "INVALID_FIELD", "'stageId' must be a UUID");
+  }
+  return stageId;
 }
 
 function parseAssigneeTarget(value) {
@@ -862,6 +876,7 @@ function taskFromRow(row) {
     title: row.title,
     description: row.description,
     status: row.status,
+    stageId: row.stage_id,
     priority: row.priority,
     labels: JSON.parse(row.labels),
     sortOrder: row.sort_order,
@@ -1209,6 +1224,7 @@ function parseTaskCreate(body) {
     "title",
     "description",
     "status",
+    "stageId",
     "priority",
     "labels",
     "sortOrder",
@@ -1225,6 +1241,7 @@ function parseTaskCreate(body) {
     title: stringField(body.title, "title", { required: true, maxLength: 240 }),
     description: stringField(body.description ?? "", "description", { maxLength: 100_000 }),
     status: parseStatus(body.status, "backlog"),
+    stageId: parseStageId(body.stageId),
     priority: parsePriority(body.priority, "none"),
     labels: body.labels === undefined ? [] : parseLabels(body.labels),
     sortOrder: body.sortOrder === undefined ? undefined : parseSortOrder(body.sortOrder),
@@ -1250,6 +1267,7 @@ function parseTaskPatch(body) {
     "title",
     "description",
     "status",
+    "stageId",
     "priority",
     "labels",
     "threadId",
@@ -1269,6 +1287,7 @@ function parseTaskPatch(body) {
     changes.description = stringField(body.description, "description", { maxLength: 100_000 });
   }
   if (body.status !== undefined) changes.status = parseStatus(body.status);
+  if (body.stageId !== undefined) changes.stageId = parseStageId(body.stageId);
   if (body.priority !== undefined) changes.priority = parsePriority(body.priority);
   if (body.labels !== undefined) changes.labels = parseLabels(body.labels);
   if (body.developmentContext !== undefined) {
@@ -1292,14 +1311,68 @@ function parseTaskPatch(body) {
 
 function parseMove(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["version", "status", "sortOrder", "threadId", "threadBinding"]));
+  assertAllowedKeys(body, new Set(["version", "status", "stageId", "sortOrder", "threadId", "threadBinding"]));
   return {
     version: parseVersion(body.version),
-    status: parseStatus(body.status),
+    status: body.status === undefined ? undefined : parseStatus(body.status),
+    stageId: parseStageId(body.stageId),
     sortOrder: body.sortOrder === undefined ? undefined : parseSortOrder(body.sortOrder),
     threadId: parseThreadId(body.threadId),
     threadBinding: parseThreadBinding(body.threadBinding),
   };
+}
+
+function parseStageWorkflowSave(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["version", "definition", "removals"]));
+  assertPlainObject(body.definition);
+  assertAllowedKeys(body.definition, new Set(["schemaVersion", "stages"]));
+  if (body.definition.schemaVersion !== 2 || !Array.isArray(body.definition.stages)) {
+    throw new ApiError(400, "INVALID_FIELD", "'definition' must be stage workflow schema version 2");
+  }
+  const stages = body.definition.stages.map((raw, index) => {
+    assertPlainObject(raw);
+    assertAllowedKeys(raw, new Set([
+      "stageId", "canonicalStatus", "name", "order", "boardVisible", "active",
+      "isDefaultForStatus", "terminalKind",
+    ]));
+    const stageId = raw.stageId == null ? null : parseStageId(raw.stageId);
+    const canonicalStatus = parseStatus(raw.canonicalStatus);
+    const name = stringField(raw.name, `definition.stages[${index}].name`, { required: true, maxLength: 120 });
+    if (!Number.isSafeInteger(raw.order) || raw.order < 0 || raw.order > 1_000_000) throw new ApiError(400, "INVALID_FIELD", "Stage order must be an integer from 0 to 1000000");
+    if (typeof raw.boardVisible !== "boolean" || typeof raw.active !== "boolean" || typeof raw.isDefaultForStatus !== "boolean") {
+      throw new ApiError(400, "INVALID_FIELD", "Stage visibility, active and default flags must be boolean");
+    }
+    const expectedTerminalKind = canonicalStatus === "done"
+      ? "done"
+      : canonicalStatus === "canceled"
+        ? "canceled"
+        : "none";
+    if (raw.terminalKind !== expectedTerminalKind) {
+      throw new ApiError(400, "INVALID_FIELD", `Stage terminalKind must be ${expectedTerminalKind} for ${canonicalStatus}`);
+    }
+    if (!raw.active && raw.isDefaultForStatus) {
+      throw new ApiError(400, "INVALID_FIELD", "An inactive stage cannot be the default for its status");
+    }
+    return { stageId, canonicalStatus, name, order: raw.order, boardVisible: raw.boardVisible, active: raw.active, isDefaultForStatus: raw.isDefaultForStatus, terminalKind: raw.terminalKind };
+  });
+  if (new Set(stages.map((stage) => stage.order)).size !== stages.length || new Set(stages.map((stage) => stage.stageId).filter(Boolean)).size !== stages.filter((stage) => stage.stageId).length) {
+    throw new ApiError(400, "INVALID_FIELD", "Stage ids and orders must be unique");
+  }
+  for (const status of TASK_STATUSES) {
+    const defaults = stages.filter((stage) => stage.canonicalStatus === status && stage.isDefaultForStatus && stage.active);
+    if (defaults.length !== 1) throw new ApiError(400, "INVALID_FIELD", `Each status requires exactly one active default stage (${status})`);
+  }
+  const removals = (body.removals ?? []).map((raw, index) => {
+    assertPlainObject(raw);
+    assertAllowedKeys(raw, new Set(["stageId", "destinationStageId"]));
+    const stageId = parseStageId(raw.stageId);
+    if (stageId === undefined) throw new ApiError(400, "INVALID_FIELD", `removals[${index}].stageId is required`);
+    const destinationStageId = parseStageId(raw.destinationStageId);
+    if (destinationStageId === undefined) throw new ApiError(400, "INVALID_FIELD", `removals[${index}].destinationStageId is required`);
+    return { stageId, destinationStageId };
+  });
+  return { version: parseVersion(body.version, { allowZero: true }), definition: { schemaVersion: 2, stages }, removals };
 }
 
 function parseVersionMutation(body) {
@@ -1463,11 +1536,18 @@ async function getProject(env, id) {
 async function createProject(env, input) {
   const timestamp = now();
   try {
-    await env.DB.prepare(`
+    const results = await env.DB.batch([
+      env.DB.prepare(`
       INSERT INTO projects (
         id, name, workspace_path, labels, next_task_number, created_at, updated_at
       ) VALUES (?, ?, NULL, ?, 1, ?, ?)
-    `).bind(input.id, input.name, DEFAULT_PROJECT_LABELS_JSON, timestamp, timestamp).run();
+    `).bind(input.id, input.name, DEFAULT_PROJECT_LABELS_JSON, timestamp, timestamp),
+      env.DB.prepare("INSERT INTO project_stage_workflows (project_id, version, updated_at) VALUES (?, 1, ?)").bind(input.id, timestamp),
+      ...DEFAULT_STAGE_WORKFLOW.map(([canonicalStatus, name, boardVisible], order) => env.DB.prepare(
+        "INSERT INTO workflow_stages (id, project_id, canonical_status, name, sort_order, board_visible, active, is_default_for_status, terminal_kind, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?)",
+      ).bind(uuid(), input.id, canonicalStatus, name, order, boardVisible ? 1 : 0, canonicalStatus === "done" ? "done" : canonicalStatus === "canceled" ? "canceled" : "none", timestamp, timestamp)),
+    ]);
+    if (!changed(results[0])) throw new Error("Project creation did not report a mutation");
   } catch (error) {
     if (String(error.message).includes("UNIQUE constraint failed")) {
       throw new ApiError(409, "PROJECT_EXISTS", `Project '${input.id}' already exists`);
@@ -1597,6 +1677,14 @@ async function listTasks(env, filters) {
   )));
 }
 
+async function resolveStageForTask(env, projectId, { stageId, status }) {
+  const row = stageId == null
+    ? await env.DB.prepare("SELECT id, canonical_status FROM workflow_stages WHERE project_id = ? AND canonical_status = ? AND active = 1 AND is_default_for_status = 1").bind(projectId, status).first()
+    : await env.DB.prepare("SELECT id, canonical_status FROM workflow_stages WHERE id = ? AND project_id = ? AND active = 1").bind(stageId, projectId).first();
+  if (!row) throw new ApiError(400, "INVALID_STAGE", "Stage must be an active stage in the issue project");
+  return { stageId: row.id, status: row.canonical_status };
+}
+
 async function createTask(env, input, actor) {
   const project = await env.DB.prepare(`
     SELECT
@@ -1615,6 +1703,9 @@ async function createTask(env, input, actor) {
   if (!project) {
     throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${input.projectId}' does not exist`);
   }
+  const stage = await resolveStageForTask(env, input.projectId, input);
+  input.status = stage.status;
+  input.stageId = stage.stageId;
   const prefix = projectPrefix(project);
   const suffixStart = prefix.length + 2;
   let sortOrder = input.sortOrder;
@@ -1622,8 +1713,8 @@ async function createTask(env, input, actor) {
     const row = await env.DB.prepare(`
       SELECT COALESCE(MAX(sort_order), 0) AS maximum
       FROM tasks
-      WHERE project_id = ? AND status = ? AND archived_at IS NULL
-    `).bind(input.projectId, input.status).first();
+      WHERE project_id = ? AND stage_id = ? AND archived_at IS NULL
+    `).bind(input.projectId, input.stageId).first();
     sortOrder = row.maximum + 1000;
   }
   const id = uuid();
@@ -1632,7 +1723,7 @@ async function createTask(env, input, actor) {
   const results = await env.DB.batch([
     env.DB.prepare(`
       INSERT INTO tasks (
-        id, identifier, project_id, title, description, status, priority, labels,
+        id, identifier, project_id, title, description, status, stage_id, priority, labels,
         sort_order, thread_id, thread_codex_project_id, thread_codex_project_kind,
         thread_codex_host_id, thread_workspace_path,
         creator_type, creator_id, creator_name, creator_avatar_url,
@@ -1652,7 +1743,7 @@ async function createTask(env, input, actor) {
           ), 1)
         ) AS TEXT),
         projects.id,
-        ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?,
         ?, ?, ?, ?,
@@ -1669,6 +1760,7 @@ async function createTask(env, input, actor) {
       input.title,
       input.description,
       input.status,
+      input.stageId,
       input.priority,
       JSON.stringify(input.labels),
       sortOrder,
@@ -1753,6 +1845,20 @@ async function updateTask(env, id, input, actor) {
     : null;
   const projectChanged = Boolean(targetProject && targetProject.id !== currentTask.projectId);
   const destinationProjectId = targetProject?.id ?? currentTask.projectId;
+  const stageExplicit = Object.hasOwn(input.changes, "stageId");
+  const statusExplicit = Object.hasOwn(input.changes, "status");
+  if (Object.hasOwn(input.changes, "stageId") || projectChanged) {
+    const stage = await resolveStageForTask(env, destinationProjectId, {
+      stageId: input.changes.stageId,
+      status: input.changes.status ?? currentTask.status,
+    });
+    input.changes.stageId = stage.stageId;
+    input.changes.status = stage.status;
+  } else if (Object.hasOwn(input.changes, "status")) {
+    const stage = await resolveStageForTask(env, destinationProjectId, { status: input.changes.status });
+    input.changes.stageId = stage.stageId;
+    input.changes.status = stage.status;
+  }
   const taskLabels = Object.hasOwn(input.changes, "labels")
     ? input.changes.labels
     : currentTask.labels;
@@ -1772,6 +1878,7 @@ async function updateTask(env, id, input, actor) {
     }
   }
   const activityValues = { ...input.changes };
+  if (projectChanged && !stageExplicit) delete activityValues.stageId;
   const dueDate = Object.hasOwn(input.changes, "dueDate")
     ? input.changes.dueDate
     : currentTask.dueDate;
@@ -1789,6 +1896,7 @@ async function updateTask(env, id, input, actor) {
     title: "title",
     description: "description",
     status: "status",
+    stageId: "stage_id",
     priority: "priority",
     labels: "labels",
     startDate: "start_date",
@@ -1806,15 +1914,16 @@ async function updateTask(env, id, input, actor) {
       values.push(key === "labels" ? JSON.stringify(value) : value);
     }
   }
-  const statusChanged = Object.hasOwn(input.changes, "status")
-    && input.changes.status !== currentTask.status;
-  if (statusChanged) {
+  const stageChanged = (stageExplicit || statusExplicit)
+    && Object.hasOwn(input.changes, "stageId")
+    && input.changes.stageId !== currentTask.stageId;
+  if (stageChanged) {
     const placementProjectId = projectChanged ? targetProject.id : currentTask.projectId;
     const row = await env.DB.prepare(`
       SELECT MIN(sort_order) AS minimum
       FROM tasks
-      WHERE project_id = ? AND status = ? AND archived_at IS NULL AND id != ?
-    `).bind(placementProjectId, input.changes.status, current.id).first();
+      WHERE project_id = ? AND stage_id = ? AND archived_at IS NULL AND id != ?
+    `).bind(placementProjectId, input.changes.stageId, current.id).first();
     assignments.push("sort_order = ?");
     values.push(row?.minimum == null ? 1000 : row.minimum - 1000);
   }
@@ -1967,20 +2076,26 @@ async function moveTask(env, id, input, actor) {
   if (current.archived_at !== null) {
     throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be moved");
   }
+  if (input.stageId === undefined && input.status === undefined) {
+    throw new ApiError(400, "INVALID_BODY", "Move requires stageId or status");
+  }
+  const stage = await resolveStageForTask(env, current.project_id, input);
+  input.stageId = stage.stageId;
+  input.status = stage.status;
   let sortOrder = input.sortOrder;
-  if (input.status !== current.status && sortOrder === undefined) {
+  if (input.stageId !== current.stage_id && sortOrder === undefined) {
     const row = await env.DB.prepare(`
       SELECT MIN(sort_order) AS minimum
       FROM tasks
-      WHERE project_id = ? AND status = ? AND archived_at IS NULL AND id != ?
-    `).bind(current.project_id, input.status, current.id).first();
+      WHERE project_id = ? AND stage_id = ? AND archived_at IS NULL AND id != ?
+    `).bind(current.project_id, input.stageId, current.id).first();
     sortOrder = row?.minimum == null ? 1000 : row.minimum - 1000;
   } else if (sortOrder === undefined) {
     const row = await env.DB.prepare(`
       SELECT COALESCE(MAX(sort_order), 0) AS maximum
       FROM tasks
-      WHERE project_id = ? AND status = ? AND archived_at IS NULL AND id != ?
-    `).bind(current.project_id, input.status, current.id).first();
+      WHERE project_id = ? AND stage_id = ? AND archived_at IS NULL AND id != ?
+    `).bind(current.project_id, input.stageId, current.id).first();
     sortOrder = row.maximum + 1000;
   }
   const timestamp = now();
@@ -1993,6 +2108,7 @@ async function moveTask(env, id, input, actor) {
     UPDATE tasks
     SET
       status = ?,
+      stage_id = ?,
       sort_order = ?,
       ${threadAssignment}
       version = version + 1,
@@ -2000,13 +2116,14 @@ async function moveTask(env, id, input, actor) {
     WHERE id = ? AND version = ?
   `).bind(
     input.status,
+    input.stageId,
     sortOrder,
     ...(storedBinding ?? []),
     timestamp,
     current.id,
     input.version,
   )];
-  const activityChanges = taskFieldChanges(taskFromRow(current), { status: input.status });
+  const activityChanges = taskFieldChanges(taskFromRow(current), { status: input.status, stageId: input.stageId });
   if (activityChanges.length > 0) {
     statements.push(taskActivityStatement(
       env,
@@ -2561,6 +2678,96 @@ async function saveProjectReadme(env, projectId, content, expectedVersion) {
   return getProjectReadme(env, projectId);
 }
 
+function stageFromRow(row) {
+  return {
+    stageId: row.id,
+    canonicalStatus: row.canonical_status,
+    name: row.name,
+    order: row.sort_order,
+    boardVisible: Boolean(row.board_visible),
+    active: Boolean(row.active),
+    isDefaultForStatus: Boolean(row.is_default_for_status),
+    terminalKind: row.terminal_kind,
+  };
+}
+
+async function getStageWorkflow(env, projectId) {
+  await requireProject(env, projectId);
+  const [workflow, rows] = await Promise.all([
+    env.DB.prepare("SELECT version, updated_at FROM project_stage_workflows WHERE project_id = ?").bind(projectId).first(),
+    all(env.DB.prepare("SELECT * FROM workflow_stages WHERE project_id = ? ORDER BY sort_order, id").bind(projectId)),
+  ]);
+  return {
+    projectId,
+    definition: { schemaVersion: 2, stages: rows.map(stageFromRow) },
+    version: workflow?.version ?? 0,
+    updatedAt: workflow?.updated_at ?? null,
+  };
+}
+
+async function saveStageWorkflow(env, projectId, input) {
+  await requireProject(env, projectId);
+  const current = await env.DB.prepare("SELECT version FROM project_stage_workflows WHERE project_id = ?").bind(projectId).first();
+  const actualVersion = current?.version ?? 0;
+  if (actualVersion !== input.version) throw new ApiError(409, "VERSION_CONFLICT", "Stage workflow was changed by another client", { expectedVersion: input.version, actualVersion });
+  const existing = await all(env.DB.prepare("SELECT * FROM workflow_stages WHERE project_id = ?").bind(projectId));
+  const existingIds = new Set(existing.map((stage) => stage.id));
+  const nextStages = input.definition.stages.map((stage) => ({ ...stage, stageId: stage.stageId ?? uuid() }));
+  const nextIds = new Set(nextStages.map((stage) => stage.stageId));
+  const foreignStage = await env.DB.prepare(
+    `SELECT id FROM workflow_stages WHERE id IN (${nextStages.map(() => "?").join(", ")}) AND project_id != ? LIMIT 1`,
+  ).bind(...nextIds, projectId).first();
+  if (foreignStage) {
+    throw new ApiError(400, "INVALID_STAGE", "Stages must belong to the issue project");
+  }
+  if ([...nextIds].some((id) => !existingIds.has(id) && input.removals.some((removal) => removal.stageId === id))) {
+    throw new ApiError(400, "INVALID_FIELD", "A removal cannot target a newly created stage");
+  }
+  const removed = [...existingIds].filter((id) => !nextIds.has(id));
+  const removalByStage = new Map(input.removals.map((removal) => [removal.stageId, removal]));
+  for (const stageId of removed) {
+    const cards = await env.DB.prepare("SELECT COUNT(*) AS count FROM tasks WHERE project_id = ? AND stage_id = ?").bind(projectId, stageId).first();
+    const removal = removalByStage.get(stageId);
+    if (Number(cards?.count ?? 0) > 0 && !removal?.destinationStageId) {
+      throw new ApiError(409, "STAGE_HAS_TASKS", "A destination stage is required before removing a stage with issues", { stageId, taskCount: Number(cards.count) });
+    }
+    if (removal?.destinationStageId && !nextIds.has(removal.destinationStageId)) {
+      throw new ApiError(400, "INVALID_FIELD", "Removal destination must remain in this workflow");
+    }
+  }
+  if (input.removals.some((removal) => !removed.includes(removal.stageId))) {
+    throw new ApiError(400, "INVALID_FIELD", "A removal must name a stage removed from the definition");
+  }
+  const timestamp = now();
+  const statements = [];
+  for (const removal of input.removals) {
+    statements.push(env.DB.prepare(
+      "UPDATE tasks SET stage_id = ?, status = (SELECT canonical_status FROM workflow_stages WHERE id = ?), version = version + 1, updated_at = ? WHERE project_id = ? AND stage_id = ?",
+    ).bind(removal.destinationStageId, removal.destinationStageId, timestamp, projectId, removal.stageId));
+  }
+  if (removed.length > 0) {
+    statements.push(env.DB.prepare(`DELETE FROM workflow_stages WHERE project_id = ? AND id IN (${removed.map(() => "?").join(", ")})`).bind(projectId, ...removed));
+  }
+  statements.push(env.DB.prepare(
+    "UPDATE workflow_stages SET sort_order = sort_order + 2000000, updated_at = ? WHERE project_id = ?",
+  ).bind(timestamp, projectId));
+  statements.push(env.DB.prepare(
+    "UPDATE workflow_stages SET is_default_for_status = 0, updated_at = ? WHERE project_id = ?",
+  ).bind(timestamp, projectId));
+  for (const stage of nextStages) {
+    statements.push(env.DB.prepare(`INSERT INTO workflow_stages (id, project_id, canonical_status, name, sort_order, board_visible, active, is_default_for_status, terminal_kind, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET canonical_status = excluded.canonical_status, name = excluded.name, sort_order = excluded.sort_order, board_visible = excluded.board_visible, active = excluded.active, is_default_for_status = excluded.is_default_for_status, terminal_kind = excluded.terminal_kind, updated_at = excluded.updated_at
+      WHERE workflow_stages.project_id = excluded.project_id`).bind(stage.stageId, projectId, stage.canonicalStatus, stage.name, stage.order, stage.boardVisible ? 1 : 0, stage.active ? 1 : 0, stage.isDefaultForStatus ? 1 : 0, stage.terminalKind, timestamp, timestamp));
+  }
+  statements.push(current
+    ? env.DB.prepare("UPDATE project_stage_workflows SET version = version + 1, updated_at = ? WHERE project_id = ? AND version = ?").bind(timestamp, projectId, input.version)
+    : env.DB.prepare("INSERT INTO project_stage_workflows (project_id, version, updated_at) VALUES (?, 1, ?)").bind(projectId, timestamp));
+  const results = await env.DB.batch(statements);
+  if (!changed(results.at(-1))) throw new ApiError(409, "VERSION_CONFLICT", "Stage workflow was changed by another client", { expectedVersion: input.version, actualVersion: (await env.DB.prepare("SELECT version FROM project_stage_workflows WHERE project_id = ?").bind(projectId).first())?.version ?? 0 });
+  return getStageWorkflow(env, projectId);
+}
+
 async function listTaskActivities(env, taskId) {
   const task = await requireTaskRow(env, taskId);
   const rows = await all(env.DB.prepare(`
@@ -3025,6 +3232,19 @@ async function routeApi(request, env, actor, url) {
       ? await addProjectLabel(env, projectId, label)
       : await deleteProjectLabel(env, projectId, label);
     return json(200, { project });
+  }
+
+  const stageWorkflowMatch = pathname.match(
+    /^\/api\/projects\/([^/]+)\/stage-workflow$/,
+  );
+  if (stageWorkflowMatch) {
+    requireNoQuery(url, "Stage workflow routes");
+    const projectId = validateProjectId(decodePathPart(stageWorkflowMatch[1], "Project id"));
+    if (request.method === "GET") return json(200, { stageWorkflow: await getStageWorkflow(env, projectId) });
+    if (request.method === "PUT") return json(200, {
+      stageWorkflow: await saveStageWorkflow(env, projectId, parseStageWorkflowSave(await readJson(request))),
+    });
+    methodNotAllowed(["GET", "PUT"]);
   }
 
   const projectReadmeAttachmentsMatch = pathname.match(

@@ -104,6 +104,224 @@ test("the Basic username becomes the trusted actor while the shared password gra
   assert.match(agentTask.body.task.creatorName, /Bob/);
 });
 
+test("stage workflows provision defaults, place tasks, and require a remap before removal", async () => {
+  const initial = await cloud.request("/api/projects/alpha/stage-workflow", { actorName: alice });
+  assert.equal(initial.response.status, 200);
+  assert.equal(initial.body.stageWorkflow.definition.stages.length, 7);
+  const todo = initial.body.stageWorkflow.definition.stages.find((stage) => (
+    stage.canonicalStatus === "todo"
+  ));
+  const saved = await cloud.request("/api/projects/alpha/stage-workflow", {
+    method: "PUT",
+    actorName: alice,
+    json: {
+      version: initial.body.stageWorkflow.version,
+      definition: {
+        schemaVersion: 2,
+        stages: [
+          ...initial.body.stageWorkflow.definition.stages,
+          {
+            stageId: null,
+            canonicalStatus: "todo",
+            name: "Ready",
+            order: 7,
+            boardVisible: true,
+            active: true,
+            isDefaultForStatus: false,
+            terminalKind: "none",
+          },
+        ],
+      },
+      removals: [],
+    },
+  });
+  assert.equal(saved.response.status, 200, JSON.stringify(saved.body));
+  const ready = saved.body.stageWorkflow.definition.stages.find((stage) => stage.name === "Ready");
+  const task = await createTask("alpha", "Stage task", alice, { stageId: ready.stageId });
+  assert.equal(task.response.status, 201);
+  assert.equal(task.body.task.stageId, ready.stageId);
+  assert.equal(task.body.task.status, "todo");
+
+  const withoutRemap = await cloud.request("/api/projects/alpha/stage-workflow", {
+    method: "PUT",
+    actorName: alice,
+    json: {
+      version: saved.body.stageWorkflow.version,
+      definition: {
+        schemaVersion: 2,
+        stages: saved.body.stageWorkflow.definition.stages.filter((stage) => stage.stageId !== ready.stageId),
+      },
+      removals: [],
+    },
+  });
+  assert.equal(withoutRemap.response.status, 409);
+  assert.equal(withoutRemap.body.error.code, "STAGE_HAS_TASKS");
+
+  const remapped = await cloud.request("/api/projects/alpha/stage-workflow", {
+    method: "PUT",
+    actorName: alice,
+    json: {
+      version: saved.body.stageWorkflow.version,
+      definition: {
+        schemaVersion: 2,
+        stages: saved.body.stageWorkflow.definition.stages.filter((stage) => stage.stageId !== ready.stageId),
+      },
+      removals: [{ stageId: ready.stageId, destinationStageId: todo.stageId }],
+    },
+  });
+  assert.equal(remapped.response.status, 200, JSON.stringify(remapped.body));
+  const fetched = await cloud.request(`/api/tasks/${task.body.task.id}`, { actorName: alice });
+  assert.equal(fetched.body.task.stageId, todo.stageId);
+});
+
+test("stage workflow saves rename, reorder, hide, and reject stale versions", async () => {
+  await createProject("stage-config-cloud");
+  const initial = await cloud.request("/api/projects/stage-config-cloud/stage-workflow", {
+    actorName: alice,
+  });
+  const stages = initial.body.stageWorkflow.definition.stages.map((stage, index) => ({
+    ...stage,
+    name: stage.canonicalStatus === "todo" ? "Ready for work" : stage.name,
+    order: initial.body.stageWorkflow.definition.stages.length - index - 1,
+    boardVisible: stage.canonicalStatus === "in_review" ? false : stage.boardVisible,
+  }));
+  const saved = await cloud.request("/api/projects/stage-config-cloud/stage-workflow", {
+    method: "PUT",
+    actorName: alice,
+    json: {
+      version: initial.body.stageWorkflow.version,
+      definition: { schemaVersion: 2, stages },
+      removals: [],
+    },
+  });
+  assert.equal(saved.response.status, 200, JSON.stringify(saved.body));
+  assert.equal(saved.body.stageWorkflow.version, initial.body.stageWorkflow.version + 1);
+  assert.equal(
+    saved.body.stageWorkflow.definition.stages.find((stage) => stage.canonicalStatus === "todo").name,
+    "Ready for work",
+  );
+  assert.equal(
+    saved.body.stageWorkflow.definition.stages.find((stage) => stage.canonicalStatus === "todo").order,
+    6,
+  );
+  assert.equal(
+    saved.body.stageWorkflow.definition.stages.find((stage) => stage.canonicalStatus === "in_review").boardVisible,
+    false,
+  );
+  assert.deepEqual(
+    saved.body.stageWorkflow.definition.stages.map((stage) => stage.order),
+    [0, 1, 2, 3, 4, 5, 6],
+  );
+
+  const stale = await cloud.request("/api/projects/stage-config-cloud/stage-workflow", {
+    method: "PUT",
+    actorName: alice,
+    json: {
+      version: initial.body.stageWorkflow.version,
+      definition: { schemaVersion: 2, stages },
+      removals: [],
+    },
+  });
+  assert.equal(stale.response.status, 409);
+  assert.equal(stale.body.error.code, "VERSION_CONFLICT");
+  assert.deepEqual(stale.body.error.details, {
+    expectedVersion: initial.body.stageWorkflow.version,
+    actualVersion: saved.body.stageWorkflow.version,
+  });
+});
+
+test("stage ownership rejects foreign stages and failed removals roll back before project remap", async () => {
+  await createProject("stage-transfer-source");
+  await createProject("stage-transfer-target");
+  const [source, target] = await Promise.all([
+    cloud.request("/api/projects/stage-transfer-source/stage-workflow", { actorName: alice }),
+    cloud.request("/api/projects/stage-transfer-target/stage-workflow", { actorName: alice }),
+  ]);
+  const sourceTodo = source.body.stageWorkflow.definition.stages.find((stage) => stage.canonicalStatus === "todo");
+  const targetTodo = target.body.stageWorkflow.definition.stages.find((stage) => stage.canonicalStatus === "todo");
+  const foreign = await createTask("stage-transfer-source", "Foreign stage", alice, {
+    stageId: targetTodo.stageId,
+  });
+  assert.equal(foreign.response.status, 400);
+  assert.equal(foreign.body.error.code, "INVALID_STAGE");
+  const sourceTask = await createTask("stage-transfer-source", "Source default stage", alice, {
+    stageId: sourceTodo.stageId,
+  });
+  const foreignPatch = await cloud.request(`/api/tasks/${sourceTask.body.task.id}`, {
+    method: "PATCH",
+    actorName: alice,
+    json: { version: sourceTask.body.task.version, stageId: targetTodo.stageId },
+  });
+  assert.equal(foreignPatch.response.status, 400);
+  assert.equal(foreignPatch.body.error.code, "INVALID_STAGE");
+
+  const sourceWithReady = await cloud.request(
+    "/api/projects/stage-transfer-source/stage-workflow",
+    {
+      method: "PUT",
+      actorName: alice,
+      json: {
+        version: source.body.stageWorkflow.version,
+        definition: {
+          schemaVersion: 2,
+          stages: [...source.body.stageWorkflow.definition.stages, {
+            stageId: null,
+            canonicalStatus: "todo",
+            name: "Ready to transfer",
+            order: 7,
+            boardVisible: true,
+            active: true,
+            isDefaultForStatus: false,
+            terminalKind: "none",
+          }],
+        },
+        removals: [],
+      },
+    },
+  );
+  assert.equal(sourceWithReady.response.status, 200, JSON.stringify(sourceWithReady.body));
+  const ready = sourceWithReady.body.stageWorkflow.definition.stages.find((stage) => (
+    stage.name === "Ready to transfer"
+  ));
+  const task = await createTask("stage-transfer-source", "Transfer stage task", alice, {
+    stageId: ready.stageId,
+  });
+  assert.equal(task.response.status, 201);
+
+  const failedRemoval = await cloud.request(
+    "/api/projects/stage-transfer-source/stage-workflow",
+    {
+      method: "PUT",
+      actorName: alice,
+      json: {
+        version: sourceWithReady.body.stageWorkflow.version,
+        definition: {
+          schemaVersion: 2,
+          stages: sourceWithReady.body.stageWorkflow.definition.stages.filter((stage) => stage.stageId !== ready.stageId),
+        },
+        removals: [],
+      },
+    },
+  );
+  assert.equal(failedRemoval.response.status, 409);
+  assert.equal(failedRemoval.body.error.code, "STAGE_HAS_TASKS");
+  const afterFailure = await cloud.request(`/api/tasks/${task.body.task.id}`, { actorName: alice });
+  assert.equal(afterFailure.body.task.stageId, ready.stageId);
+
+  const transferred = await cloud.request(`/api/tasks/${task.body.task.id}`, {
+    method: "PATCH",
+    actorName: alice,
+    json: {
+      version: afterFailure.body.task.version,
+      projectId: "stage-transfer-target",
+    },
+  });
+  assert.equal(transferred.response.status, 200, JSON.stringify(transferred.body));
+  assert.equal(transferred.body.task.stageId, targetTodo.stageId);
+  assert.equal(transferred.body.task.status, "todo");
+  assert.notEqual(transferred.body.task.stageId, sourceTodo.stageId);
+});
+
 test("projects, tasks, comments, and relations preserve the current API contract", async () => {
   const parent = await createTask("alpha", "Parent");
   const child = await createTask("alpha", "Child");

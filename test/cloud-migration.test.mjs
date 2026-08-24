@@ -368,6 +368,8 @@ function expectedProjectCounts() {
     alpha: {
       projects: 1,
       project_readmes: 0,
+      project_stage_workflows: 1,
+      workflow_stages: 7,
       tasks: 2,
       comments: 1,
       attachments: 2,
@@ -376,6 +378,8 @@ function expectedProjectCounts() {
     beta: {
       projects: 1,
       project_readmes: 0,
+      project_stage_workflows: 1,
+      workflow_stages: 7,
       tasks: 1,
       comments: 1,
       attachments: 1,
@@ -389,6 +393,8 @@ function expectedCloudBaselineCounts() {
     local: {
       projects: 1,
       project_readmes: 0,
+      project_stage_workflows: 1,
+      workflow_stages: 7,
       tasks: 0,
       comments: 0,
       attachments: 0,
@@ -480,13 +486,20 @@ test("migration snapshots live WAL data, counts each project, and strips local e
     attachmentsDirectory: fixture.attachmentsDirectory,
   });
 
-  assert.equal(bundle.schemaVersion, 2);
+  assert.equal(bundle.schemaVersion, 3);
   assert.deepEqual(bundle.counts.byProject, expectedProjectCounts());
   assert.deepEqual(
     bundle.tables.projects.map((project) => project.id).sort(),
     ["alpha", "beta"],
   );
   assert.equal(bundle.tables.projects.every((project) => project.workspace_path === null), true);
+  assert.equal(bundle.tables.project_stage_workflows.length, 2);
+  assert.equal(bundle.tables.workflow_stages.length, 14);
+  for (const task of bundle.tables.tasks) {
+    const stage = bundle.tables.workflow_stages.find((candidate) => candidate.id === task.stage_id);
+    assert.equal(stage?.project_id, task.project_id);
+    assert.equal(stage?.canonical_status, task.status);
+  }
 
   const alphaWorktreeTask = bundle.tables.tasks.find((task) => task.id === "task-a1");
   assert.equal(alphaWorktreeTask.worktree_path, null);
@@ -499,6 +512,77 @@ test("migration snapshots live WAL data, counts each project, and strips local e
   assert.doesNotMatch(serializedBundle, /cf-access-super-secret/);
   assert.doesNotMatch(serializedBundle, /\/Users\/(?:alice|bob)\//);
   assert.equal(Object.hasOwn(bundle.tables, "local_cloud_session"), false);
+});
+
+test("migration preserves a v2 stage source in a v3 bundle", async () => {
+  const fixture = await createMigrationFixture();
+  fixture.database.exec(`
+    CREATE TABLE project_stage_workflows (
+      project_id TEXT PRIMARY KEY,
+      version INTEGER NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE workflow_stages (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      canonical_status TEXT NOT NULL,
+      name TEXT NOT NULL,
+      sort_order INTEGER NOT NULL,
+      board_visible INTEGER NOT NULL,
+      active INTEGER NOT NULL,
+      is_default_for_status INTEGER NOT NULL,
+      terminal_kind TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    ALTER TABLE tasks ADD COLUMN stage_id TEXT;
+  `);
+  const defaults = [
+    ["todo", "To do", 1], ["in_progress", "In progress", 1],
+    ["blocked", "Blocked", 1], ["in_review", "In review", 1],
+    ["backlog", "Backlog", 0], ["done", "Done", 0], ["canceled", "Canceled", 0],
+  ];
+  const insertWorkflow = fixture.database.prepare(
+    "INSERT INTO project_stage_workflows VALUES (?, 4, ?)",
+  );
+  const insertStage = fixture.database.prepare(`
+    INSERT INTO workflow_stages VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?)
+  `);
+  for (const projectId of ["alpha", "beta"]) {
+    insertWorkflow.run(projectId, timestamp);
+    defaults.forEach(([status, name, boardVisible], order) => {
+      const id = `${projectId}-${status}`;
+      insertStage.run(
+        id,
+        projectId,
+        status,
+        projectId === "alpha" && status === "todo" ? "Alpha ready" : name,
+        order,
+        boardVisible,
+        status === "done" ? "done" : status === "canceled" ? "canceled" : "none",
+        timestamp,
+        timestamp,
+      );
+    });
+  }
+  fixture.database.exec(`
+    UPDATE tasks SET stage_id = project_id || '-' || status;
+  `);
+
+  const bundle = await createCloudMigrationBundle({
+    databasePath: fixture.databasePath,
+    attachmentsDirectory: fixture.attachmentsDirectory,
+  });
+  assert.equal(bundle.schemaVersion, 3);
+  assert.equal(bundle.tables.project_stage_workflows.find((row) => row.project_id === "alpha").version, 4);
+  assert.equal(
+    bundle.tables.workflow_stages.find((stage) => stage.id === "alpha-todo").name,
+    "Alpha ready",
+  );
+  assert.deepEqual(
+    bundle.tables.tasks.map((task) => task.stage_id).sort(),
+    ["alpha-in_progress", "alpha-todo", "beta-backlog"],
+  );
 });
 
 test("migration records attachment bytes, SHA-256, and actual size", async () => {
@@ -560,6 +644,8 @@ test("cloud import calls D1 and R2 adapters, then verifies project counts and ob
   assert.deepEqual(Object.keys(d1.calls[0]), [
     "projects",
     "project_readmes",
+    "project_stage_workflows",
+    "workflow_stages",
     "tasks",
     "comments",
     "task_relations",
@@ -672,9 +758,9 @@ test("D1 binding import uses one JSON statement per table for 100+ rows", async 
   await adapters.d1.importTables(tables);
 
   assert.equal(batches.length, 1);
-  assert.equal(batches[0].length, 6);
+  assert.equal(batches[0].length, 8);
   for (const statement of batches[0]) assert.match(statement.sql, /json_each\(\?\)/);
-  assert.equal(JSON.parse(batches[0][2].values[0]).length, 125);
+  assert.equal(JSON.parse(batches[0][4].values[0]).length, 125);
 });
 
 test("Wrangler D1 SQL chunks large tables below the remote statement byte limit", async () => {
@@ -944,6 +1030,20 @@ test("versioned bundle round-trips through private manifest, data, and attachmen
     restored.attachments.map(({ id, body }) => [id, Buffer.from(body)]),
     bundle.attachments.map(({ id, body }) => [id, Buffer.from(body)]),
   );
+
+  const legacyManifest = JSON.parse(await readFile(
+    path.join(outputDirectory, "manifest.json"),
+    "utf8",
+  ));
+  legacyManifest.schemaVersion = 2;
+  await writeFile(
+    path.join(outputDirectory, "manifest.json"),
+    `${JSON.stringify(legacyManifest)}\n`,
+  );
+  await assert.rejects(
+    readCloudMigrationBundle(outputDirectory),
+    /Unsupported cloud migration schema version '2'/,
+  );
 });
 
 test("CLI import and verify require and use an explicit adapter module", async () => {
@@ -1024,14 +1124,18 @@ test("Wrangler adapter requires remote opt-in and keeps transfer files private",
           await writeFile(filename, downloadedBody);
         }
       }
-      if (commandArgs.includes("--json")) return { stdout: '[{"results":[]}]' };
+      if (commandArgs.includes("--json")) {
+        return {
+          stdout: '[{"results":[{"project_id":"local","projects":1,"project_readmes":0,"project_stage_workflows":1,"workflow_stages":7,"tasks":0,"comments":0,"task_relations":0,"attachments":0}]}]',
+        };
+      }
       return { stdout: "" };
     },
   });
 
   try {
     await adapters.d1.importTables(bundle.tables);
-    assert.deepEqual(await adapters.d1.countByProject(), {});
+    assert.deepEqual(await adapters.d1.countByProject(), expectedCloudBaselineCounts());
     await adapters.r2.put("attachment-a", Buffer.from("upload"));
     assert.deepEqual(await adapters.r2.head("attachment-a"), {
       size: downloadedBody.byteLength,
