@@ -10,6 +10,7 @@ import {
   parentRelationMetadataFromStored,
   parentRelationMetadataJson,
 } from "../shared/relation-metadata.mjs";
+import { calculateTaskRollup } from "../shared/task-rollup.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
 const TASK_TREE_MAX_NODES = 1_000;
@@ -2156,6 +2157,47 @@ export class TaskboardDatabase {
       nodeCount: nodes.length,
       nodes,
     };
+  }
+
+  getTaskRollup(id) {
+    const root = this.database.prepare(
+      "SELECT * FROM tasks WHERE id = ? OR identifier = ?",
+    ).get(id, id);
+    if (!root) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+
+    const rows = this.database.prepare(`
+      WITH RECURSIVE rolled_tasks(id, parent_id, relation_metadata) AS (
+        SELECT ?, NULL, NULL
+        UNION ALL
+        SELECT relations.target_task_id, relations.source_task_id, relations.metadata
+        FROM task_relations AS relations
+        JOIN rolled_tasks ON rolled_tasks.id = relations.source_task_id
+        WHERE relations.relation_type = 'parent'
+          AND COALESCE(json_extract(relations.metadata, '$.rollup'), 1) = 1
+      )
+      SELECT tasks.*, rolled_tasks.parent_id AS rollup_parent_id,
+        rolled_tasks.relation_metadata AS rollup_relation_metadata
+      FROM rolled_tasks
+      JOIN tasks ON tasks.id = rolled_tasks.id
+      LIMIT ?
+    `).all(root.id, TASK_TREE_MAX_NODES + 1);
+    if (rows.length > TASK_TREE_MAX_NODES) {
+      throw new ApiError(413, "TREE_TOO_LARGE", `Task tree cannot exceed ${TASK_TREE_MAX_NODES} nodes`);
+    }
+
+    return calculateTaskRollup({
+      root: taskFromRow(root),
+      tasks: rows.map(taskFromRow),
+      relations: rows.flatMap((row) => (
+        row.rollup_parent_id === null ? [] : [{
+          type: "parent",
+          parentId: row.rollup_parent_id,
+          childId: row.id,
+          metadata: parentRelationMetadataFromStored(row.rollup_relation_metadata),
+        }]
+      )),
+      maxNodes: TASK_TREE_MAX_NODES,
+    });
   }
 
   createTask(input) {

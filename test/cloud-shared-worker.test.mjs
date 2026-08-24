@@ -1059,6 +1059,72 @@ test("cloud parent composition metadata defaults, validates, updates, and round-
   assert.equal(Object.hasOwn(lateral.body.task.relations.blocks[0], "metadata"), false);
 });
 
+test("cloud task rollup matches the deterministic local parent-only contract", async () => {
+  const projectId = "rollup-cloud-parity";
+  await createProject(projectId);
+  const root = await createTask(projectId, "Manual cloud parent", alice, {
+    description: "Keep this manual purpose", status: "in_review",
+  });
+  const child = await createTask(projectId, "Finished child", alice, { status: "done" });
+  const blocker = await createTask(projectId, "Blocked grandchild", alice, {
+    status: "blocked", priority: "urgent",
+  });
+  const ignored = await createTask(projectId, "Ignored blocked child", alice, {
+    status: "blocked", priority: "urgent",
+  });
+  const unrelated = await createTask(projectId, "Unrelated task");
+  const latest = async (id) => (
+    (await cloud.request(`/api/tasks/${id}`, { actorName: alice })).body.task
+  );
+  const addParent = async (childTask, parentTask, metadata) => cloud.request(
+    `/api/tasks/${childTask.id}/relations/parent/${parentTask.id}`,
+    {
+      method: "POST",
+      actorName: alice,
+      json: { version: childTask.version, ...(metadata ? { metadata } : {}) },
+    },
+  );
+  assert.equal((await addParent(child.body.task, root.body.task)).response.status, 200);
+  assert.equal((await addParent(blocker.body.task, await latest(child.body.task.id))).response.status, 200);
+  assert.equal((await addParent(
+    ignored.body.task,
+    await latest(root.body.task.id),
+    { required: false, rollup: false },
+  )).response.status, 200);
+
+  const initial = await cloud.request(`/api/tasks/${root.body.task.id}/rollup`, { actorName: alice });
+  assert.equal(initial.response.status, 200);
+  assert.equal(initial.body.rollup.stage, "in_review");
+  assert.deepEqual(initial.body.rollup.progress, { total: 2, completed: 1, terminal: 1 });
+  assert.deepEqual(initial.body.rollup.visual, {
+    state: "blocked", sourceTaskIds: [blocker.body.task.id],
+  });
+  assert.deepEqual(initial.body.rollup.provenance.sourceTaskIds, [child.body.task.id, blocker.body.task.id]);
+  assert.equal(initial.body.rollup.freshness.stale, false);
+  const unrelatedBefore = (await cloud.request(
+    `/api/tasks/${unrelated.body.task.id}/rollup`, { actorName: alice },
+  )).body.rollup;
+
+  const latestBlocker = await latest(blocker.body.task.id);
+  assert.equal((await cloud.request(`/api/tasks/${blocker.body.task.id}`, {
+    method: "PATCH",
+    actorName: alice,
+    json: { version: latestBlocker.version, status: "done" },
+  })).response.status, 200);
+  const recalculated = await cloud.request(`/api/tasks/${root.body.task.id}/rollup`, { actorName: alice });
+  assert.equal(recalculated.body.rollup.visual.state, "normal");
+  assert.notEqual(recalculated.body.rollup.freshness.sourceRevision, initial.body.rollup.freshness.sourceRevision);
+  assert.deepEqual((await cloud.request(
+    `/api/tasks/${unrelated.body.task.id}/rollup`, { actorName: alice },
+  )).body.rollup.freshness, unrelatedBefore.freshness);
+
+  const parentAfter = await latest(root.body.task.id);
+  assert.equal(parentAfter.version, root.body.task.version);
+  assert.equal(parentAfter.status, "in_review");
+  assert.equal(parentAfter.title, "Manual cloud parent");
+  assert.equal(parentAfter.description, "Keep this manual purpose");
+});
+
 test("tree queries keep direct and nested ancestor/descendant traversal in cloud parity", async () => {
   const projectId = "tree-cloud-parity";
   await createProject(projectId);
@@ -1176,6 +1242,13 @@ test("cloud tree rejects a breadth that exceeds the 1,000-node cap", async () =>
   );
   assert.equal(result.response.status, 413);
   assert.equal(result.body.error.code, "TREE_TOO_LARGE");
+
+  const rollup = await cloud.request(
+    `/api/tasks/${root.body.task.id}/rollup`,
+    { actorName: alice },
+  );
+  assert.equal(rollup.response.status, 413);
+  assert.equal(rollup.body.error.code, "TREE_TOO_LARGE");
 });
 
 test("concurrent inverse parent writes cannot create a cycle", async () => {

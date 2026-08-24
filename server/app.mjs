@@ -3088,6 +3088,24 @@ export function createTaskboardServer(options = {}) {
         return sendJson(response, 200, { tree: database.getTaskTree(id, direction, depth) });
       }
 
+      const taskRollupRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/rollup$/);
+      if (taskRollupRoute) {
+        let id;
+        try {
+          id = decodeURIComponent(taskRollupRoute[1]);
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Task id contains invalid encoding");
+        }
+        if (id.length === 0 || id.length > 128) {
+          throw new ApiError(400, "INVALID_PATH", "Task id is invalid");
+        }
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Task rollup routes do not accept query parameters");
+        }
+        return sendJson(response, 200, { rollup: database.getTaskRollup(id) });
+      }
+
       const taskRoute = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(archive|restore|move))?$/);
       if (taskRoute) {
         let id;

@@ -475,6 +475,27 @@ test("issue tree uses the bounded directional tree endpoint", async () => {
   }
 });
 
+test("issue rollup uses the public deterministic rollup endpoint", async () => {
+  let requestedUrl;
+  const result = await run(
+    ["issue", "rollup", "TASK/1", "--json"],
+    async (url, init) => {
+      requestedUrl = url;
+      assert.equal(init.method, "GET");
+      return response({ rollup: { rootId: "TASK/1", freshness: { stale: false } } });
+    },
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(requestedUrl.pathname, "/api/tasks/TASK%2F1/rollup");
+
+  const invalid = await run(
+    ["issue", "rollup", "TASK-1", "--depth", "1"],
+    async () => assert.fail("fetch should not be called"),
+  );
+  assert.equal(invalid.exitCode, 2);
+  assert.equal(invalid.stderr.error.code, "USAGE_ERROR");
+});
+
 test("issue relation validates its action and relation type before fetching", async () => {
   for (const argv of [
     ["issue", "relation", "replace", "TASK-1", "--type", "related", "--issue", "TASK-2"],

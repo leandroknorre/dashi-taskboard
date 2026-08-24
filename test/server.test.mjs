@@ -976,6 +976,61 @@ test("parent composition metadata defaults, updates atomically, and leaves later
   assert.equal(Object.hasOwn(lateral.body.task.relations.blocks[0], "metadata"), false);
 });
 
+test("task rollup is rebuilt from rollup-enabled parent descendants without moving the parent", async () => {
+  const baseUrl = await startServer();
+  const createIssue = async (title, extra = {}) => {
+    const result = await request(baseUrl, "/api/tasks", {
+      method: "POST",
+      body: { title, ...extra },
+    });
+    assert.equal(result.response.status, 201);
+    return result.body.task;
+  };
+  const latest = async (id) => (await request(baseUrl, `/api/tasks/${id}`)).body.task;
+  const addParent = async (child, parent, metadata) => request(
+    baseUrl,
+    `/api/tasks/${child.id}/relations/parent/${parent.id}`,
+    { method: "POST", body: { version: child.version, ...(metadata ? { metadata } : {}) } },
+  );
+
+  const root = await createIssue("Manual parent purpose", {
+    description: "Keep this manual purpose", status: "in_review",
+  });
+  const child = await createIssue("Finished child", { status: "done" });
+  const blocker = await createIssue("Blocked grandchild", { status: "blocked", priority: "urgent" });
+  const ignored = await createIssue("Ignored blocked child", { status: "blocked", priority: "urgent" });
+  const unrelated = await createIssue("Unrelated task");
+  assert.equal((await addParent(child, root)).response.status, 200);
+  assert.equal((await addParent(blocker, await latest(child.id))).response.status, 200);
+  assert.equal((await addParent(ignored, await latest(root.id), { required: false, rollup: false })).response.status, 200);
+
+  const initial = await request(baseUrl, `/api/tasks/${root.id}/rollup`);
+  assert.equal(initial.response.status, 200);
+  assert.equal(initial.body.rollup.stage, "in_review");
+  assert.deepEqual(initial.body.rollup.progress, { total: 2, completed: 1, terminal: 1 });
+  assert.deepEqual(initial.body.rollup.visual, { state: "blocked", sourceTaskIds: [blocker.id] });
+  assert.deepEqual(initial.body.rollup.provenance.sourceTaskIds, [child.id, blocker.id]);
+  assert.equal(initial.body.rollup.freshness.stale, false);
+  const unrelatedBefore = (await request(baseUrl, `/api/tasks/${unrelated.id}/rollup`)).body.rollup;
+
+  const updatedBlocker = await latest(blocker.id);
+  assert.equal((await request(baseUrl, `/api/tasks/${blocker.id}`, {
+    method: "PATCH",
+    body: { version: updatedBlocker.version, status: "done" },
+  })).response.status, 200);
+  const recalculated = await request(baseUrl, `/api/tasks/${root.id}/rollup`);
+  assert.equal(recalculated.response.status, 200);
+  assert.equal(recalculated.body.rollup.visual.state, "normal");
+  assert.notEqual(recalculated.body.rollup.freshness.sourceRevision, initial.body.rollup.freshness.sourceRevision);
+  assert.deepEqual((await request(baseUrl, `/api/tasks/${unrelated.id}/rollup`)).body.rollup.freshness, unrelatedBefore.freshness);
+
+  const parentAfter = await latest(root.id);
+  assert.equal(parentAfter.version, root.version);
+  assert.equal(parentAfter.status, "in_review");
+  assert.equal(parentAfter.title, "Manual parent purpose");
+  assert.equal(parentAfter.description, "Keep this manual purpose");
+});
+
 test("issue tree returns deterministic direct and nested parent paths without changing relation APIs", async () => {
   const baseUrl = await startServer();
   const createIssue = async (title, projectId = "local") => {

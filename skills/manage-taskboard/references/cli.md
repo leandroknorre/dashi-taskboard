@@ -60,9 +60,12 @@ Except for built-in help, every successful command writes one JSON object with `
 taskctl issue list [--project PROJECT_ID] [--status STATUS] [--archived true|false|all] [--json]
 taskctl issue get ID [--json]
 taskctl issue tree ID --direction descendants|ancestors --depth N [--json]
+taskctl issue rollup ID [--json]
 ```
 
 `issue tree` is a bounded structural read. `--depth 1` returns only direct children or the direct parent; larger values include that many levels, up to 25. The response is flat and deterministic: every node carries `id`, traversal `parentId`, `depth`, and `path` (usable as a breadcrumb), plus a small task summary. It never calculates status rollups or changes issues.
+
+`issue rollup` returns a deterministic read model built only from `parent` edges whose `metadata.rollup` is not `false`. It reports descendant progress, a derived visual state (`blocked` takes precedence over an active `urgent` descendant), freshness and structural provenance. It never changes the parent's stage, title, description, or any other manual field.
 
 ## Create issues
 

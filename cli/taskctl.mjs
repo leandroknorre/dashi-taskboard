@@ -93,6 +93,7 @@ const COMMAND_OPTIONS = new Map([
   ["issue archive", new Set(["thread-id", "if-version", "json"])],
   ["issue restore", new Set(["thread-id", "if-version", "json"])],
   ["issue tree", new Set(["direction", "depth", "json"])],
+  ["issue rollup", new Set(["json"])],
   ["issue relation", new Set(["type", "issue", "metadata", "thread-id", "if-version", "json"])],
   ["comment list", new Set(["after", "json"])],
   ["comment add", new Set([
@@ -127,7 +128,7 @@ Commands:
   project readme set [PROJECT_ID] (--content TEXT | --file FILE) [--if-version N]
   cloud login --url URL --actor-name NAME
   cloud status|logout
-  issue list|get|create|update|move|archive|restore|tree|relation
+  issue list|get|create|update|move|archive|restore|tree|rollup|relation
   comment list ISSUE_ID [--after CURSOR]
   comment add ISSUE_ID (--body TEXT | --body-file FILE) [--thread-id ID]
   comment update COMMENT_ID --body TEXT --if-version N [--thread-id ID]
@@ -176,6 +177,7 @@ Actions:
   archive ISSUE_ID [--thread-id ID] [--if-version N] [--json]
   restore ISSUE_ID [--thread-id ID] [--if-version N] [--json]
   tree ISSUE_ID --direction descendants|ancestors --depth N [--json]
+  rollup ISSUE_ID [--json]
   relation add|update|remove ISSUE_ID --type parent|blocks|blocked_by|related
     --issue RELATED_ISSUE_ID [--metadata '{"required":true,"rollup":true}']
     [--thread-id ID] [--if-version N] [--json]
@@ -307,7 +309,7 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, cloud login/status/logout, issue list/get/create/update/move/archive/restore/tree/relation, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme, cloud login/status/logout, issue list/get/create/update/move/archive/restore/tree/rollup/relation, comment list/add/update/delete, attachment list/download/upload, context current",
     );
   }
   validateOptions(parsed.options, allowedOptions);
@@ -390,6 +392,9 @@ async function execute(parsed, overrides) {
     case "issue tree":
       expectOperandCount(parsed, 1);
       return getIssueTree(api, parsed.operands[0], parsed.options);
+    case "issue rollup":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", `${taskPath(parsed.operands[0])}/rollup`);
     case "issue relation":
       expectOperandCount(parsed, 2);
       return mutateIssueRelation(

@@ -7,6 +7,7 @@ import {
   parentRelationMetadataFromStored,
   parentRelationMetadataJson,
 } from "../../shared/relation-metadata.mjs";
+import { calculateTaskRollup } from "../../shared/task-rollup.mjs";
 
 const JSON_BODY_LIMIT = 1024 * 1024;
 const PROJECT_README_BODY_LIMIT = 3 * 1024 * 1024;
@@ -1232,6 +1233,43 @@ async function getTaskTree(env, id, direction, depth) {
     nodeCount: nodes.length,
     nodes,
   };
+}
+
+async function getTaskRollup(env, id) {
+  const root = await requireTaskRow(env, id);
+  const rows = await all(env.DB.prepare(`
+    WITH RECURSIVE rolled_tasks(id, parent_id, relation_metadata) AS (
+      SELECT ?, NULL, NULL
+      UNION ALL
+      SELECT relations.target_task_id, relations.source_task_id, relations.metadata
+      FROM task_relations AS relations
+      JOIN rolled_tasks ON rolled_tasks.id = relations.source_task_id
+      WHERE relations.relation_type = 'parent'
+        AND COALESCE(json_extract(relations.metadata, '$.rollup'), 1) = 1
+    )
+    SELECT tasks.*, rolled_tasks.parent_id AS rollup_parent_id,
+      rolled_tasks.relation_metadata AS rollup_relation_metadata
+    FROM rolled_tasks
+    JOIN tasks ON tasks.id = rolled_tasks.id
+    LIMIT ?
+  `).bind(root.id, TASK_TREE_MAX_NODES + 1));
+  if (rows.length > TASK_TREE_MAX_NODES) {
+    throw new ApiError(413, "TREE_TOO_LARGE", `Task tree cannot exceed ${TASK_TREE_MAX_NODES} nodes`);
+  }
+
+  return calculateTaskRollup({
+    root: taskFromRow(root),
+    tasks: rows.map(taskFromRow),
+    relations: rows.flatMap((row) => (
+      row.rollup_parent_id === null ? [] : [{
+        type: "parent",
+        parentId: row.rollup_parent_id,
+        childId: row.id,
+        metadata: parentRelationMetadataFromStored(row.rollup_relation_metadata),
+      }]
+    )),
+    maxNodes: TASK_TREE_MAX_NODES,
+  });
 }
 
 async function taskActivityComments(env, taskIds) {
@@ -3509,6 +3547,14 @@ async function routeApi(request, env, actor, url) {
     const taskId = decodePathPart(taskTreeMatch[1], "Task id");
     const { direction, depth } = parseTaskTreeQuery(url.searchParams);
     return json(200, { tree: await getTaskTree(env, taskId, direction, depth) });
+  }
+
+  const taskRollupMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/rollup$/);
+  if (taskRollupMatch) {
+    if (request.method !== "GET") methodNotAllowed(["GET"]);
+    requireNoQuery(url, "Task rollup routes");
+    const taskId = decodePathPart(taskRollupMatch[1], "Task id");
+    return json(200, { rollup: await getTaskRollup(env, taskId) });
   }
 
   const relationMatch = pathname.match(
