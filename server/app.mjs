@@ -18,6 +18,7 @@ import {
   isTaskStatus,
 } from "../shared/domain.mjs";
 import { resolveCodexExecutable } from "../shared/codex-executable.mjs";
+import { normalizeStageWorkflowDefinition } from "../shared/board-workflow.mjs";
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
 import { AiChatService } from "./ai-chat.mjs";
 import { resolveAiWorkspace, resolveMappedAiWorkspace } from "./ai-chat-catalog.mjs";
@@ -581,7 +582,7 @@ function resolveAssignee(target, actor) {
 function parseTaskCreate(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
-    "projectId", "title", "description", "status", "priority", "labels", "sortOrder", "threadId", "threadBinding",
+    "projectId", "title", "description", "status", "stageId", "priority", "labels", "sortOrder", "threadId", "threadBinding",
     "assigneeTarget", "developmentContext", "startDate", "dueDate", "recurrence",
   ]));
   const projectId = validateProjectId(body.projectId ?? DEFAULT_PROJECT_ID);
@@ -590,6 +591,7 @@ function parseTaskCreate(body) {
     title: stringField(body.title, "title", { required: true, maxLength: 240 }),
     description: stringField(body.description ?? "", "description", { maxLength: 100_000 }),
     status: parseStatus(body.status, "backlog"),
+    stageId: body.stageId === undefined ? undefined : stringField(body.stageId, "stageId", { required: true, maxLength: 64 }),
     priority: parsePriority(body.priority, "none"),
     labels: body.labels === undefined ? [] : parseLabels(body.labels),
     sortOrder: body.sortOrder === undefined ? undefined : parseSortOrder(body.sortOrder),
@@ -610,7 +612,7 @@ function parseTaskCreate(body) {
 function parseTaskPatch(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
-    "version", "projectId", "title", "description", "status", "priority", "labels", "threadId", "threadBinding",
+    "version", "projectId", "title", "description", "status", "stageId", "priority", "labels", "threadId", "threadBinding",
     "assigneeTarget", "developmentContext", "startDate", "dueDate", "recurrence",
   ]));
   const version = parseVersion(body.version);
@@ -622,6 +624,7 @@ function parseTaskPatch(body) {
   if (body.title !== undefined) changes.title = stringField(body.title, "title", { required: true, maxLength: 240 });
   if (body.description !== undefined) changes.description = stringField(body.description, "description", { maxLength: 100_000 });
   if (body.status !== undefined) changes.status = parseStatus(body.status);
+  if (body.stageId !== undefined) changes.stageId = stringField(body.stageId, "stageId", { required: true, maxLength: 64 });
   if (body.priority !== undefined) changes.priority = parsePriority(body.priority);
   if (body.labels !== undefined) changes.labels = parseLabels(body.labels);
   if (body.developmentContext !== undefined) changes.developmentContext = parseDevelopmentContext(body.developmentContext);
@@ -639,13 +642,27 @@ function parseTaskPatch(body) {
 
 function parseMove(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["version", "status", "sortOrder", "threadId", "threadBinding"]));
+  assertAllowedKeys(body, new Set(["version", "status", "stageId", "sortOrder", "threadId", "threadBinding"]));
   return {
     version: parseVersion(body.version),
     status: parseStatus(body.status),
+    stageId: body.stageId === undefined ? undefined : stringField(body.stageId, "stageId", { required: true, maxLength: 64 }),
     sortOrder: body.sortOrder === undefined ? undefined : parseSortOrder(body.sortOrder),
     threadId: parseThreadId(body.threadId),
     threadBinding: parseThreadBinding(body.threadBinding),
+  };
+}
+
+function parseStageWorkflowSave(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["definition", "version", "removals"]));
+  return {
+    definition: normalizeStageWorkflowDefinition(
+      body.definition,
+      (message) => new ApiError(400, "INVALID_FIELD", message),
+    ),
+    version: parseVersion(body.version),
+    removals: body.removals ?? [],
   };
 }
 
@@ -2408,6 +2425,32 @@ export function createTaskboardServer(options = {}) {
         return methodNotAllowed(response, ["GET", "POST"]);
       }
 
+      const stageWorkflowRoute = pathname.match(/^\/api\/projects\/([^/]+)\/stage-workflow$/);
+      if (stageWorkflowRoute) {
+        let projectId;
+        try {
+          projectId = decodeURIComponent(stageWorkflowRoute[1]);
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Project id contains invalid encoding");
+        }
+        validateProjectId(projectId);
+        if (request.method === "GET") {
+          return sendJson(response, 200, database.getStageWorkflow(projectId));
+        }
+        if (request.method === "PUT") {
+          const input = parseStageWorkflowSave(await readJson(request));
+          const workflow = database.saveStageWorkflow(
+            projectId,
+            input.version,
+            input.definition,
+            input.removals,
+          );
+          events.emit("stage-workflow.updated", { projectId });
+          return sendJson(response, 200, workflow);
+        }
+        return methodNotAllowed(response, ["GET", "PUT"]);
+      }
+
       const projectRoute = pathname.match(/^\/api\/projects\/([^/]+)$/);
       if (projectRoute) {
         if ([...url.searchParams.keys()].length > 0) {
@@ -3062,6 +3105,7 @@ export function createTaskboardServer(options = {}) {
             move.threadId,
             move.threadBinding,
             actorFromRequest(request),
+            move.stageId,
           );
           events.emit("task.moved", { task });
           return sendJson(response, 200, { task });

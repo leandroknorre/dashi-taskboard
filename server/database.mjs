@@ -4,6 +4,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { DEFAULT_LABEL_NAMES, JIRA_PROJECT_ID } from "../shared/domain.mjs";
+import { defaultStageWorkflowDefinition, normalizeStageWorkflowDefinition } from "../shared/board-workflow.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
 
@@ -237,6 +238,7 @@ function taskFromRow(row) {
     title: row.title,
     description: row.description,
     status: row.status,
+    stageId: row.stage_id ?? null,
     priority: row.priority,
     labels: JSON.parse(row.labels),
     sortOrder: row.sort_order,
@@ -459,6 +461,7 @@ export class TaskboardDatabase {
         status TEXT NOT NULL CHECK (status IN (
           'backlog', 'todo', 'in_progress', 'in_review', 'blocked', 'done', 'canceled'
         )),
+        stage_id TEXT,
         priority TEXT NOT NULL CHECK (priority IN ('none', 'urgent', 'high', 'medium', 'low')),
         labels TEXT NOT NULL DEFAULT '[]',
         sort_order REAL NOT NULL,
@@ -495,6 +498,24 @@ export class TaskboardDatabase {
 
       CREATE INDEX IF NOT EXISTS tasks_project_status_sort
         ON tasks(project_id, archived_at, status, sort_order, created_at);
+
+      CREATE TABLE IF NOT EXISTS workflow_stages (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        canonical_status TEXT NOT NULL,
+        name TEXT NOT NULL,
+        stage_order INTEGER NOT NULL,
+        board_visible INTEGER NOT NULL,
+        active INTEGER NOT NULL,
+        is_default_for_status INTEGER NOT NULL,
+        terminal_kind TEXT NOT NULL DEFAULT 'none'
+      );
+
+      CREATE TABLE IF NOT EXISTS project_stage_workflows (
+        project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+        version INTEGER NOT NULL DEFAULT 1,
+        updated_at TEXT NOT NULL
+      );
 
       CREATE TABLE IF NOT EXISTS comments (
         id TEXT PRIMARY KEY,
@@ -690,6 +711,9 @@ export class TaskboardDatabase {
     }
     this.#migrateTaskStatuses();
     const migratedTaskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
+    if (!migratedTaskColumns.some((column) => column.name === "stage_id")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN stage_id TEXT");
+    }
     if (!migratedTaskColumns.some((column) => column.name === "creator_type")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN creator_type TEXT NOT NULL DEFAULT 'user'");
     }
@@ -936,6 +960,21 @@ export class TaskboardDatabase {
       SET name = '全局', workspace_path = NULL, updated_at = ?
       WHERE id = 'local' AND (name != '全局' OR workspace_path IS NOT NULL)
     `).run(timestamp);
+    this.#migrateStageWorkflows();
+  }
+
+  #migrateStageWorkflows() {
+    const timestamp = now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      for (const project of this.database.prepare("SELECT id FROM projects").all()) {
+        this.#ensureStageWorkflow(project.id, timestamp);
+      }
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   close() {
@@ -1786,6 +1825,153 @@ export class TaskboardDatabase {
     }
   }
 
+  #ensureStageWorkflow(projectId, timestamp = now()) {
+    if (this.database.prepare("SELECT 1 FROM project_stage_workflows WHERE project_id = ?").get(projectId)) return;
+    const definition = defaultStageWorkflowDefinition();
+    for (const stage of definition.stages) {
+      this.database.prepare(`
+        INSERT INTO workflow_stages (
+          id, project_id, canonical_status, name, stage_order, board_visible,
+          active, is_default_for_status, terminal_kind
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        randomUUID(), projectId, stage.canonicalStatus, stage.name, stage.order,
+        Number(stage.boardVisible), Number(stage.active), Number(stage.isDefaultForStatus),
+        stage.terminalKind,
+      );
+    }
+    this.database.prepare(
+      "INSERT INTO project_stage_workflows (project_id, version, updated_at) VALUES (?, 1, ?)",
+    ).run(projectId, timestamp);
+    this.database.prepare(`
+      UPDATE tasks
+      SET stage_id = (
+        SELECT id FROM workflow_stages
+        WHERE project_id = tasks.project_id
+          AND canonical_status = tasks.status
+          AND active = 1
+          AND is_default_for_status = 1
+        LIMIT 1
+      )
+      WHERE project_id = ? AND stage_id IS NULL
+    `).run(projectId);
+  }
+
+  #resolveStage(projectId, stageId, status) {
+    this.#ensureStageWorkflow(projectId);
+    const stage = stageId
+      ? this.database.prepare(`
+          SELECT id, canonical_status FROM workflow_stages
+          WHERE id = ? AND project_id = ? AND active = 1
+        `).get(stageId, projectId)
+      : this.database.prepare(`
+          SELECT id, canonical_status FROM workflow_stages
+          WHERE project_id = ? AND canonical_status = ? AND active = 1
+            AND is_default_for_status = 1
+          LIMIT 1
+        `).get(projectId, status);
+    if (!stage) throw new ApiError(400, "INVALID_STAGE", "Stage does not exist, is inactive, or belongs to another project");
+    return stage;
+  }
+
+  getStageWorkflow(projectId) {
+    if (!this.database.prepare("SELECT 1 FROM projects WHERE id = ?").get(projectId)) {
+      throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
+    }
+    this.#ensureStageWorkflow(projectId);
+    const workflow = this.database.prepare(
+      "SELECT version, updated_at FROM project_stage_workflows WHERE project_id = ?",
+    ).get(projectId);
+    const stages = this.database.prepare(`
+      SELECT id, canonical_status, name, stage_order, board_visible, active,
+        is_default_for_status, terminal_kind
+      FROM workflow_stages WHERE project_id = ? ORDER BY stage_order, id
+    `).all(projectId).map((row) => ({
+      stageId: row.id,
+      canonicalStatus: row.canonical_status,
+      name: row.name,
+      order: row.stage_order,
+      boardVisible: Boolean(row.board_visible),
+      active: Boolean(row.active),
+      isDefaultForStatus: Boolean(row.is_default_for_status),
+      terminalKind: row.terminal_kind,
+    }));
+    return {
+      projectId,
+      definition: { schemaVersion: 2, stages },
+      version: workflow.version,
+      updatedAt: workflow.updated_at,
+    };
+  }
+
+  saveStageWorkflow(projectId, expectedVersion, definition, removals = []) {
+    const current = this.getStageWorkflow(projectId);
+    if (current.version !== expectedVersion) {
+      throw new ApiError(409, "VERSION_CONFLICT", "Workflow was changed by another client", {
+        expectedVersion,
+        actualVersion: current.version,
+      });
+    }
+    const normalized = normalizeStageWorkflowDefinition(
+      definition,
+      (message) => new ApiError(400, "INVALID_FIELD", message),
+    );
+    if (!Array.isArray(removals)) throw new ApiError(400, "INVALID_FIELD", "'removals' must be an array");
+    const supplied = normalized.stages.map((stage) => ({ ...stage, stageId: stage.stageId ?? randomUUID() }));
+    const removed = current.definition.stages.filter(
+      (stage) => !supplied.some((candidate) => candidate.stageId === stage.stageId),
+    );
+    const destinations = new Map(removals.map((item) => [item?.stageId, item?.destinationStageId]));
+    for (const stage of removed) {
+      const task = this.database.prepare(
+        "SELECT identifier FROM tasks WHERE project_id = ? AND stage_id = ? LIMIT 1",
+      ).get(projectId, stage.stageId);
+      const destinationStageId = destinations.get(stage.stageId);
+      if (task && !destinationStageId) {
+        throw new ApiError(409, "STAGE_HAS_TASKS", `Stage '${stage.name}' contains tasks; provide a destination stage`);
+      }
+      if (task && !supplied.some((candidate) => candidate.stageId === destinationStageId && candidate.active)) {
+        throw new ApiError(400, "INVALID_STAGE", "Removal destination must be an active stage in the new workflow");
+      }
+    }
+    const timestamp = now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database.prepare("DELETE FROM workflow_stages WHERE project_id = ?").run(projectId);
+      for (const stage of supplied) {
+        this.database.prepare(`
+          INSERT INTO workflow_stages (
+            id, project_id, canonical_status, name, stage_order, board_visible,
+            active, is_default_for_status, terminal_kind
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          stage.stageId, projectId, stage.canonicalStatus, stage.name, stage.order,
+          Number(stage.boardVisible), Number(stage.active), Number(stage.isDefaultForStatus),
+          stage.terminalKind,
+        );
+      }
+      for (const stage of removed) {
+        const destinationStageId = destinations.get(stage.stageId);
+        if (!destinationStageId) continue;
+        const destination = supplied.find((candidate) => candidate.stageId === destinationStageId);
+        this.database.prepare(`
+          UPDATE tasks SET stage_id = ?, status = ?, version = version + 1, updated_at = ?
+          WHERE project_id = ? AND stage_id = ?
+        `).run(destinationStageId, destination.canonicalStatus, timestamp, projectId, stage.stageId);
+      }
+      this.database.prepare(`
+        UPDATE project_stage_workflows
+        SET version = version + 1, updated_at = ?
+        WHERE project_id = ?
+      `).run(timestamp, projectId);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    return this.getStageWorkflow(projectId);
+  }
+
   listTasks(filters) {
     const where = [];
     const values = [];
@@ -1864,6 +2050,9 @@ export class TaskboardDatabase {
       if (!project) {
         throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${input.projectId}' does not exist`);
       }
+      const stage = this.#resolveStage(input.projectId, input.stageId, input.status);
+      input.status = stage.canonical_status;
+      input.stageId = stage.id;
 
       const prefix = projectPrefix(project);
       const maximum = this.database.prepare(`
@@ -1880,8 +2069,8 @@ export class TaskboardDatabase {
         const row = this.database.prepare(`
           SELECT MIN(sort_order) AS minimum
           FROM tasks
-          WHERE project_id = ? AND status = ? AND archived_at IS NULL
-        `).get(input.projectId, input.status);
+          WHERE project_id = ? AND stage_id = ? AND archived_at IS NULL
+        `).get(input.projectId, input.stageId);
         sortOrder = row.minimum === null ? 1000 : row.minimum - 1000;
       }
 
@@ -1895,7 +2084,7 @@ export class TaskboardDatabase {
       );
       this.database.prepare(`
         INSERT INTO tasks (
-          id, identifier, project_id, title, description, status, priority, labels,
+          id, identifier, project_id, title, description, status, stage_id, priority, labels,
           sort_order, thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path,
           creator_type, creator_id, creator_name, creator_avatar_url,
@@ -1903,7 +2092,7 @@ export class TaskboardDatabase {
           git_branch, worktree_path, worktree_branch,
           start_date, due_date, recurrence_interval, recurrence_unit,
           archived_at, version, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)
       `).run(
         id,
         identifier,
@@ -1911,6 +2100,7 @@ export class TaskboardDatabase {
         input.title,
         input.description,
         input.status,
+        input.stageId,
         input.priority,
         JSON.stringify(input.labels),
         sortOrder,
@@ -1944,6 +2134,12 @@ export class TaskboardDatabase {
   updateTask(id, version, changes, threadId, threadBinding, actor) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
+    const targetProjectId = Object.hasOwn(changes, "projectId") ? changes.projectId : current.projectId;
+    if (Object.hasOwn(changes, "stageId") || Object.hasOwn(changes, "status") || Object.hasOwn(changes, "projectId")) {
+      const stage = this.#resolveStage(targetProjectId, changes.stageId, changes.status ?? current.status);
+      changes.status = stage.canonical_status;
+      changes.stageId = stage.id;
+    }
     const activityChanges = taskFieldChanges(current, changes);
     const targetProject = Object.hasOwn(changes, "projectId")
       ? this.database.prepare("SELECT id, name, workspace_path, labels FROM projects WHERE id = ?").get(changes.projectId)
@@ -1985,6 +2181,7 @@ export class TaskboardDatabase {
       title: "title",
       description: "description",
       status: "status",
+      stageId: "stage_id",
       priority: "priority",
       labels: "labels",
       startDate: "start_date",
@@ -2020,13 +2217,16 @@ export class TaskboardDatabase {
       assignments.push(`${columns[key]} = ?`);
       values.push(key === "labels" ? JSON.stringify(value) : value);
     }
-    if (Object.hasOwn(changes, "status") && changes.status !== current.status) {
+    if (
+      (Object.hasOwn(changes, "status") && changes.status !== current.status)
+      || (Object.hasOwn(changes, "stageId") && changes.stageId !== current.stageId)
+    ) {
       const placementProjectId = projectChanged ? targetProject.id : current.projectId;
       const row = this.database.prepare(`
         SELECT MIN(sort_order) AS minimum
         FROM tasks
-        WHERE project_id = ? AND status = ? AND archived_at IS NULL AND id != ?
-      `).get(placementProjectId, changes.status, current.id);
+        WHERE project_id = ? AND stage_id = ? AND archived_at IS NULL AND id != ?
+      `).get(placementProjectId, changes.stageId, current.id);
       assignments.push("sort_order = ?");
       values.push(row.minimum === null ? 1000 : row.minimum - 1000);
     }
@@ -2079,25 +2279,28 @@ export class TaskboardDatabase {
     return this.getTask(current.id);
   }
 
-  moveTask(id, version, status, sortOrder, threadId, threadBinding, actor) {
+  moveTask(id, version, status, sortOrder, threadId, threadBinding, actor, stageId) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
     if (current.archivedAt !== null) {
       throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be moved");
     }
-    if (status !== current.status && sortOrder === undefined) {
+    const stage = this.#resolveStage(current.projectId, stageId, status);
+    status = stage.canonical_status;
+    stageId = stage.id;
+    if ((status !== current.status || stageId !== current.stageId) && sortOrder === undefined) {
       const row = this.database.prepare(`
         SELECT MIN(sort_order) AS minimum
         FROM tasks
-        WHERE project_id = ? AND status = ? AND archived_at IS NULL AND id != ?
-      `).get(current.projectId, status, current.id);
+        WHERE project_id = ? AND stage_id = ? AND archived_at IS NULL AND id != ?
+      `).get(current.projectId, stageId, current.id);
       sortOrder = row.minimum === null ? 1000 : row.minimum - 1000;
     } else if (sortOrder === undefined) {
       const row = this.database.prepare(`
         SELECT COALESCE(MAX(sort_order), 0) AS maximum
         FROM tasks
-        WHERE project_id = ? AND status = ? AND archived_at IS NULL AND id != ?
-      `).get(current.projectId, status, current.id);
+        WHERE project_id = ? AND stage_id = ? AND archived_at IS NULL AND id != ?
+      `).get(current.projectId, stageId, current.id);
       sortOrder = row.maximum + 1000;
     }
 
@@ -2111,16 +2314,16 @@ export class TaskboardDatabase {
     try {
       const result = this.database.prepare(`
         UPDATE tasks
-        SET status = ?, sort_order = ?, ${threadAssignment} version = version + 1, updated_at = ?
+        SET status = ?, stage_id = ?, sort_order = ?, ${threadAssignment} version = version + 1, updated_at = ?
         WHERE id = ? AND version = ?
-      `).run(status, sortOrder, ...(storedBinding ?? []), timestamp, current.id, version);
+      `).run(status, stageId, sortOrder, ...(storedBinding ?? []), timestamp, current.id, version);
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
       }
       this.#recordTaskActivity(
         current.id,
         actor,
-        taskFieldChanges(current, { status }),
+        taskFieldChanges(current, { status, stageId }),
         timestamp,
       );
       this.database.exec("COMMIT");

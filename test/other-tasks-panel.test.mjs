@@ -23,12 +23,13 @@ function cssBlock(selector) {
   return styles.slice(start, end + 2);
 }
 
-test("the issue workspace projects configured statuses into adaptive main and secondary groups", () => {
+test("the issue workspace keeps display settings for cards while project workflows own stages", () => {
   assert.deepEqual(statusList("MAIN_STATUSES"), ["todo", "in_progress", "blocked", "in_review"]);
   assert.deepEqual(statusList("SECONDARY_STATUSES"), ["backlog", "done", "canceled"]);
   assert.match(statusSource, /satisfies readonly TaskStatus\[\]/);
-  assert.match(appSource, /const mainBoardItems = boardDisplaySettings\.mainStatuses/);
-  assert.match(appSource, /mainBoardItems\.map\(\(item\) => item === "archived" \? \([\s\S]*?<BoardColumn/);
+  assert.match(appSource, /const workflowBoardStages = stageWorkflow\?\.definition\.stages/);
+  assert.match(appSource, /const mainBoardItems = workflowBoardStages\.length[\s\S]*?workflowBoardStages\.map\(\(stage\) => stage\.stageId\)[\s\S]*?: boardDisplaySettings\.mainStatuses/);
+  assert.match(appSource, /mainBoardItems\.map\(\(item\) => \{[\s\S]*?workflowStage = workflowBoardStages\.find/);
   assert.match(appSource, /mainBoardItems\.map\(\(item\) => \([\s\S]*?className="loading-column"/);
   assert.match(boardColumnSource, /todo: \{ label: "等待认领", tone: "todo" \}/);
   assert.match(boardColumnSource, /in_progress: \{ label: "处理中", tone: "progress" \}/);
@@ -39,7 +40,7 @@ test("the issue workspace projects configured statuses into adaptive main and se
 test("other tasks is a closed-by-default non-modal panel with archived issues", () => {
   assert.match(appSource, /useState\(false\)/);
   assert.match(appSource, /useState<OtherTaskTab>\("backlog"\)/);
-  assert.match(appSource, /const otherTaskTabs = boardDisplaySettings\.sidebarStatuses/);
+  assert.match(appSource, /const otherTaskTabs = workflowBoardStages\.length[\s\S]*?: boardDisplaySettings\.sidebarStatuses/);
   assert.match(appSource, /className=\{`other-tasks-trigger\$\{otherTasksOpen \? " is-open" : ""\}`\}/);
   assert.match(appSource, /aria-controls="other-tasks-panel"/);
   assert.match(appSource, /aria-expanded=\{otherTasksOpen\}/);
@@ -65,7 +66,7 @@ test("other tasks is a closed-by-default non-modal panel with archived issues", 
 test("search and filters feed the same status buckets used by the board and panel", () => {
   assert.match(appSource, /const filteredTasks = useMemo\([\s\S]*?matchesTaskSearch\(task, search, language\) && matchesTaskFilters\(task, filters\)/);
   assert.match(appSource, /TASK_STATUSES\.map\(\(status\) => \[status, filteredTasks\.filter\(\(task\) => task\.status === status\)\]\)/);
-  assert.match(appSource, /tasks=\{tasksByStatus\[item\]\}/);
+  assert.match(appSource, /tasks=\{workflowStage[\s\S]*?task\.stageId === workflowStage\.stageId[\s\S]*?: tasksByStatus\[item as TaskStatus\]\}/);
   assert.match(appSource, /tasksByStatus=\{tasksByStatus\}/);
   assert.match(appSource, /archivedTasks=\{filteredArchivedTasks\}/);
   assert.match(appSource, /hasActiveFilters=\{hasActiveTaskFilters\}/);
@@ -98,7 +99,7 @@ test("panel cards reuse TaskCard and the existing ranked board drop path", () =>
 test("global creation defaults to todo while per-column creation keeps the chosen status", () => {
   assert.equal(appSource.match(/setEditor\(\{ task: null, status: "todo" \}\)/g)?.length, 3);
   assert.doesNotMatch(appSource, /setEditor\(\{ task: null, status: "backlog" \}\)/);
-  assert.match(appSource, /onCreate=\{\(initialStatus\) => setEditor\(\{ task: null, status: initialStatus \}\)\}/);
+  assert.match(appSource, /onCreate=\{\(initialStatus, stageId\) => setEditor\(\{ task: null, status: initialStatus, stageId \}\)\}/);
 });
 
 test("legacy empty-column and manual visibility runtime paths are removed", async () => {

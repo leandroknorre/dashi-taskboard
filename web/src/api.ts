@@ -24,6 +24,8 @@ import type {
   ProjectReadmeAttachment,
   ProjectSummary,
   Task,
+  StageWorkflowDefinition,
+  StageWorkflowRecord,
   TaskChangeActivity,
   TaskboardMetadata,
   TaskDraft,
@@ -574,6 +576,25 @@ export async function createTask(projectId: string, draft: TaskDraft, threadId?:
   return data.task;
 }
 
+export function getStageWorkflow(projectId: string, signal?: AbortSignal): Promise<StageWorkflowRecord> {
+  return request<StageWorkflowRecord>(
+    `/api/projects/${encodeURIComponent(projectId)}/stage-workflow`,
+    { signal },
+  );
+}
+
+export function saveStageWorkflow(
+  projectId: string,
+  definition: StageWorkflowDefinition,
+  version: number,
+  removals: Array<{ stageId: string; destinationStageId: string }> = [],
+): Promise<StageWorkflowRecord> {
+  return request<StageWorkflowRecord>(
+    `/api/projects/${encodeURIComponent(projectId)}/stage-workflow`,
+    { method: "PUT", body: JSON.stringify({ definition, version, removals }) },
+  );
+}
+
 export async function updateTask(task: Task, draft: TaskDraft, threadId?: string): Promise<Task> {
   const data = await request<{ task: Task }>(`/api/tasks/${encodeURIComponent(task.id)}`, {
     method: "PATCH",
@@ -588,6 +609,7 @@ export async function moveTask(
   sortOrder?: number,
   threadBinding?: CodexThreadBinding | null,
   threadId?: string,
+  stageId?: string,
 ): Promise<Task> {
   const data = await request<{ task: Task }>(
     `/api/tasks/${encodeURIComponent(task.id)}/move`,
@@ -596,6 +618,7 @@ export async function moveTask(
       body: JSON.stringify({
         version: task.version,
         status,
+        ...(stageId ? { stageId } : {}),
         ...(sortOrder === undefined ? {} : { sortOrder }),
         ...(threadBinding === undefined ? {} : { threadBinding }),
         ...(threadId ? { threadId } : {}),

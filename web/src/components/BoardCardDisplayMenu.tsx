@@ -31,12 +31,14 @@ export const DEFAULT_BOARD_DISPLAY_SETTINGS: BoardDisplaySettings = {
 
 interface BoardCardDisplayMenuProps {
   settings: BoardDisplaySettings;
+  workflowManaged?: boolean;
   onChange: (value: BoardDisplaySettings) => void;
   onReset: () => void;
 }
 
 export function BoardCardDisplayMenu({
   settings,
+  workflowManaged = false,
   onChange,
   onReset,
 }: BoardCardDisplayMenuProps) {
@@ -206,23 +208,29 @@ export function BoardCardDisplayMenu({
           <span aria-hidden="true" />
         </button>
       </div>
-      <button
-        className="display-settings-more"
-        type="button"
-        aria-haspopup="dialog"
-        onClick={() => {
-          setMenuOpen(false);
-          setDialogOpen(true);
-        }}
-      >
-        <span>{text("更多显示设置", "More display settings")}</span>
-        <span aria-hidden="true">›</span>
-      </button>
+      {workflowManaged ? (
+        <p className="board-display-workflow-hint">
+          {text("列由项目流程配置。", "Columns are configured by the project workflow.")}
+        </p>
+      ) : (
+        <button
+          className="display-settings-more"
+          type="button"
+          aria-haspopup="dialog"
+          onClick={() => {
+            setMenuOpen(false);
+            setDialogOpen(true);
+          }}
+        >
+          <span>{text("更多显示设置", "More display settings")}</span>
+          <span aria-hidden="true">›</span>
+        </button>
+      )}
     </div>,
     document.body,
   ) : null;
 
-  const dialog = dialogOpen ? createPortal(
+  const dialog = dialogOpen && !workflowManaged ? createPortal(
     <div
       className="display-settings-backdrop no-drag"
       onPointerDown={(event) => {

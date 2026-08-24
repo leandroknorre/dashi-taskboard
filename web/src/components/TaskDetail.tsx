@@ -44,6 +44,7 @@ import type {
   TaskPriority,
   TaskRelationSummary,
   TaskStatus,
+  WorkflowStage,
 } from "../types";
 import {
   CODEX_AGENT_ACTOR,
@@ -106,6 +107,7 @@ interface TaskDetailProps {
   tasks: Task[];
   referenceTasks: Task[];
   currentUser: ActorIdentity;
+  workflowStages?: readonly WorkflowStage[];
   availableLabels: string[];
   developmentScan: DevelopmentScan;
   developmentScanLoading: boolean;
@@ -383,6 +385,7 @@ export function TaskDetail({
   tasks,
   referenceTasks,
   currentUser,
+  workflowStages,
   availableLabels,
   developmentScan,
   developmentScanLoading,
@@ -1681,11 +1684,13 @@ export function TaskDetail({
             <div className="detail-property-row">
               <span className="detail-property-label">{text("状态", "Status")}</span>
               <TaskPropertyPicker
-                value={currentTask.status}
-                options={TASK_STATUSES.map((status) => ({
-                  value: status,
-                  label: taskStatusLabel(language, status),
-                  icon: <StatusIcon status={status} color="currentColor" size={14} />,
+                value={workflowStages ? currentTask.stageId ?? currentTask.status : currentTask.status}
+                options={(workflowStages?.filter((stage) => stage.active) ?? TASK_STATUSES.map((status) => ({
+                  stageId: status, canonicalStatus: status, name: taskStatusLabel(language, status),
+                }))).map((stage) => ({
+                  value: stage.stageId,
+                  label: stage.name || taskStatusLabel(language, stage.canonicalStatus),
+                  icon: <StatusIcon status={stage.canonicalStatus} color="currentColor" size={14} />,
                 }))}
                 open={propertyMenu === "status"}
                 disabled={savingProperty === "status"}
@@ -1697,13 +1702,16 @@ export function TaskDetail({
                       <StatusIcon status={currentTask.status} color="currentColor" size={14} />
                     </span>
                     <span className="task-property-trigger-label">
-                      {taskStatusLabel(language, currentTask.status)}
+                      {workflowStages?.find((stage) => stage.stageId === currentTask.stageId)?.name ?? taskStatusLabel(language, currentTask.status)}
                     </span>
                   </>
                 )}
                 ariaLabel={text("状态", "Status")}
                 onOpenChange={(open) => setPropertyMenu(open ? "status" : null)}
-                onChange={(status) => void saveTask({ status }, "status")}
+                onChange={(stageId) => {
+                  const stage = workflowStages?.find((candidate) => candidate.stageId === stageId);
+                  void saveTask(stage ? { status: stage.canonicalStatus, stageId } : { status: stageId as TaskStatus }, "status");
+                }}
               />
             </div>
             <div className="detail-property-row">

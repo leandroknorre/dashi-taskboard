@@ -18,6 +18,7 @@ import {
   type TaskDraft,
   type TaskPriority,
   type TaskStatus,
+  type WorkflowStage,
 } from "../types";
 import {
   CODEX_AGENT_ACTOR,
@@ -89,6 +90,7 @@ export interface NewTaskEditorDraft {
   title: string;
   descriptionSegments: InlineMediaSegment[];
   status: TaskStatus;
+  stageId?: string;
   priority: TaskPriority;
   assignee: ActorIdentity;
   selectedLabels: string[];
@@ -108,9 +110,11 @@ interface TaskEditorProps {
   tasks: Task[];
   referenceTasks: Task[];
   initialStatus: TaskStatus;
+  initialStageId?: string;
   initialDraft: NewTaskEditorDraft | null;
   labels: string[];
   currentUser: ActorIdentity;
+  workflowStages?: readonly WorkflowStage[];
   developmentScan: DevelopmentScan;
   developmentScanLoading: boolean;
   onCreateLabel: (label: string) => Promise<void>;
@@ -167,9 +171,11 @@ export function TaskEditor({
   tasks,
   referenceTasks,
   initialStatus,
+  initialStageId,
   initialDraft,
   labels: availableLabels,
   currentUser,
+  workflowStages,
   developmentScan,
   developmentScanLoading,
   onCreateLabel,
@@ -190,6 +196,10 @@ export function TaskEditor({
     () => initialDraft?.descriptionSegments ?? createInlineMediaSegments(),
   );
   const [status, setStatus] = useState<TaskStatus>(task?.status ?? initialStatus);
+  const [stageId, setStageId] = useState<string | undefined>(() => {
+    const candidate = task?.stageId ?? initialDraft?.stageId ?? initialStageId;
+    return workflowStages?.some((stage) => stage.stageId === candidate) ? candidate : undefined;
+  });
   const [priority, setPriority] = useState<TaskPriority>(task?.priority ?? initialDraft?.priority ?? "none");
   const [assignee, setAssignee] = useState<ActorIdentity>(task?.assignee ?? initialDraft?.assignee ?? currentUser);
   const [selectedLabels, setSelectedLabels] = useState<string[]>(task?.labels ?? initialDraft?.selectedLabels ?? []);
@@ -209,6 +219,24 @@ export function TaskEditor({
   const [error, setError] = useState<TaskEditorError | null>(null);
   const [attachmentError, setAttachmentError] = useState<TaskEditorError | null>(null);
   const [attachments, setAttachments] = useState<File[]>(initialDraft?.attachments ?? []);
+
+  const orderedWorkflowStages = useMemo(() => workflowStages?.length
+    ? [...workflowStages]
+      .filter((stage) => stage.active)
+      .sort((left, right) => left.order - right.order)
+    : TASK_STATUSES.map((value) => ({
+      stageId: undefined,
+      canonicalStatus: value,
+      name: taskStatusLabel(language, value),
+    })), [language, workflowStages]);
+
+  useEffect(() => {
+    if (stageId || !workflowStages?.length) return;
+    const defaultStage = workflowStages.find((stage) => (
+      stage.active && stage.isDefaultForStatus && stage.canonicalStatus === status
+    )) ?? workflowStages.find((stage) => stage.active && stage.canonicalStatus === status);
+    if (defaultStage) setStageId(defaultStage.stageId);
+  }, [stageId, status, workflowStages]);
 
   const developmentOptions = useMemo(() => {
     const options = [...developmentScan.contexts];
@@ -395,6 +423,7 @@ export function TaskEditor({
         title: cleanTitle,
         description: descriptionValue,
         status,
+        ...(stageId ? { stageId } : {}),
         priority,
         labels: selectedLabels,
         ...(assigneeTarget ? { assigneeTarget } : {}),
@@ -474,6 +503,7 @@ export function TaskEditor({
       title,
       descriptionSegments,
       status,
+      stageId,
       priority,
       assignee,
       selectedLabels,
@@ -606,17 +636,24 @@ export function TaskEditor({
               />
             )}
             <TaskPropertyPicker
-              value={status}
-              options={TASK_STATUSES.map((value) => ({
-                value,
-                label: taskStatusLabel(language, value),
-                icon: <StatusIcon status={value} color="currentColor" size={14} />,
+              value={stageId ?? status}
+              options={orderedWorkflowStages.map((stage) => ({
+                value: stage.stageId ?? stage.canonicalStatus,
+                label: stage.name || taskStatusLabel(language, stage.canonicalStatus),
+                icon: <StatusIcon status={stage.canonicalStatus} color="currentColor" size={14} />,
               }))}
               open={menu === "status"}
               triggerClassName="property-control property-status"
               ariaLabel={text("状态", "Status")}
               onOpenChange={(open) => setMenu(open ? "status" : null)}
-              onChange={setStatus}
+              onChange={(value) => {
+                const selected = orderedWorkflowStages.find((stage) => (
+                  (stage.stageId ?? stage.canonicalStatus) === value
+                ));
+                if (!selected) return;
+                setStatus(selected.canonicalStatus);
+                setStageId(selected.stageId);
+              }}
             />
             <TaskPropertyPicker
               value={priority}

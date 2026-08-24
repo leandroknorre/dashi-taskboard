@@ -1183,6 +1183,13 @@ kbd {
   line-height: 1;
 }
 
+.board-display-workflow-hint {
+  margin: 4px 0 0;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 16px;
+}
+
 .display-settings-backdrop {
   position: fixed;
   z-index: 1700;
@@ -11618,4 +11625,83 @@ kbd {
   .dashboard-metrics { grid-template-columns: minmax(0, 1fr); }
   .dashboard-metric { border-left: 0; border-top: var(--border-hairline) solid var(--border); }
   .dashboard-metric:first-child { border-top: 0; }
+}
+
+/* Project workflow editor: its own scroll regions keep controls reachable on
+   compact laptop viewports while the board retains visible native rails. */
+.board-scroll,
+.board-column,
+.column-list,
+.other-tasks-list,
+.board-workflow-stages,
+.board-workflow-preview {
+  scrollbar-gutter: stable both-edges;
+  scrollbar-color: var(--border-strong, #a6adbb) transparent;
+  scrollbar-width: auto;
+}
+.board-scroll::-webkit-scrollbar,
+.board-column::-webkit-scrollbar,
+.column-list::-webkit-scrollbar,
+.other-tasks-list::-webkit-scrollbar,
+.board-workflow-stages::-webkit-scrollbar,
+.board-workflow-preview::-webkit-scrollbar { display: block; width: 12px; height: 12px; }
+.board-scroll::-webkit-scrollbar-thumb,
+.board-column::-webkit-scrollbar-thumb,
+.column-list::-webkit-scrollbar-thumb,
+.other-tasks-list::-webkit-scrollbar-thumb,
+.board-workflow-stages::-webkit-scrollbar-thumb,
+.board-workflow-preview::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--text-secondary, #596273) 60%, transparent);
+  border: 3px solid transparent; border-radius: 999px; background-clip: padding-box;
+}
+.board-workflow-dialog {
+  width: min(760px, calc(100vw - 32px));
+  height: min(720px, calc(100dvh - 40px));
+  max-height: min(720px, calc(100dvh - 40px));
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow: hidden;
+}
+.board-workflow-header { display: flex; justify-content: space-between; gap: 16px; }
+.board-workflow-header h2, .board-workflow-header p { margin: 0; }
+.board-workflow-header p { margin-top: 6px; color: var(--text-secondary, #687184); }
+.board-workflow-body {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  flex-direction: column;
+  gap: 10px;
+  overflow: hidden;
+}
+.board-workflow-preview { display: flex; gap: 8px; overflow: auto; padding: 10px; border: 1px solid var(--border, #e0e3eb); border-radius: 10px; }
+.board-workflow-preview span { flex: 0 0 auto; padding: 5px 12px; border-radius: 7px; background: var(--surface-muted, #f3f4f8); }
+.board-workflow-stages {
+  display: grid;
+  flex: 1 1 auto;
+  min-height: 132px;
+  overflow: auto;
+  gap: 8px;
+  padding-right: 4px;
+}
+.board-workflow-stage {
+  display: grid;
+  min-width: 720px;
+  grid-template-columns: auto minmax(160px, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px;
+  border: 1px solid var(--border, #e0e3eb);
+  border-radius: 8px;
+}
+.board-workflow-stage-order { display: flex; gap: 2px; }
+.board-workflow-stage-label { display: grid; grid-template-columns: minmax(0, 1fr) 150px; gap: 8px; }
+.board-workflow-stage input, .board-workflow-stage select, .board-workflow-remap select { min-width: 0; }
+.board-workflow-visibility { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.board-workflow-remap { display: grid; grid-template-columns: minmax(0, 1fr) 200px; gap: 8px; align-items: center; }
+.board-workflow-actions { display: flex; flex: 0 0 auto; justify-content: flex-end; gap: 8px; margin: 0; }
+@media (max-width: 719px) {
+  .board-workflow-stage { min-width: 0; grid-template-columns: auto minmax(0, 1fr) auto; }
+  .board-workflow-stage-label, .board-workflow-remap { grid-template-columns: 1fr; }
+  .board-workflow-remove { grid-column: 2 / -1; }
 }

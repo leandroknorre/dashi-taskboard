@@ -405,6 +405,7 @@ export interface Task {
   title: string;
   description: string;
   status: TaskStatus;
+  stageId: string | null;
   priority: TaskPriority;
   labels: string[];
   sortOrder: number;
@@ -519,6 +520,7 @@ export interface TaskDraft {
   title: string;
   description: string;
   status: TaskStatus;
+  stageId?: string;
   priority: TaskPriority;
   labels: string[];
   assigneeTarget?: AssigneeTarget;
@@ -526,6 +528,29 @@ export interface TaskDraft {
   startDate: string | null;
   dueDate: string | null;
   recurrence: Recurrence | null;
+}
+
+export interface WorkflowStage {
+  stageId: string;
+  canonicalStatus: TaskStatus;
+  name: string;
+  boardVisible: boolean;
+  order: number;
+  active: boolean;
+  isDefaultForStatus: boolean;
+  terminalKind: "none" | "done" | "canceled";
+}
+
+export interface StageWorkflowDefinition {
+  schemaVersion: 2;
+  stages: WorkflowStage[];
+}
+
+export interface StageWorkflowRecord {
+  projectId: string;
+  definition: StageWorkflowDefinition;
+  version: number;
+  updatedAt: string | null;
 }
 
 export interface TaskEvent {

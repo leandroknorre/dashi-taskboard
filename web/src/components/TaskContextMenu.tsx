@@ -14,6 +14,7 @@ import {
   type Task,
   type TaskPriority,
   type TaskStatus,
+  type WorkflowStage,
 } from "../types";
 import { labelPresentation } from "../labels";
 import { taskPriorityLabel, taskStatusLabel, useTaskboardI18n } from "../i18n";
@@ -33,9 +34,10 @@ interface TaskContextMenuProps {
   task: Task;
   position: { x: number; y: number };
   labels: string[];
+  workflowStages?: readonly WorkflowStage[];
   onClose: () => void;
   onEdit: (task: Task) => void;
-  onStatusChange: (task: Task, status: TaskStatus) => void;
+  onStatusChange: (task: Task, status: TaskStatus, stageId?: string) => void;
   onPriorityChange: (task: Task, priority: TaskPriority) => void;
   onLabelsChange: (task: Task, labels: string[]) => void;
   onDuplicate: (task: Task) => void;
@@ -105,6 +107,7 @@ export function TaskContextMenu({
   task,
   position,
   labels,
+  workflowStages,
   onClose,
   onEdit,
   onStatusChange,
@@ -285,14 +288,14 @@ export function TaskContextMenu({
         >
           {submenu === "status" && (
             <div className="context-submenu" role="menu" data-submenu-panel="status" style={{ "--submenu-shift": `${submenuShift}px` } as CSSProperties}>
-              {TASK_STATUSES.map((status, index) => (
+              {(workflowStages?.filter((stage) => stage.active) ?? TASK_STATUSES.map((status, index) => ({ stageId: status, canonicalStatus: status, name: taskStatusLabel(language, status), order: index }))).map((stage, index) => (
                 <MenuItem
-                  key={status}
-                  label={taskStatusLabel(language, status)}
-                  icon={<StatusIcon status={status} color="currentColor" />}
+                  key={stage.stageId}
+                  label={stage.name || taskStatusLabel(language, stage.canonicalStatus)}
+                  icon={<StatusIcon status={stage.canonicalStatus} color="currentColor" />}
                   shortcut={String(index + 1)}
-                  checked={task.status === status}
-                  onClick={() => closeThen(() => onStatusChange(task, status))}
+                  checked={workflowStages ? task.stageId === stage.stageId : task.status === stage.canonicalStatus}
+                  onClick={() => closeThen(() => onStatusChange(task, stage.canonicalStatus, workflowStages ? stage.stageId : undefined))}
                 />
               ))}
             </div>

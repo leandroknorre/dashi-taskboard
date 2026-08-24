@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Gantt, type GanttStatic, type Task as GanttTask } from "dhtmlx-gantt";
 import "../vendor/dhtmlxgantt.css";
-import type { Task, TaskDraft } from "../types";
+import type { Task, TaskDraft, WorkflowStage } from "../types";
 import type { TaskCardPresentation } from "../taskConversations";
 import { useTaskboardI18n } from "../i18n";
 import { LinearIcon } from "./LinearIcon";
@@ -12,6 +12,8 @@ type GanttZoom = "day" | "week" | "month";
 
 interface GanttGroupDefinition {
   id: string;
+  stageId?: string;
+  label?: string;
   chineseLabel: string;
   englishLabel: string;
   statuses: Task["status"][];
@@ -37,6 +39,7 @@ interface GanttViewProps {
   zoom: GanttZoom;
   hideCompleted: boolean;
   todayRequest: number;
+  workflowStages?: readonly WorkflowStage[];
   onOpenTask: (task: Task) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
 }
@@ -106,11 +109,12 @@ function dateCellClass(date: Date) {
   return classes.join(" ");
 }
 
-export function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCompleted, todayRequest, onOpenTask, onUpdate }: GanttViewProps) {
+export function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCompleted, todayRequest, workflowStages, onOpenTask, onUpdate }: GanttViewProps) {
   const { language, locale, text } = useTaskboardI18n();
   const i18nRef = useRef({ language, locale, text });
   const containerRef = useRef<HTMLDivElement>(null);
   const ganttRef = useRef<GanttStatic | null>(null);
+  const [ganttReady, setGanttReady] = useState(false);
   const [gridCollapsed, setGridCollapsed] = useState(false);
   const [gridWidth, setGridWidth] = useState(360);
   const [todayMarkerLeft, setTodayMarkerLeft] = useState<number | null>(null);
@@ -129,6 +133,13 @@ export function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCo
     () => hideCompleted ? tasks.filter((task) => task.status !== "done" && task.status !== "canceled") : tasks,
     [hideCompleted, tasks],
   );
+  const ganttGroups = useMemo(() => workflowStages?.length
+    ? workflowStages.filter((stage) => stage.active).sort((left, right) => left.order - right.order).map((stage) => ({
+      id: stage.stageId, stageId: stage.stageId, label: stage.name, chineseLabel: "", englishLabel: "",
+      statuses: [stage.canonicalStatus], defaultOpen: stage.canonicalStatus !== "done" && stage.canonicalStatus !== "canceled",
+    }))
+    : GANTT_GROUPS,
+  [workflowStages]);
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -309,6 +320,10 @@ export function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCo
     };
     try {
       instance.init(container);
+      // The project workflow can resolve while this lazy module is mounting.
+      // A state tick after init guarantees the current projection is parsed
+      // against a live DHTMLX instance instead of being dropped in that gap.
+      setGanttReady(true);
     } finally {
       instance.event = originalEvent;
     }
@@ -344,12 +359,12 @@ export function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCo
     const issueColumn = instance.config.columns.find((column) => column.name === "text");
     if (issueColumn) issueColumn.label = i18nRef.current.text("议题", "Issue");
 
-    for (const group of GANTT_GROUPS) {
+    for (const group of ganttGroups) {
       const id = `gantt-group-${group.id}`;
       if (!instance.isTaskExists(id)) continue;
       const task = instance.getTask(id) as TaskboardGanttTask & { $open?: boolean };
       const open = task.$open;
-      const label = i18nRef.current.text(group.chineseLabel, group.englishLabel);
+      const label = group.label || i18nRef.current.text(group.chineseLabel, group.englishLabel);
       task.text = label;
       task.taskboardTitle = label;
       task.$open = open;
@@ -362,26 +377,26 @@ export function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCo
     instance.config.show_grid = showGrid;
     instance.config.grid_width = gridWidth;
     instance.scrollTo(scroll.x, scroll.y);
-  }, [language, locale, text]);
+  }, [ganttGroups, language, locale, text]);
 
   useEffect(() => {
     const instance = ganttRef.current;
-    if (!instance) return;
+    if (!instance || !ganttReady) return;
     const data: TaskboardGanttTask[] = [];
     const groupOpenState = new Map<string, boolean>();
 
-    for (const group of GANTT_GROUPS) {
+    for (const group of ganttGroups) {
       const groupId = `gantt-group-${group.id}`;
       if (!instance.isTaskExists(groupId)) continue;
       const existingGroup = instance.getTask(groupId) as TaskboardGanttTask & { $open?: boolean };
       groupOpenState.set(groupId, Boolean(existingGroup.$open));
     }
 
-    for (const group of GANTT_GROUPS) {
+    for (const group of ganttGroups) {
       const groupId = `gantt-group-${group.id}`;
-      const groupLabel = i18nRef.current.text(group.chineseLabel, group.englishLabel);
+      const groupLabel = group.label || i18nRef.current.text(group.chineseLabel, group.englishLabel);
       const groupTasks = visibleTasks
-        .filter((task) => group.statuses.includes(task.status))
+        .filter((task) => group.stageId ? task.stageId === group.stageId : group.statuses.includes(task.status))
         .sort((left, right) => Number(Boolean(right.startDate && right.dueDate)) - Number(Boolean(left.startDate && left.dueDate)));
       if (!groupTasks.length) continue;
       const progress = groupTasks.reduce((sum, task) => sum + taskProgress(task, presentations[task.id]), 0) / groupTasks.length;
@@ -469,7 +484,7 @@ export function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCo
     }
     if (restoredViewport) pendingDetailViewport = null;
     hasParsedDataRef.current = true;
-  }, [presentations, visibleTasks]);
+  }, [ganttGroups, ganttReady, presentations, visibleTasks]);
 
   useEffect(() => {
     ganttRef.current?.ext.zoom.setLevel(zoom);

@@ -22,6 +22,8 @@ export const STATUS_DETAILS: Record<
 interface BoardColumnProps {
   scrollRef: (element: HTMLDivElement | null) => void;
   status: TaskStatus;
+  stageId?: string;
+  label?: string;
   tasks: Task[];
   presentations: Record<string, TaskCardPresentation>;
   now: number;
@@ -39,21 +41,23 @@ interface BoardColumnProps {
   showBody: boolean;
   createEnabled?: boolean;
   onCreateLabel: (label: string, projectId?: string) => Promise<void>;
-  onCreate: (status: TaskStatus) => void;
+  onCreate: (status: TaskStatus, stageId?: string) => void;
   onEdit: (task: Task) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
   onComplete: (task: Task) => void;
   onContextMenu: (task: Task, position: { x: number; y: number }) => void;
   onDragStart: (task: Task, height: number) => void;
   onDragEnd: () => void;
-  onDragEnter: (status: TaskStatus) => void;
-  onDrop: (status: TaskStatus, taskId: string, beforeTaskId: string | null) => void;
+  onDragEnter: (status: TaskStatus, stageId?: string) => void;
+  onDrop: (status: TaskStatus, taskId: string, beforeTaskId: string | null, stageId?: string) => void;
   onOpenConversation: (conversation: TaskConversationItem) => void;
 }
 
 export function BoardColumn({
   scrollRef,
   status,
+  stageId,
+  label: suppliedLabel,
   tasks,
   presentations,
   now,
@@ -84,7 +88,7 @@ export function BoardColumn({
 }: BoardColumnProps) {
   const { language, text } = useTaskboardI18n();
   const details = STATUS_DETAILS[status];
-  const label = taskStatusLabel(language, status);
+  const label = suppliedLabel ?? taskStatusLabel(language, status);
   const [dropBeforeTaskId, setDropBeforeTaskId] = useState<string | null | undefined>();
   const taskIndexes = new Map(tasks.map((task, index) => [task.id, index]));
   const remainingTasks = tasks.filter((task) => task.id !== draggedTaskId);
@@ -112,7 +116,7 @@ export function BoardColumn({
     const taskId =
       event.dataTransfer.getData("application/x-taskboard-task") ||
       event.dataTransfer.getData("text/plain");
-    if (taskId) onDrop(status, taskId, findDropBefore(event.currentTarget, event.clientY));
+    if (taskId) onDrop(status, taskId, findDropBefore(event.currentTarget, event.clientY), stageId);
     setDropBeforeTaskId(undefined);
   }
 
@@ -131,11 +135,11 @@ export function BoardColumn({
     <section
       className={`board-column status-${status}${isDropTarget ? " is-drop-target" : ""}`}
       aria-labelledby={`column-${status}`}
-      onDragEnter={() => onDragEnter(status)}
+      onDragEnter={() => onDragEnter(status, stageId)}
       onDragOver={(event) => {
         event.preventDefault();
         event.dataTransfer.dropEffect = "move";
-        onDragEnter(status);
+        onDragEnter(status, stageId);
         setDropBeforeTaskId(findDropBefore(event.currentTarget, event.clientY));
       }}
       onDragLeave={(event) => {
@@ -159,7 +163,7 @@ export function BoardColumn({
             <button
               type="button"
               className="icon-button add-task-button"
-              onClick={() => onCreate(status)}
+              onClick={() => onCreate(status, stageId)}
               aria-label={text(`在${label}中新建议题`, `Create issue in ${label}`)}
               title={text(`添加到${label}`, `Add to ${label}`)}
             >

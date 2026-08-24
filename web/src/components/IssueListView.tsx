@@ -1,9 +1,9 @@
-import { useState, type KeyboardEvent, type MouseEvent, type RefObject } from "react";
+import { useMemo, useState, type KeyboardEvent, type MouseEvent, type RefObject } from "react";
 import { assigneeTargetForActor } from "../actors";
 import { taskPriorityLabel, taskStatusLabel, useTaskboardI18n } from "../i18n";
 import { labelPresentation } from "../labels";
 import type { TaskCardPresentation } from "../taskConversations";
-import { TASK_PRIORITIES, TASK_STATUSES, type ActorIdentity, type Task, type TaskDraft, type TaskStatus } from "../types";
+import { TASK_PRIORITIES, TASK_STATUSES, type ActorIdentity, type Task, type TaskDraft, type TaskStatus, type WorkflowStage } from "../types";
 import { ActorAvatar } from "./ActorAvatar";
 import { LinearIcon } from "./LinearIcon";
 import { DueDateIcon, PriorityIcon, StatusIcon } from "./SemanticIcons";
@@ -17,6 +17,7 @@ interface IssueListViewProps {
   tasks: Task[];
   presentations: Record<string, TaskCardPresentation>;
   currentUser: ActorIdentity;
+  workflowStages?: readonly WorkflowStage[];
   hasActiveFilters: boolean;
   onOpenTask: (task: Task) => void;
   onOpenConversation: (conversation: TaskCardPresentation["conversations"][number]) => void;
@@ -37,20 +38,26 @@ export function IssueListView({
   tasks,
   presentations,
   currentUser,
+  workflowStages,
   hasActiveFilters,
   onOpenTask,
   onOpenConversation,
   onUpdate,
 }: IssueListViewProps) {
   const { language, locale, text } = useTaskboardI18n();
-  const [collapsed, setCollapsed] = useState(() => new Set(COLLAPSED_BY_DEFAULT));
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set(COLLAPSED_BY_DEFAULT));
   const [priorityMenuTaskId, setPriorityMenuTaskId] = useState<string | null>(null);
 
   function stopRow(event: MouseEvent | KeyboardEvent) {
     event.stopPropagation();
   }
 
-  function toggleStatus(status: TaskStatus) {
+  const orderedStages = useMemo(() => workflowStages?.length
+    ? [...workflowStages].filter((stage) => stage.active).sort((left, right) => left.order - right.order)
+    : TASK_STATUSES.map((status, order) => ({ stageId: status, canonicalStatus: status, name: taskStatusLabel(language, status), order, boardVisible: true, active: true, isDefaultForStatus: true, terminalKind: "none" as const })),
+  [language, workflowStages]);
+
+  function toggleStatus(status: string) {
     setCollapsed((current) => {
       const next = new Set(current);
       if (next.has(status)) next.delete(status);
@@ -62,13 +69,14 @@ export function IssueListView({
   return (
     <div className="issue-list-view" ref={scrollRef}>
       <div className="issue-list-groups">
-        {TASK_STATUSES.map((status) => {
-          const statusTasks = tasks.filter((task) => task.status === status);
-          const isCollapsed = collapsed.has(status);
-          const statusLabel = taskStatusLabel(language, status);
+        {orderedStages.map((stage) => {
+          const status = stage.canonicalStatus;
+          const statusTasks = tasks.filter((task) => workflowStages ? task.stageId === stage.stageId : task.status === status);
+          const isCollapsed = collapsed.has(stage.stageId);
+          const statusLabel = stage.name || taskStatusLabel(language, status);
           return (
-            <section className={`issue-list-group status-${status}`} key={status}>
-              <button className="issue-list-group-header" type="button" onClick={() => toggleStatus(status)} aria-expanded={!isCollapsed}>
+            <section className={`issue-list-group status-${status}`} key={stage.stageId}>
+              <button className="issue-list-group-header" type="button" onClick={() => toggleStatus(stage.stageId)} aria-expanded={!isCollapsed}>
                 <LinearIcon name={isCollapsed ? "chevronRight" : "chevronDown"} />
                 <span className="issue-list-status-icon"><StatusIcon status={status} color="currentColor" size={14} /></span>
                 <strong>{statusLabel}</strong>

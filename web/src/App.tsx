@@ -26,6 +26,7 @@ import {
   getAiChatCatalog,
   getCodexThreadProgress,
   getHostRuntime,
+  getStageWorkflow,
   getJiraConnection,
   getTaskboardRevision,
   getTaskboardMetadata,
@@ -52,6 +53,7 @@ import {
   assigneeTargetForActor,
 } from "./actors";
 import { BoardColumn } from "./components/BoardColumn";
+import { BoardWorkflowDialog } from "./components/BoardWorkflowDialog";
 import type { AiChatOpenThreadRequest } from "./components/AiChat";
 import {
   BoardCardDisplayMenu,
@@ -129,6 +131,7 @@ import {
   type IssueRelationType,
   type JiraConnection,
   type Project,
+  type StageWorkflowRecord,
   type Task,
   type TaskboardMetadata,
   type TaskDraft,
@@ -170,6 +173,7 @@ const GanttView = lazy(() => import("./components/GanttView").then((module) => (
 interface EditorState {
   task: Task | null;
   status: TaskStatus;
+  stageId?: string;
   projectId?: string | null;
 }
 
@@ -542,6 +546,7 @@ function taskToDraft(task: Task): TaskDraft {
     title: task.title,
     description: task.description,
     status: task.status,
+    ...(task.stageId ? { stageId: task.stageId } : {}),
     priority: task.priority,
     labels: task.labels,
     developmentContext: task.developmentContext,
@@ -759,7 +764,7 @@ export function App() {
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [draggedTaskId, setDraggedTaskId] = useState<string | null>(null);
   const [draggedTaskHeight, setDraggedTaskHeight] = useState(0);
-  const [dropTarget, setDropTarget] = useState<TaskStatus | null>(null);
+  const [dropTarget, setDropTarget] = useState<string | null>(null);
   const [movingTaskId, setMovingTaskId] = useState<string | null>(null);
   const [settlingTaskId, setSettlingTaskId] = useState<string | null>(null);
   const [openingProjectId, setOpeningProjectId] = useState<string | null>(null);
@@ -781,6 +786,8 @@ export function App() {
   const [deviceWorkspacePaths, setDeviceWorkspacePaths] = useState(readDeviceWorkspacePaths);
   const [projectCodexIdentities, setProjectCodexIdentities] = useState(readProjectCodexIdentities);
   const [projectAutomations, setProjectAutomations] = useState(readProjectAutomations);
+  const [stageWorkflow, setStageWorkflow] = useState<StageWorkflowRecord | null>(null);
+  const [workflowDialogOpen, setWorkflowDialogOpen] = useState(false);
   const [automationPending, setAutomationPending] = useState(false);
   const [automationError, setAutomationError] = useState<string | null>(null);
   const [automationCatalog, setAutomationCatalog] = useState<{
@@ -868,6 +875,19 @@ export function App() {
   const isJiraProject = selectedProject?.source === "jira";
   const boardDisplaySettings = projectBoardDisplaySettings[selectedProjectId]
     ?? DEFAULT_BOARD_DISPLAY_SETTINGS;
+  useEffect(() => {
+    if (!selectedProject || isAllProjects || isJiraProject) {
+      setStageWorkflow(null);
+      return;
+    }
+    const controller = new AbortController();
+    void getStageWorkflow(selectedProject.id, controller.signal).then((workflow) => {
+      if (!controller.signal.aborted) setStageWorkflow(workflow);
+    }).catch(() => {
+      if (!controller.signal.aborted) setStageWorkflow(null);
+    });
+    return () => controller.abort();
+  }, [isAllProjects, isJiraProject, selectedProject?.id]);
   const automationModels = automationCatalog && automationCatalog.projectId === selectedProject?.id
     ? automationCatalog.models
     : [];
@@ -2197,13 +2217,23 @@ export function App() {
     ) as Record<TaskStatus, Task[]>;
   }, [filteredTasks]);
 
-  const mainBoardItems = boardDisplaySettings.mainStatuses;
+  const workflowBoardStages = stageWorkflow?.definition.stages
+    .filter((stage) => stage.active && stage.boardVisible)
+    .sort((left, right) => left.order - right.order) ?? [];
+  const mainBoardItems = workflowBoardStages.length
+    ? workflowBoardStages.map((stage) => stage.stageId)
+    : boardDisplaySettings.mainStatuses;
   const mainColumnCount = Math.max(mainBoardItems.length, 1);
   const mainBoardMinWidth = (mainColumnCount * 300) + ((mainColumnCount - 1) * 24);
   const mainBoardMaxWidth = (mainColumnCount * 400) + ((mainColumnCount - 1) * 24);
   const otherTasksColumnCount = mainColumnCount + 1;
   const otherTasksWidth = `clamp(300px, calc(${100 / otherTasksColumnCount}% - ${(36 + (mainColumnCount * 24)) / otherTasksColumnCount}px), 400px)`;
-  const otherTaskTabs = boardDisplaySettings.sidebarStatuses;
+  // Stage placement/order comes from the project workflow. The older display
+  // settings still control card content, but must not render a second copy of
+  // canonical-status columns alongside custom stages.
+  const otherTaskTabs = workflowBoardStages.length
+    ? []
+    : boardDisplaySettings.sidebarStatuses;
   const otherTaskTabsKey = otherTaskTabs.join(",");
   const otherTasksAvailable = otherTaskTabs.length > 0;
 
@@ -2447,6 +2477,7 @@ export function App() {
     status: TaskStatus,
     beforeTaskId: string | null = null,
     useDropPosition = false,
+    stageId?: string,
   ) {
     if (movingTaskId) {
       setDropTarget(null);
@@ -2457,10 +2488,10 @@ export function App() {
 
     const destination = tasks.filter((candidate) => (
       candidate.projectId === task.projectId
-      && candidate.status === status
+      && (stageId ? candidate.stageId === stageId : candidate.status === status)
       && candidate.id !== task.id
     ));
-    const statusChanged = task.status !== status;
+    const statusChanged = task.status !== status || (stageId !== undefined && task.stageId !== stageId);
     const insertionIndex = statusChanged && !useDropPosition
       ? 0
       : beforeTaskId
@@ -2470,10 +2501,11 @@ export function App() {
     const desiredOrder = [...destination];
     desiredOrder.splice(targetIndex, 0, task);
     const currentOrder = tasks.filter((candidate) => (
-      candidate.projectId === task.projectId && candidate.status === status
+      candidate.projectId === task.projectId && (stageId ? candidate.stageId === stageId : candidate.status === status)
     ));
     if (
       task.status === status
+      && (stageId === undefined || task.stageId === stageId)
       && currentOrder.length === desiredOrder.length
       && currentOrder.every((candidate, index) => candidate.id === desiredOrder[index].id)
     ) {
@@ -2495,18 +2527,18 @@ export function App() {
     setActionError(null);
     setMovingTaskId(task.id);
     setTasks((current) => sortTasks(current.map((candidate) =>
-      candidate.id === task.id ? { ...candidate, status, sortOrder } : candidate,
+      candidate.id === task.id ? { ...candidate, status, stageId: stageId ?? candidate.stageId, sortOrder } : candidate,
     )));
 
     try {
-      const moved = await moveTaskRequest(task, status, sortOrder);
+      const moved = await moveTaskRequest(task, status, sortOrder, undefined, undefined, stageId);
       setTasks((current) => sortTasks(current.map((candidate) =>
         candidate.id === moved.id ? moved : candidate,
       )));
       pushUndo(null, async () => {
         const candidate = tasksRef.current.find((current) => current.id === moved.id);
         const current = candidate && candidate.version >= moved.version ? candidate : moved;
-        const restored = await moveTaskRequest(current, previous.status, previous.sortOrder);
+        const restored = await moveTaskRequest(current, previous.status, previous.sortOrder, undefined, undefined, previous.stageId ?? undefined);
         setTasks((tasks) => sortTasks(tasks.map((item) => item.id === restored.id ? restored : item)));
       });
     } catch (error) {
@@ -2531,7 +2563,7 @@ export function App() {
   function startTaskDrag(task: Task, height: number) {
     setDraggedTaskId(task.id);
     setDraggedTaskHeight(height);
-    setDropTarget(task.status);
+    setDropTarget(task.stageId ?? task.status);
   }
 
   function endTaskDrag() {
@@ -2540,7 +2572,7 @@ export function App() {
     setDropTarget(null);
   }
 
-  function finishTaskDrop(destination: TaskStatus, taskId: string, beforeTaskId: string | null = null) {
+  function finishTaskDrop(destination: TaskStatus, taskId: string, beforeTaskId: string | null = null, stageId?: string) {
     const task = tasks.find((candidate) => candidate.id === taskId);
     setDraggedTaskId(null);
     setDraggedTaskHeight(0);
@@ -2550,7 +2582,8 @@ export function App() {
     window.setTimeout(() => {
       setSettlingTaskId((current) => current === task.id ? null : current);
     }, 220);
-    void moveTask(task, destination, beforeTaskId, true);
+    if (stageId) void moveTask(task, destination, beforeTaskId, true, stageId);
+    else void moveTask(task, destination, beforeTaskId, true);
   }
 
   async function updateTaskProperties(task: Task, changes: Partial<TaskDraft>): Promise<Task> {
@@ -3504,9 +3537,21 @@ export function App() {
             {boardView === "issues" && (isAllProjects || selectedProject) && (
               <BoardCardDisplayMenu
                 settings={boardDisplaySettings}
+                workflowManaged={workflowBoardStages.length > 0}
                 onChange={updateProjectBoardDisplaySettings}
                 onReset={resetProjectBoardDisplaySettings}
               />
+            )}
+            {boardView === "issues" && selectedProject && !isAllProjects && !isJiraProject && (
+              <button
+                className="icon-button"
+                type="button"
+                onClick={() => setWorkflowDialogOpen(true)}
+                aria-label={text("配置流程", "Configure workflow")}
+                title={text("配置流程", "Configure workflow")}
+              >
+                <LinearIcon name="displayOptions" />
+              </button>
             )}
             {boardView === "issues" && otherTasksAvailable && (
               <button
@@ -3553,6 +3598,7 @@ export function App() {
             tasks={tasks.filter((task) => task.projectId === detailTask.projectId)}
             referenceTasks={referenceTasks.filter((task) => task.projectId === detailTask.projectId)}
             currentUser={currentUser}
+            workflowStages={stageWorkflow?.definition.stages}
             availableLabels={availableLabels}
             developmentScan={developmentScan}
             developmentScanLoading={developmentScanLoading}
@@ -3641,6 +3687,7 @@ export function App() {
             tasks={filteredTasks}
             presentations={taskPresentations}
             currentUser={currentUser}
+            workflowStages={stageWorkflow?.definition.stages}
             hasActiveFilters={hasActiveTaskFilters}
             onOpenTask={openTaskDetail}
             onOpenConversation={openTaskConversation}
@@ -3655,6 +3702,7 @@ export function App() {
               zoom={ganttZoom}
               hideCompleted={ganttHideCompleted}
               todayRequest={ganttTodayRequest}
+              workflowStages={stageWorkflow?.definition.stages}
               onOpenTask={openTaskDetail}
               onUpdate={updateTaskProperties}
             />
@@ -3682,7 +3730,9 @@ export function App() {
               <>
                 <div className="board-scroll" aria-label={text("议题看板", "Issue board")}>
                   <div className="board">
-                    {mainBoardItems.map((item) => item === "archived" ? (
+                    {mainBoardItems.map((item) => {
+                      const workflowStage = workflowBoardStages.find((stage) => stage.stageId === item);
+                      return item === "archived" ? (
                       <ArchivedTasksColumn
                         key={item}
                         tasks={filteredArchivedTasks}
@@ -3696,16 +3746,20 @@ export function App() {
                       <BoardColumn
                         key={item}
                         scrollRef={(element) => {
-                          boardColumnScrollRefs.current[item] = element;
+                          boardColumnScrollRefs.current[workflowStage?.canonicalStatus ?? item as TaskStatus] = element;
                         }}
-                        status={item}
-                        tasks={tasksByStatus[item]}
+                        status={workflowStage?.canonicalStatus ?? item as TaskStatus}
+                        stageId={workflowStage?.stageId}
+                        label={workflowStage?.name}
+                        tasks={workflowStage
+                          ? filteredTasks.filter((task) => task.stageId === workflowStage.stageId)
+                          : tasksByStatus[item as TaskStatus]}
                         presentations={taskPresentations}
                         now={processingNow}
                         emptyMessage={hasActiveTaskFilters
                           ? text("当前筛选下无匹配议题", "No issues match the current filters")
                           : text("暂无议题", "No issues")}
-                        isDropTarget={dropTarget === item}
+                        isDropTarget={dropTarget === (workflowStage?.stageId ?? item)}
                         draggedTaskId={draggedTaskId}
                         draggedTaskHeight={draggedTaskHeight}
                         movingTaskId={movingTaskId}
@@ -3718,18 +3772,18 @@ export function App() {
                         showBody={boardDisplaySettings.body}
                         createEnabled={!isJiraProject}
                         onCreateLabel={persistProjectLabel}
-                        onCreate={(initialStatus) => setEditor({ task: null, status: initialStatus })}
+                        onCreate={(initialStatus, stageId) => setEditor({ task: null, status: initialStatus, stageId })}
                         onEdit={openTaskDetail}
                         onUpdate={updateTaskProperties}
                         onComplete={(task) => void moveTask(task, "done")}
                         onContextMenu={openTaskContextMenu}
                         onDragStart={startTaskDrag}
                         onDragEnd={endTaskDrag}
-                        onDragEnter={setDropTarget}
+                        onDragEnter={(_status, stageId) => setDropTarget(stageId ?? _status)}
                         onDrop={finishTaskDrop}
                         onOpenConversation={openTaskConversation}
                       />
-                    ))}
+                    ); })}
                   </div>
                 </div>
                 {otherTasksAvailable && otherTasksMounted && (
@@ -3777,6 +3831,18 @@ export function App() {
           </div>
         )}
       </main>
+
+      {workflowDialogOpen && selectedProject && (
+        <BoardWorkflowDialog
+          projectId={selectedProject.id}
+          onClose={() => setWorkflowDialogOpen(false)}
+          onSaved={(workflow) => {
+            setStageWorkflow(workflow);
+            setWorkflowDialogOpen(false);
+            if (taskScopeProjectId) void refreshTasks(taskScopeProjectId, { quiet: true });
+          }}
+        />
+      )}
 
       {projectContextMenu && (
         <div
@@ -4000,11 +4066,13 @@ export function App() {
           tasks={tasks.filter((task) => task.projectId === editorProjectId)}
           referenceTasks={referenceTasks.filter((task) => task.projectId === editorProjectId)}
           initialStatus={editor.status}
+          initialStageId={editor.stageId}
           initialDraft={editor.task || newTaskDraft?.projectId !== selectedProjectId
             ? null
             : newTaskDraft.draft}
           labels={projects.find((project) => project.id === editorProjectId)?.labels ?? []}
           currentUser={currentUser}
+          workflowStages={stageWorkflow?.definition.stages}
           developmentScan={developmentScan}
           developmentScanLoading={developmentScanLoading}
           onCreateLabel={(label) => persistProjectLabel(label, editorProjectId ?? selectedProjectId)}
@@ -4027,9 +4095,10 @@ export function App() {
           task={contextMenuTask}
           position={{ x: contextMenu.x, y: contextMenu.y }}
           labels={availableLabels}
+          workflowStages={stageWorkflow?.definition.stages}
           onClose={closeContextMenu}
           onEdit={openTaskDetail}
-          onStatusChange={(task, status) => void moveTask(task, status)}
+          onStatusChange={(task, status, stageId) => void moveTask(task, status, null, false, stageId)}
           onPriorityChange={(task, nextPriority) => void updateTaskProperties(
             task,
             { priority: nextPriority },
