@@ -26,6 +26,8 @@ import {
   getAiChatCatalog,
   getCodexThreadProgress,
   getHostRuntime,
+  getNestedWorkspace,
+  getTaskRollup,
   getStageWorkflow,
   getJiraConnection,
   getTaskboardRevision,
@@ -63,6 +65,7 @@ import {
 import { DashboardView } from "./components/DashboardView";
 import { ProjectReadmeView } from "./components/ProjectReadmeView";
 import { IssueListView } from "./components/IssueListView";
+import { NestedWorkspaceView } from "./components/NestedWorkspaceView";
 import { JiraConnectionDialog } from "./components/JiraConnectionDialog";
 import { ArchivedTasksColumn, OtherTasksPanel } from "./components/OtherTasksPanel";
 import {
@@ -93,7 +96,14 @@ import {
   postEmbeddedHostMessage,
   setEmbeddedFrameChallenge,
 } from "./embeddedHost.mjs";
-import { buildIssueUrl, readIssueIdentifier } from "./issueRoute";
+import {
+  buildIssueUrl,
+  buildWorkspaceUrl,
+  readIssueIdentifier,
+  readWorkspaceIdentifier,
+  readWorkspaceView,
+  type WorkspaceView,
+} from "./issueRoute";
 import {
   getTaskboardI18n,
   resolveTaskboardLanguage,
@@ -134,6 +144,8 @@ import {
   type StageWorkflowRecord,
   type Task,
   type TaskboardMetadata,
+  type NestedWorkspace,
+  type TaskRollup,
   type TaskDraft,
   type TaskStatus,
 } from "./types";
@@ -717,6 +729,18 @@ export function App() {
   const initialProjectId = query.get("project") ?? recentProjectIds[0] ?? ALL_PROJECTS_ID;
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState(initialProjectId);
+  const [workspaceIdentifier, setWorkspaceIdentifier] = useState<string | null>(
+    () => readWorkspaceIdentifier(window.location.search),
+  );
+  const [workspaceView, setWorkspaceView] = useState<WorkspaceView>(
+    () => readWorkspaceView(window.location.search),
+  );
+  const [workspaceDescendants, setWorkspaceDescendants] = useState(false);
+  const [nestedWorkspace, setNestedWorkspace] = useState<NestedWorkspace | null>(null);
+  const [workspaceRollup, setWorkspaceRollup] = useState<TaskRollup | null>(null);
+  const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const [workspaceLoadingMore, setWorkspaceLoadingMore] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [archivedTasks, setArchivedTasks] = useState<Task[]>([]);
   const [tasksLoading, setTasksLoading] = useState(false);
@@ -1554,6 +1578,10 @@ export function App() {
       const url = new URL(window.location.href);
       const routeProjectId = url.searchParams.get("project") ?? GLOBAL_PROJECT_ID;
       const routeIssueIdentifier = readIssueIdentifier(url.search);
+      const routeWorkspaceIdentifier = readWorkspaceIdentifier(url.search);
+      setWorkspaceIdentifier(routeWorkspaceIdentifier);
+      setWorkspaceView(readWorkspaceView(url.search));
+      if (!routeWorkspaceIdentifier) setWorkspaceDescendants(false);
       if (routeIssueIdentifier && boardView === "list" && issueListRef.current) {
         pendingDetailSourceScrollRef.current = {
           projectId: selectedProjectId,
@@ -1607,6 +1635,31 @@ export function App() {
       setBoardView(selectedProjectId === ALL_PROJECTS_ID ? "issues" : readProjectBoardView(selectedProjectId));
     }
   }, [selectedProjectId]);
+
+  useEffect(() => {
+    if (!workspaceIdentifier) {
+      setNestedWorkspace(null);
+      setWorkspaceRollup(null);
+      setWorkspaceError(null);
+      return;
+    }
+    const controller = new AbortController();
+    setWorkspaceLoading(true);
+    setWorkspaceError(null);
+    void Promise.all([
+      getNestedWorkspace(workspaceIdentifier, { descendants: workspaceDescendants }, controller.signal),
+      getTaskRollup(workspaceIdentifier, controller.signal),
+    ]).then(([workspace, rollup]) => {
+      if (controller.signal.aborted) return;
+      setNestedWorkspace(workspace);
+      setWorkspaceRollup(rollup);
+    }).catch((error) => {
+      if (!controller.signal.aborted) setWorkspaceError(errorMessage(error));
+    }).finally(() => {
+      if (!controller.signal.aborted) setWorkspaceLoading(false);
+    });
+    return () => controller.abort();
+  }, [workspaceDescendants, workspaceIdentifier]);
 
   useEffect(() => {
     if (!selectedProjectId) {
@@ -2291,6 +2344,54 @@ export function App() {
     if (selectedProjectId) {
       taskboardStorage.setItem(`${PROJECT_VIEW_KEY_PREFIX}${selectedProjectId}`, view);
     }
+  }
+
+  function selectWorkspaceView(view: WorkspaceView) {
+    if (!workspaceIdentifier) return;
+    setWorkspaceView(view);
+    const url = buildWorkspaceUrl(window.location.href, workspaceIdentifier, view);
+    window.history.replaceState(window.history.state, "", url);
+  }
+
+  function openNestedWorkspace(identifier: string) {
+    setWorkspaceDescendants(false);
+    setWorkspaceIdentifier(identifier);
+    setWorkspaceView("overview");
+    const url = buildWorkspaceUrl(window.location.href, identifier, "overview");
+    window.history.pushState(window.history.state, "", url);
+  }
+
+  function loadMoreNestedWorkspace() {
+    if (!workspaceIdentifier || !nestedWorkspace) return;
+    const page = workspaceDescendants ? nestedWorkspace.descendants : nestedWorkspace.children;
+    if (!page?.nextCursor) return;
+    setWorkspaceLoadingMore(true);
+    void getNestedWorkspace(workspaceIdentifier, {
+      descendants: workspaceDescendants,
+      cursor: page.nextCursor,
+    }).then((next) => {
+      setNestedWorkspace((current) => {
+        if (!current) return current;
+        if (workspaceDescendants) {
+          if (!current.descendants || !next.descendants) return current;
+          return {
+            ...current,
+            descendants: {
+              items: [...current.descendants.items, ...next.descendants.items],
+              nextCursor: next.descendants.nextCursor,
+            },
+          };
+        }
+        return {
+          ...current,
+          children: {
+            items: [...current.children.items, ...next.children.items],
+            nextCursor: next.children.nextCursor,
+          },
+        };
+      });
+    }).catch((error) => setWorkspaceError(errorMessage(error)))
+      .finally(() => setWorkspaceLoadingMore(false));
   }
 
   function updateProjectBoardDisplaySettings(value: BoardDisplaySettings) {
@@ -3430,7 +3531,7 @@ export function App() {
           </div>
         </header>
 
-        {selectedProjectId && !detailTask && <div className="board-toolbar">
+        {selectedProjectId && !detailTask && !workspaceIdentifier && <div className="board-toolbar">
           <div className="view-tabs" aria-label={text("看板视图", "Board views")}>
             <button
               className={`view-tab${boardView === "dashboard" ? " active" : ""}`}
@@ -3622,6 +3723,28 @@ export function App() {
             openingThread={openingThreadTaskId === detailTask.id}
             onError={setActionError}
           />
+        ) : workspaceIdentifier ? (
+          workspaceLoading && !nestedWorkspace ? (
+            <div className="board-view-loading">{text("正在打开嵌套工作区…", "Opening nested workspace…")}</div>
+          ) : workspaceError && !nestedWorkspace ? (
+            <div className="page-empty">
+              <h2>{text("无法打开嵌套工作区", "Could not open nested workspace")}</h2>
+              <p>{workspaceError}</p>
+            </div>
+          ) : nestedWorkspace ? (
+            <NestedWorkspaceView
+              workspace={nestedWorkspace}
+              rollup={workspaceRollup}
+              view={workspaceView}
+              descendants={workspaceDescendants}
+              loadingMore={workspaceLoadingMore}
+              onViewChange={selectWorkspaceView}
+              onDescendantsChange={setWorkspaceDescendants}
+              onLoadMore={loadMoreNestedWorkspace}
+              onOpenTask={openTaskDetail}
+              onOpenWorkspace={openNestedWorkspace}
+            />
+          ) : null
         ) : boardView !== "readme"
           && hasLoadedTasks
           && tasks.length === 0

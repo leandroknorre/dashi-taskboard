@@ -437,6 +437,49 @@ export interface Task {
   updatedAt: string;
 }
 
+/** Read-only item returned by the nested workspace projection. */
+export interface NestedWorkspaceItem {
+  id: string;
+  identifier: string;
+  projectId: string;
+  title: string;
+  /** The persisted workflow stage/status, never a derived rollup value. */
+  status: TaskStatus;
+  macroBucket: "planned" | "ready" | "active" | "review" | "blocked" | "closed";
+  priority: TaskPriority;
+  archivedAt: string | null;
+  parentId: string | null;
+  depth: number;
+  path: string[];
+}
+
+export interface NestedWorkspaceOverview extends Omit<Task, "relations" | "conversationRefs" | "participants" | "previewImage" | "activityKey" | "activityUpdatedAt"> {
+  macroBucket: NestedWorkspaceItem["macroBucket"];
+}
+
+export interface NestedWorkspacePage {
+  items: NestedWorkspaceItem[];
+  nextCursor: string | null;
+}
+
+export interface NestedWorkspace {
+  overview: NestedWorkspaceOverview;
+  breadcrumb: NestedWorkspaceItem[];
+  children: NestedWorkspacePage;
+  descendants?: NestedWorkspacePage;
+}
+
+export interface TaskRollup {
+  version: 1;
+  rootId: string;
+  /** The manually controlled root stage. */
+  stage: TaskStatus;
+  progress: { total: number; completed: number; terminal: number };
+  visual: { state: "normal" | "blocked" | "critical"; sourceTaskIds: string[] };
+  freshness: { stale: boolean; sourceUpdatedAt: string | null; sourceRevision: string };
+  provenance: { kind: string; relationType: "parent"; sourceTaskIds: string[] };
+}
+
 export interface JiraConnection {
   configured: boolean;
   baseUrl: string | null;

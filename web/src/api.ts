@@ -24,6 +24,8 @@ import type {
   ProjectReadmeAttachment,
   ProjectSummary,
   Task,
+  NestedWorkspace,
+  TaskRollup,
   StageWorkflowDefinition,
   StageWorkflowRecord,
   TaskChangeActivity,
@@ -562,6 +564,29 @@ export async function getTask(taskId: string, signal?: AbortSignal): Promise<Tas
     { signal },
   );
   return data.task;
+}
+
+export function getNestedWorkspace(
+  taskId: string,
+  options: { descendants?: boolean; limit?: number; cursor?: string | null } = {},
+  signal?: AbortSignal,
+): Promise<NestedWorkspace> {
+  const params = new URLSearchParams();
+  if (options.descendants) params.set("descendants", "true");
+  if (options.limit) params.set("limit", String(options.limit));
+  if (options.cursor) params.set("cursor", options.cursor);
+  const suffix = params.size ? `?${params}` : "";
+  return request<{ workspace: NestedWorkspace }>(
+    `/api/tasks/${encodeURIComponent(taskId)}/workspace${suffix}`,
+    { signal },
+  ).then((data) => data.workspace);
+}
+
+export function getTaskRollup(taskId: string, signal?: AbortSignal): Promise<TaskRollup> {
+  return request<{ rollup: TaskRollup }>(
+    `/api/tasks/${encodeURIComponent(taskId)}/rollup`,
+    { signal },
+  ).then((data) => data.rollup);
 }
 
 export function listArchivedTasks(projectId?: string, signal?: AbortSignal): Promise<Task[]> {

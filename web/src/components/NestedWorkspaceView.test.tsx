@@ -1,0 +1,101 @@
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { TaskboardLanguageProvider } from "../i18n";
+import type { NestedWorkspace, TaskRollup } from "../types";
+import { NestedWorkspaceView } from "./NestedWorkspaceView";
+
+afterEach(cleanup);
+
+const workspace = {
+  overview: {
+    id: "root",
+    identifier: "TASK-1",
+    projectId: "project-1",
+    title: "Release workspace",
+    description: "Ship the public workspace.",
+    status: "todo",
+    macroBucket: "ready",
+  },
+  breadcrumb: [
+    { id: "program", identifier: "TASK-0", projectId: "project-1", title: "Program", status: "backlog", macroBucket: "planned", priority: "none", archivedAt: null, parentId: null, depth: 0, path: ["program"] },
+    { id: "root", identifier: "TASK-1", projectId: "project-1", title: "Release workspace", status: "todo", macroBucket: "ready", priority: "high", archivedAt: null, parentId: "program", depth: 1, path: ["program", "root"] },
+  ],
+  children: {
+    items: [
+      { id: "child", identifier: "TASK-2", projectId: "project-1", title: "Build board", status: "in_progress", macroBucket: "active", priority: "high", archivedAt: null, parentId: "root", depth: 1, path: ["root", "child"] },
+    ],
+    nextCursor: "workspace:child",
+  },
+  descendants: {
+    items: [
+      { id: "child", identifier: "TASK-2", projectId: "project-1", title: "Build board", status: "in_progress", macroBucket: "active", priority: "high", archivedAt: null, parentId: "root", depth: 1, path: ["root", "child"] },
+      { id: "grandchild", identifier: "TASK-3", projectId: "project-1", title: "Verify list", status: "in_review", macroBucket: "review", priority: "none", archivedAt: null, parentId: "child", depth: 2, path: ["root", "child", "grandchild"] },
+    ],
+    nextCursor: null,
+  },
+} as NestedWorkspace;
+
+const rollup: TaskRollup = {
+  version: 1,
+  rootId: "root",
+  stage: "todo",
+  progress: { total: 2, completed: 0, terminal: 0 },
+  visual: { state: "normal", sourceTaskIds: [] },
+  freshness: { stale: false, sourceUpdatedAt: null, sourceRevision: "root:1" },
+  provenance: { kind: "structural-parent", relationType: "parent", sourceTaskIds: ["child", "grandchild"] },
+};
+
+function renderWorkspace(view: "overview" | "board" | "list" | "tree" = "overview") {
+  const onViewChange = vi.fn();
+  const onDescendantsChange = vi.fn();
+  const onLoadMore = vi.fn();
+  const onOpenTask = vi.fn();
+  const onOpenWorkspace = vi.fn();
+  render(
+    <TaskboardLanguageProvider language="en">
+      <NestedWorkspaceView
+        workspace={workspace}
+        rollup={rollup}
+        view={view}
+        descendants={false}
+        loadingMore={false}
+        onViewChange={onViewChange}
+        onDescendantsChange={onDescendantsChange}
+        onLoadMore={onLoadMore}
+        onOpenTask={onOpenTask}
+        onOpenWorkspace={onOpenWorkspace}
+      />
+    </TaskboardLanguageProvider>,
+  );
+  return { onViewChange, onDescendantsChange, onLoadMore, onOpenTask, onOpenWorkspace };
+}
+
+describe("NestedWorkspaceView", () => {
+  it("shows the manual purpose, rollup provenance and freshness in overview", () => {
+    renderWorkspace();
+    expect(screen.getByText("Ship the public workspace.")).toBeTruthy();
+    expect(screen.getByText("0/2")).toBeTruthy();
+    expect(screen.getByText(/Derived from/)).toBeTruthy();
+    expect(screen.getByText(/Fresh at read time/)).toBeTruthy();
+  });
+
+  it("groups board cards by macro bucket while displaying the actual stage", () => {
+    const { onOpenTask, onLoadMore } = renderWorkspace("board");
+    expect(screen.getByText("Active")).toBeTruthy();
+    expect(screen.getByText("in progress")).toBeTruthy();
+    fireEvent.click(screen.getByText("Build board"));
+    expect(onOpenTask).toHaveBeenCalledWith(expect.objectContaining({ identifier: "TASK-2" }));
+    fireEvent.click(screen.getByText("Load more"));
+    expect(onLoadMore).toHaveBeenCalledOnce();
+  });
+
+  it("uses route callbacks for workspace view and direct/all-descendant toggles", () => {
+    const { onViewChange, onDescendantsChange, onOpenWorkspace } = renderWorkspace("list");
+    fireEvent.click(screen.getByText("Tree"));
+    expect(onViewChange).toHaveBeenCalledWith("tree");
+    fireEvent.click(screen.getByLabelText("All descendants"));
+    expect(onDescendantsChange).toHaveBeenCalledWith(true);
+    fireEvent.click(screen.getByText("Program"));
+    expect(onOpenWorkspace).toHaveBeenCalledWith("TASK-0");
+  });
+});

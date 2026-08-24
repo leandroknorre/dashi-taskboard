@@ -1,8 +1,38 @@
 const ISSUE_QUERY_PARAM = "issue";
+const WORKSPACE_QUERY_PARAM = "workspace";
+
+export const WORKSPACE_VIEWS = ["overview", "board", "list", "tree"] as const;
+export type WorkspaceView = (typeof WORKSPACE_VIEWS)[number];
 
 export function readIssueIdentifier(search: string): string | null {
   const identifier = new URLSearchParams(search).get(ISSUE_QUERY_PARAM)?.trim().toUpperCase();
   return identifier || null;
+}
+
+export function readWorkspaceIdentifier(search: string): string | null {
+  return new URLSearchParams(search).get(WORKSPACE_QUERY_PARAM)?.trim() || null;
+}
+
+export function readWorkspaceView(search: string): WorkspaceView {
+  const value = new URLSearchParams(search).get("view");
+  return WORKSPACE_VIEWS.includes(value as WorkspaceView) ? value as WorkspaceView : "overview";
+}
+
+/** Changes only nested-workspace route state, preserving project, issue and host context. */
+export function buildWorkspaceUrl(
+  href: string,
+  workspaceIdentifier: string | null,
+  view: WorkspaceView = "overview",
+): URL {
+  const url = new URL(href);
+  if (workspaceIdentifier) {
+    url.searchParams.set(WORKSPACE_QUERY_PARAM, workspaceIdentifier);
+    url.searchParams.set("view", view);
+  } else {
+    url.searchParams.delete(WORKSPACE_QUERY_PARAM);
+    url.searchParams.delete("view");
+  }
+  return url;
 }
 
 export function buildIssueUrl(
