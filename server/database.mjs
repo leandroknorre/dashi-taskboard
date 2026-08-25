@@ -18,6 +18,7 @@ import {
   workspaceOverviewFromTask,
 } from "../shared/nested-workspace.mjs";
 import { migrateLocalWorkflowLedger } from "./workflow-ledger.mjs";
+import { migrateLocalAutomationRuns } from "./workflow-automation-run-schema.mjs";
 import { migrateLocalWorkflowTransitions } from "./workflow-transition-schema.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
@@ -1038,6 +1039,7 @@ export class TaskboardDatabase {
     this.#migrateStageWorkflows();
     migrateLocalWorkflowLedger(this.database);
     migrateLocalWorkflowTransitions(this.database);
+    migrateLocalAutomationRuns(this.database);
   }
 
   #migrateStageWorkflows() {

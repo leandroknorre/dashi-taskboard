@@ -23,6 +23,7 @@ import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment
 import { normalizeParentRelationMetadata } from "../shared/relation-metadata.mjs";
 import { parseNestedWorkspaceQuery } from "../shared/nested-workspace.mjs";
 import { AiChatService } from "./ai-chat.mjs";
+import { AutomationRunService } from "./automation-run-service.mjs";
 import { resolveAiWorkspace, resolveMappedAiWorkspace } from "./ai-chat-catalog.mjs";
 import { decodeComposerReferenceKey } from "./composer-reference.mjs";
 import { createCloudConfigStore } from "./cloud-config.mjs";
@@ -604,6 +605,30 @@ function actorFromRequest(request) {
   return { type: "user", id, name, avatarUrl };
 }
 
+/**
+ * Most local mutations may retain the legacy local-user fallback. Dispatch is
+ * deliberately different: it is the human acknowledgement before an adapter
+ * can observe the outbox, so it must carry the host-provided user identity.
+ */
+function explicitHumanActorFromRequest(request) {
+  if (request.headers["x-taskboard-client"] === "taskctl") {
+    return actorFromRequest(request);
+  }
+  const identityHeaders = [
+    requestHeader(request, "x-taskboard-user-id"),
+    requestHeader(request, "x-taskboard-user-name"),
+    requestHeader(request, "x-taskboard-user-avatar"),
+  ];
+  if (identityHeaders.every((value) => value === undefined)) {
+    throw new ApiError(
+      401,
+      "EXPLICIT_HUMAN_ACTOR_REQUIRED",
+      "Manual automation dispatch requires an explicit host-provided user identity",
+    );
+  }
+  return actorFromRequest(request);
+}
+
 function parseAssigneeTarget(value) {
   if (value === undefined) return undefined;
   if (value !== "current-user" && value !== "codex-agent") {
@@ -716,6 +741,30 @@ function parseTaskTransition(body, idempotencyHeader) {
     authorizationId: body.authorizationId === undefined
       ? null
       : stringField(body.authorizationId, "authorizationId", { nullable: true, maxLength: 96 }),
+    idempotencyKey: stringField(idempotencyHeader, "Idempotency-Key", { required: true, maxLength: 64 }),
+  };
+}
+
+function parseAutomationRunDispatch(body, idempotencyHeader) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["expectedVersion", "leaseSeconds"]));
+  if (idempotencyHeader === undefined) {
+    throw new ApiError(400, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key header is required");
+  }
+  return {
+    ...body,
+    idempotencyKey: stringField(idempotencyHeader, "Idempotency-Key", { required: true, maxLength: 64 }),
+  };
+}
+
+function parseAutomationRunResult(body, idempotencyHeader) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["expectedVersion", "leaseToken", "status", "result"]));
+  if (idempotencyHeader === undefined) {
+    throw new ApiError(400, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key header is required");
+  }
+  return {
+    ...body,
     idempotencyKey: stringField(idempotencyHeader, "Idempotency-Key", { required: true, maxLength: 64 }),
   };
 }
@@ -1715,6 +1764,7 @@ export function createTaskboardServer(options = {}) {
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath);
   const transitions = new TransitionService(database);
+  const automationRuns = new AutomationRunService(database);
   const events = new EventHub();
   let clientStorageWrite = Promise.resolve();
 
@@ -3161,6 +3211,24 @@ export function createTaskboardServer(options = {}) {
         return sendJson(response, 200, { workspace: database.getNestedWorkspace(id, options) });
       }
 
+      const taskAutomationRunsRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/automation-runs$/);
+      if (taskAutomationRunsRoute) {
+        let id;
+        try {
+          id = decodeURIComponent(taskAutomationRunsRoute[1]);
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Task id contains invalid encoding");
+        }
+        if (id.length === 0 || id.length > 128) {
+          throw new ApiError(400, "INVALID_PATH", "Task id is invalid");
+        }
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Automation run list routes do not accept query parameters");
+        }
+        return sendJson(response, 200, { runs: automationRuns.listForTask(id) });
+      }
+
       const taskTransitionRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/transitions$/);
       if (taskTransitionRoute) {
         let id;
@@ -3191,8 +3259,51 @@ export function createTaskboardServer(options = {}) {
           task: result.task,
           transition: result.request,
           event: result.event,
+          automationRun: result.automationRun,
           idempotent: result.idempotent,
         });
+      }
+
+      const automationRunRoute = pathname.match(/^\/api\/automation-runs\/([^/]+)(?:\/(dispatch|result))?$/);
+      if (automationRunRoute) {
+        let runId;
+        try {
+          runId = decodeURIComponent(automationRunRoute[1]);
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Automation run id contains invalid encoding");
+        }
+        if (runId.length === 0 || runId.length > 128) {
+          throw new ApiError(400, "INVALID_PATH", "Automation run id is invalid");
+        }
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Automation run routes do not accept query parameters");
+        }
+        const action = automationRunRoute[2];
+        if (!action) {
+          if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+          return sendJson(response, 200, { run: automationRuns.get(runId) });
+        }
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        if (action === "dispatch") {
+          const result = automationRuns.dispatch(
+            runId,
+            parseAutomationRunDispatch(await readJson(request), requestHeader(request, "idempotency-key")),
+            { actor: explicitHumanActorFromRequest(request) },
+          );
+          events.emit("automation-run.dispatched", { run: result.run });
+          return sendJson(response, 200, {
+            run: result.run,
+            leaseToken: result.leaseToken,
+            idempotent: result.idempotent,
+          });
+        }
+        const result = automationRuns.recordResult(
+          runId,
+          parseAutomationRunResult(await readJson(request), requestHeader(request, "idempotency-key")),
+          { actor: actorFromRequest(request) },
+        );
+        events.emit(`automation-run.${result.run.status}`, { run: result.run });
+        return sendJson(response, 200, { run: result.run, idempotent: result.idempotent });
       }
 
       const taskRoute = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(archive|restore|move))?$/);
@@ -3267,6 +3378,7 @@ export function createTaskboardServer(options = {}) {
               task: result.task,
               transition: result.request,
               event: result.event,
+              automationRun: result.automationRun,
               idempotent: result.idempotent,
               legacy: true,
             });
@@ -3376,6 +3488,7 @@ export function createTaskboardServer(options = {}) {
                 task: result.task,
                 transition: result.request,
                 event: result.event,
+                automationRun: result.automationRun,
                 idempotent: result.idempotent,
                 legacy: true,
               });

@@ -14,6 +14,7 @@ import {
   evaluatePinnedTransition,
   normalizeTransitionCommand,
 } from "../shared/transition-service.mjs";
+import { automationRunFromRow, createAutomationRunForTransition } from "./automation-run-service.mjs";
 import { ApiError } from "./database.mjs";
 import { WorkflowLedger } from "./workflow-ledger.mjs";
 import { migrateLocalWorkflowTransitions } from "./workflow-transition-schema.mjs";
@@ -287,6 +288,7 @@ export class TransitionService {
       task: this.taskboardDatabase.getTask(taskId),
       request: requestFromRow(request),
       event: ledgerResult.event,
+      automationRun: applied.automationRun,
     };
   }
 
@@ -485,6 +487,12 @@ export class TransitionService {
       task: this.taskboardDatabase.getTask(taskId),
       request: requestFromRow(row),
       event,
+      automationRun: (() => {
+        const run = this.database.prepare(`
+          SELECT * FROM workflow_automation_runs WHERE transition_event_id = ?
+        `).get(row.event_id);
+        return run ? automationRunFromRow(run) : null;
+      })(),
     };
   }
 
@@ -611,12 +619,23 @@ export class TransitionService {
       taskId, context.task.project_id, destination.canonical_status, destination.task_stage_id,
       context.task.version + 1, context.task.created_at, timestamp, nextSequence, event.eventHash,
     );
+    const automationRun = createAutomationRunForTransition(this.database, {
+      taskId,
+      workflowId: context.pin.workflow_id,
+      revisionId: context.pin.revision_id,
+      taskStageId: destination.task_stage_id,
+      contractStageId: destination.contract_stage_id,
+      definition: context.definition,
+      transitionEvent: event,
+      timestamp,
+    });
     return {
       status: destination.canonical_status,
       stageId: destination.task_stage_id,
       version: context.task.version + 1,
       allowed,
       previousProjection,
+      automationRun,
     };
   }
 }

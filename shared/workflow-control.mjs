@@ -127,8 +127,9 @@ export function assertWorkflowRevisionPublication(previous, candidate) {
 }
 
 /**
- * Agent profiles are versioned and effect-free in this contract phase. A
- * human-operated actor belongs to a different contract, not an agent profile.
+ * Agent profiles are versioned. Disabled, manual, and shadow profiles remain
+ * effect-free: a later adapter can only receive an explicitly dispatched run.
+ * A human-operated actor belongs to a different contract, not an agent profile.
  */
 export function normalizeAgentProfile(value) {
   return normalizeAgentProfileRevision(value, undefined);
@@ -140,7 +141,7 @@ export function assertAgentOperation(profile, operation) {
   if (operation !== "read") {
     throw new WorkflowContractError(
       WORKFLOW_ERROR_CODES.AGENT_EFFECT_FORBIDDEN,
-      "Manual and shadow agent profiles are read-only in this contract phase",
+      "Disabled, manual, and shadow agent profiles are read-only in this contract phase",
       { mode: normalized.mode, operation },
     );
   }
@@ -269,7 +270,7 @@ function normalizeAgentProfileRevision(value, index) {
   const label = index === undefined ? "Agent profile revision" : `agentProfileRevisions[${index}]`;
   const profile = objectOnly(value, label);
   rejectUnknown(profile, ["agentProfileId", "agentProfileRevisionId", "revision", "createdAt", "immutable", "mode"], label);
-  if (!validIdentifier(profile.agentProfileId) || !validUuid(profile.agentProfileRevisionId) || !Number.isSafeInteger(profile.revision) || profile.revision < 1 || !validTimestamp(profile.createdAt) || profile.immutable !== true || (profile.mode !== "manual" && profile.mode !== "shadow")) {
+  if (!validIdentifier(profile.agentProfileId) || !validUuid(profile.agentProfileRevisionId) || !Number.isSafeInteger(profile.revision) || profile.revision < 1 || !validTimestamp(profile.createdAt) || profile.immutable !== true || !["disabled", "manual", "shadow"].includes(profile.mode)) {
     throw invalid(`${label} is invalid`);
   }
   return deepFreeze({ ...profile });
