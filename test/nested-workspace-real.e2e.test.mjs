@@ -95,6 +95,12 @@ async function startReadOnlyProxy(targetOrigin) {
   const methods = [];
   const rejected = [];
   const requests = [];
+  const clientRequests = new Set();
+  const sockets = new Set();
+  const trackSocket = (socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  };
   const proxy = createServer((request, response) => {
     methods.push(request.method);
     requests.push({ method: request.method, url: request.url ?? "/" });
@@ -109,9 +115,13 @@ async function startReadOnlyProxy(targetOrigin) {
       response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
       upstreamResponse.pipe(response);
     });
+    clientRequests.add(upstream);
+    upstream.once("close", () => clientRequests.delete(upstream));
+    upstream.on("socket", trackSocket);
     upstream.on("error", () => response.destroy());
     request.pipe(upstream);
   });
+  proxy.on("connection", trackSocket);
   await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
   const address = proxy.address();
   assert.ok(address && typeof address === "object");
@@ -120,7 +130,17 @@ async function startReadOnlyProxy(targetOrigin) {
     methods,
     rejected,
     requests,
-    close: () => new Promise((resolve, reject) => proxy.close((error) => error ? reject(error) : resolve())),
+    async close() {
+      const closed = new Promise((resolve, reject) => {
+        proxy.close((error) => error ? reject(error) : resolve());
+      });
+      for (const request of clientRequests) request.destroy();
+      for (const socket of sockets) socket.destroy();
+      await closed;
+      proxy.off("connection", trackSocket);
+      clientRequests.clear();
+      sockets.clear();
+    },
   };
 }
 

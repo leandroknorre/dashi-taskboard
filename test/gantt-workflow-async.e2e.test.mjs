@@ -154,6 +154,13 @@ function seedBoardScrollFixture(directory) {
 async function startDelayedProxy(targetOrigin) {
   let delayedWorkflowResponses = 0;
   let releasedWorkflowResponses = 0;
+  const clientRequests = new Set();
+  const sockets = new Set();
+  const delayedForwards = new Set();
+  const trackSocket = (socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  };
   const proxy = createServer((request, response) => {
     const target = new URL(request.url ?? "/", targetOrigin);
     const upstream = httpRequest(target, {
@@ -167,19 +174,25 @@ async function startDelayedProxy(targetOrigin) {
       };
       if (request.method === "GET" && target.pathname === "/api/projects/alpha/stage-workflow") {
         delayedWorkflowResponses += 1;
-        setTimeout(() => {
+        const timer = setTimeout(() => {
+          delayedForwards.delete(timer);
           releasedWorkflowResponses += 1;
           forward();
         }, delayMs);
+        delayedForwards.add(timer);
       } else {
         forward();
       }
     });
+    clientRequests.add(upstream);
+    upstream.once("close", () => clientRequests.delete(upstream));
+    upstream.on("socket", trackSocket);
     upstream.on("error", () => {
       if (!response.headersSent && !response.destroyed) response.writeHead(502).end();
     });
     request.pipe(upstream);
   });
+  proxy.on("connection", trackSocket);
   await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
   const address = proxy.address();
   assert.ok(address && typeof address === "object");
@@ -187,7 +200,19 @@ async function startDelayedProxy(targetOrigin) {
     origin: `http://127.0.0.1:${address.port}`,
     delayedWorkflowResponses: () => delayedWorkflowResponses,
     releasedWorkflowResponses: () => releasedWorkflowResponses,
-    close: () => new Promise((resolve, reject) => proxy.close((error) => error ? reject(error) : resolve())),
+    async close() {
+      const closed = new Promise((resolve, reject) => {
+        proxy.close((error) => error ? reject(error) : resolve());
+      });
+      for (const timer of delayedForwards) clearTimeout(timer);
+      delayedForwards.clear();
+      for (const request of clientRequests) request.destroy();
+      for (const socket of sockets) socket.destroy();
+      await closed;
+      proxy.off("connection", trackSocket);
+      clientRequests.clear();
+      sockets.clear();
+    },
   };
 }
 
