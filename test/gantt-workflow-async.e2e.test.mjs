@@ -174,6 +174,7 @@ async function startDelayedProxy(targetOrigin) {
   const sockets = new Set();
   const delayedForwards = new Set();
   const trackSocket = (socket) => {
+    if (sockets.has(socket)) return;
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
   };

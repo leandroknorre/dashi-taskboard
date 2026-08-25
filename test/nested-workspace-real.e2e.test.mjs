@@ -201,6 +201,7 @@ async function startReadOnlyProxy(targetOrigin) {
   const clientRequests = new Set();
   const sockets = new Set();
   const trackSocket = (socket) => {
+    if (sockets.has(socket)) return;
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
   };
