@@ -1242,6 +1242,41 @@ test("nested workspace keeps the local read-model contract in cloud", async () =
   ].sort());
   assert.deepEqual([...directChildIds].sort(), [child.body.task.id, sibling.body.task.id].sort());
 
+  const firstDescendantPage = await cloud.request(
+    `/api/tasks/${composite.body.task.id}/workspace?descendants=true&limit=1`,
+    { actorName: alice },
+  );
+  const typedDescendantCursor = firstDescendantPage.body.workspace.descendants.nextCursor;
+  assert.ok(typedDescendantCursor);
+  for (const [parameter, descendants] of [
+    ["descendantsCursor", null],
+    ["descendantsCursor", "false"],
+    ["cursor", null],
+    ["cursor", "false"],
+  ]) {
+    const query = new URLSearchParams({ limit: "1", [parameter]: typedDescendantCursor });
+    if (descendants !== null) query.set("descendants", descendants);
+    const invalid = await cloud.request(
+      `/api/tasks/${composite.body.task.id}/workspace?${query}`,
+      { actorName: alice },
+    );
+    assert.equal(invalid.response.status, 400);
+    assert.equal(invalid.body.error.code, "INVALID_NESTED_WORKSPACE_CURSOR");
+  }
+  for (const parameter of ["descendantsCursor", "cursor"]) {
+    const query = new URLSearchParams({
+      descendants: "true",
+      limit: "1",
+      [parameter]: typedDescendantCursor,
+    });
+    const valid = await cloud.request(
+      `/api/tasks/${composite.body.task.id}/workspace?${query}`,
+      { actorName: alice },
+    );
+    assert.equal(valid.response.status, 200);
+    assert.equal(valid.body.workspace.descendants.items.length, 1);
+  }
+
   let descendantsCursor = null;
   const descendantIds = [];
   do {

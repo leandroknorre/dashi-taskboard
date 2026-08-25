@@ -61,6 +61,7 @@ export function parseNestedWorkspaceQuery(searchParams, createError) {
   if (descendants !== "true" && descendants !== "false") {
     throw createError("INVALID_NESTED_WORKSPACE_QUERY", "'descendants' must be true or false");
   }
+  const includeDescendants = descendants === "true";
   const rawLimit = searchParams.get("limit");
   const limit = rawLimit === null ? NESTED_WORKSPACE_DEFAULT_LIMIT : Number(rawLimit);
   if (
@@ -104,13 +105,13 @@ export function parseNestedWorkspaceQuery(searchParams, createError) {
     else if (match[1] === "descendants" && descendantsCursor === null) descendantsCursor = legacyCursor;
     else throw createError("INVALID_NESTED_WORKSPACE_CURSOR", "Workspace cursor is repeated");
   }
-  if (!descendants && descendantsCursor !== null) {
+  if (!includeDescendants && descendantsCursor !== null) {
     throw createError(
       "INVALID_NESTED_WORKSPACE_CURSOR",
       "'descendantsCursor' requires 'descendants=true'",
     );
   }
-  return { descendants: descendants === "true", limit, childrenCursor, descendantsCursor };
+  return { descendants: includeDescendants, limit, childrenCursor, descendantsCursor };
 }
 
 export function paginateWorkspaceItems(items, cursor, limit, kind, createError) {
