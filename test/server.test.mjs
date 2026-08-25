@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHmac } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import { access, chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, request as httpRequest } from "node:http";
 import os from "node:os";
@@ -9,6 +9,7 @@ import { afterEach, test } from "node:test";
 import { WebSocket, WebSocketServer } from "ws";
 
 import { createTaskboardServer, resolveServerOptions } from "../server/index.mjs";
+import { TransitionService } from "../server/transition-service.mjs";
 
 const runningApps = [];
 
@@ -978,6 +979,7 @@ test("parent composition metadata defaults, updates atomically, and leaves later
 
 test("task rollup is rebuilt from rollup-enabled parent descendants without moving the parent", async () => {
   const baseUrl = await startServer();
+  const app = runningApps.at(-1).app;
   const createIssue = async (title, extra = {}) => {
     const result = await request(baseUrl, "/api/tasks", {
       method: "POST",
@@ -1014,9 +1016,27 @@ test("task rollup is rebuilt from rollup-enabled parent descendants without movi
   const unrelatedBefore = (await request(baseUrl, `/api/tasks/${unrelated.id}/rollup`)).body.rollup;
 
   const updatedBlocker = await latest(blocker.id);
-  assert.equal((await request(baseUrl, `/api/tasks/${blocker.id}`, {
-    method: "PATCH",
-    body: { version: updatedBlocker.version, status: "done" },
+  const completion = new TransitionService(app.database)
+    .listActions(blocker.id)
+    .find((action) => action.toTerminalKind === "completed");
+  assert.ok(completion);
+  assert.equal((await request(baseUrl, `/api/tasks/${blocker.id}/transitions`, {
+    method: "POST",
+    headers: { "idempotency-key": "rollup-complete-blocker" },
+    body: {
+      expectedStateVersion: updatedBlocker.version,
+      actionKey: completion.actionKey,
+      gateEvidence: [{
+        evidenceId: randomUUID(),
+        gateId: "human-acceptance",
+        type: "human_acceptance",
+        capturedAt: "2026-08-25T00:00:00.000Z",
+        actor: { actorId: "rollup-reviewer", kind: "human" },
+        status: "valid",
+        record: { evidenceEventId: randomUUID(), eventHash: "a".repeat(64) },
+        revocation: null,
+      }],
+    },
   })).response.status, 200);
   const recalculated = await request(baseUrl, `/api/tasks/${root.id}/rollup`);
   assert.equal(recalculated.response.status, 200);

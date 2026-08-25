@@ -391,6 +391,7 @@ const EVENT_NAMES = [
   "task.created",
   "task.updated",
   "task.moved",
+  "task.transitioned",
   "task.archived",
   "task.restored",
   "task.deleted",

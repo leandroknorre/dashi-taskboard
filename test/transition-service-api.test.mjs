@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -70,6 +71,19 @@ function destinationStatus(app, revisionId, action) {
     SELECT canonical_status FROM workflow_revision_stage_bindings
     WHERE revision_id = ? AND task_stage_id = ?
   `).get(revisionId, action.toTaskStageId).canonical_status;
+}
+
+function validAcceptance() {
+  return [{
+    evidenceId: randomUUID(),
+    gateId: "human-acceptance",
+    type: "human_acceptance",
+    capturedAt: "2026-08-25T00:00:00.000Z",
+    actor: { actorId: "api-reviewer", kind: "human" },
+    status: "valid",
+    record: { evidenceEventId: randomUUID(), eventHash: "a".repeat(64) },
+    revocation: null,
+  }];
 }
 
 test("POST transition requires Idempotency-Key and a retry returns the original local transition", async () => {
@@ -190,5 +204,40 @@ test("the legacy stage editor cannot remap a task after its workflow revision is
   assert.equal(response.response.status, 409);
   assert.equal(response.body.error.code, "WORKFLOW_AUTHORING_UNAVAILABLE");
   assert.equal(app.database.getTask(task.id).version, task.version);
+  assert.equal(app.database.database.prepare("SELECT COUNT(*) AS count FROM workflow_ledger_events").get().count, 0);
+});
+
+test("a real API parent completion stays blocked while a required descendant is open", async () => {
+  const { app, baseUrl } = await start();
+  const parent = createTask(app, "Required parent");
+  const child = createTask(app, "Open required child");
+  app.database.addTaskRelation(
+    child.id,
+    child.version,
+    "parent",
+    parent.id,
+    undefined,
+    undefined,
+    actor,
+    "manual",
+    { required: true, rollup: true },
+  );
+  const transitions = new TransitionService(app.database);
+  const completion = actionTo(transitions, parent.id, "completed");
+
+  const blocked = await request(baseUrl, `/api/tasks/${parent.id}/transitions`, {
+    method: "POST",
+    headers: { "idempotency-key": "api-required-parent-completion" },
+    body: {
+      expectedStateVersion: parent.version,
+      actionKey: completion.actionKey,
+      gateEvidence: validAcceptance(),
+    },
+  });
+
+  assert.equal(blocked.response.status, 409);
+  assert.equal(blocked.body.error.code, "REQUIRED_DESCENDANT_INCOMPLETE");
+  assert.equal(app.database.getTask(parent.id).status, parent.status);
+  assert.equal(app.database.getTask(child.id).status, child.status);
   assert.equal(app.database.database.prepare("SELECT COUNT(*) AS count FROM workflow_ledger_events").get().count, 0);
 });
