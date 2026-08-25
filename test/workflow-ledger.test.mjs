@@ -1,19 +1,34 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, test } from "node:test";
 
-import { WORKFLOW_ERROR_CODES, WorkflowContractError } from "../shared/workflow-control.mjs";
 import {
+  WORKFLOW_ERROR_CODES,
+  WorkflowContractError,
+  canonicalJson,
+  createLedgerEventEnvelope,
+} from "../shared/workflow-control.mjs";
+import {
+  WORKFLOW_LEDGER_SCHEMA_SQL,
   WorkflowLedger,
+  auditWorkflowLedgerRows,
+  ledgerEventIntent,
   migrateLocalWorkflowLedger,
 } from "../server/workflow-ledger.mjs";
 import { ledgerEvent } from "./fixtures/workflow-control.mjs";
 import { createCloudWorkerHarness } from "./helpers/cloud-worker-harness.mjs";
 
 const fixtures = [];
+const projectRoot = path.resolve(import.meta.dirname, "..");
+const ledgerColumns = [
+  "sequence", "event_id", "event_type", "workflow_id", "revision_id",
+  "aggregate_type", "aggregate_id", "correlation_id", "causation_id",
+  "idempotency_key", "idempotency_fingerprint", "prev_hash", "event_hash",
+  "envelope_json", "occurred_at", "created_at",
+];
 
 afterEach(async () => {
   while (fixtures.length > 0) {
@@ -74,6 +89,85 @@ function executedEvent(overrides = {}) {
     },
     ...overrides,
   });
+}
+
+function insertOrReplaceLedgerRow(database, row) {
+  return database.prepare(`
+    INSERT OR REPLACE INTO workflow_ledger_events (${ledgerColumns.join(", ")})
+    VALUES (${ledgerColumns.map(() => "?").join(", ")})
+  `).run(...ledgerColumns.map((column) => row[column]));
+}
+
+function replacementCandidate(row, collisionColumn) {
+  const candidate = {
+    ...row,
+    sequence: 100,
+    event_id: "replacement-event",
+    idempotency_key: "replacement-idempotency",
+    event_hash: "d".repeat(64),
+    idempotency_fingerprint: "replacement-intent",
+    envelope_json: "{}",
+  };
+  candidate[collisionColumn] = row[collisionColumn];
+  return candidate;
+}
+
+function cloudLedgerRow(event, sequence, createdAt = "2026-08-24T12:07:00.000Z") {
+  return {
+    sequence,
+    event_id: event.eventId,
+    event_type: event.eventType,
+    workflow_id: event.workflowId,
+    revision_id: event.revisionId,
+    aggregate_type: event.aggregateType,
+    aggregate_id: event.aggregateId,
+    correlation_id: event.correlationId,
+    causation_id: event.causationId,
+    idempotency_key: event.idempotencyKey,
+    idempotency_fingerprint: ledgerEventIntent(event),
+    prev_hash: event.prevHash,
+    event_hash: event.eventHash,
+    envelope_json: canonicalJson(event),
+    occurred_at: event.occurredAt,
+    created_at: createdAt,
+  };
+}
+
+function cloudLedgerInsertStatement(cloud, row, { replace = false } = {}) {
+  return cloud.db.prepare(`
+    INSERT ${replace ? "OR REPLACE " : ""}INTO workflow_ledger_events (${ledgerColumns.join(", ")})
+    VALUES (${ledgerColumns.map(() => "?").join(", ")})
+  `).bind(...ledgerColumns.map((column) => row[column]));
+}
+
+async function insertCloudLedgerRow(cloud, row, options = {}) {
+  return cloudLedgerInsertStatement(cloud, row, options).run();
+}
+
+async function cloudAuditInput(cloud) {
+  return {
+    eventRows: (await cloud.db.prepare("SELECT * FROM workflow_ledger_events ORDER BY sequence").all()).results,
+    head: await cloud.db.prepare("SELECT * FROM workflow_ledger_head WHERE singleton = 1").first(),
+    outboxRows: (await cloud.db.prepare("SELECT * FROM workflow_outbox ORDER BY sequence").all()).results,
+  };
+}
+
+function cloudMigrationStatements(source) {
+  const statements = [];
+  let current = [];
+  let trigger = false;
+  for (const sourceLine of source.split(/\r?\n/)) {
+    const line = sourceLine.trim();
+    if (line === "") continue;
+    if (current.length === 0) trigger = /^CREATE\s+TRIGGER\b/i.test(line);
+    current.push(line);
+    if ((trigger ? /\bEND;$/i : /;$/).test(line)) {
+      statements.push(current.join(" "));
+      current = [];
+      trigger = false;
+    }
+  }
+  return statements.join("\n");
 }
 
 test("append atomically writes an immutable event, projection, outbox, and replayable hash chain", () => {
@@ -161,6 +255,67 @@ test("replay detects an altered envelope and physical truncation", () => {
   );
 });
 
+test("0015 blocks INSERT OR REPLACE on every immutable ledger identity, including a staged head rewrite", () => {
+  const { database, ledger } = createFixture();
+  ledger.append(requestedEvent());
+  ledger.append(executedEvent());
+  const row = database.prepare("SELECT * FROM workflow_ledger_events WHERE sequence = 1").get();
+  const originalHead = { ...database.prepare("SELECT * FROM workflow_ledger_head WHERE singleton = 1").get() };
+  assert.equal(database.prepare("PRAGMA recursive_triggers").get().recursive_triggers, 1);
+
+  for (const column of ["sequence", "event_id", "idempotency_key", "event_hash"]) {
+    assert.throws(
+      () => insertOrReplaceLedgerRow(database, replacementCandidate(row, column)),
+      /WORKFLOW_LEDGER_APPEND_ONLY/,
+      column,
+    );
+  }
+
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database.prepare(`
+      UPDATE workflow_ledger_head
+      SET last_sequence = ?, last_event_hash = ?, updated_at = ?
+      WHERE singleton = 1
+    `).run(1, "e".repeat(64), "2026-08-24T12:08:00.000Z");
+    assert.throws(
+      () => insertOrReplaceLedgerRow(database, replacementCandidate(row, "sequence")),
+      /WORKFLOW_LEDGER_APPEND_ONLY/,
+    );
+  } finally {
+    database.exec("ROLLBACK");
+  }
+  assert.deepEqual({ ...database.prepare("SELECT * FROM workflow_ledger_head WHERE singleton = 1").get() }, originalHead);
+  assert.equal(ledger.replay().at(0).lastSequence, 2);
+});
+
+test("replay validates all denormalized event fields and the event-to-outbox correspondence", () => {
+  const eventTypeChanged = createFixture();
+  eventTypeChanged.ledger.append(requestedEvent());
+  eventTypeChanged.database.exec("DROP TRIGGER workflow_ledger_events_append_only_update");
+  eventTypeChanged.database.prepare(`
+    UPDATE workflow_ledger_events SET event_type = 'transition.executed' WHERE sequence = 1
+  `).run();
+  assert.throws(
+    () => eventTypeChanged.ledger.replay(),
+    (error) => error instanceof WorkflowContractError && error.code === WORKFLOW_ERROR_CODES.LEDGER_HASH_INVALID,
+  );
+
+  const outboxDiverged = createFixture();
+  outboxDiverged.ledger.append(requestedEvent());
+  outboxDiverged.database.prepare(`
+    UPDATE workflow_outbox SET topic = 'workflow.diverged' WHERE sequence = 1
+  `).run();
+  assert.throws(
+    () => outboxDiverged.ledger.audit(),
+    (error) => error instanceof WorkflowContractError && error.code === WORKFLOW_ERROR_CODES.LEDGER_HASH_INVALID,
+  );
+  assert.throws(
+    () => outboxDiverged.ledger.replay(),
+    (error) => error instanceof WorkflowContractError && error.code === WORKFLOW_ERROR_CODES.LEDGER_HASH_INVALID,
+  );
+});
+
 test("a projection failure rolls back the event, projection, outbox, and ledger head together", () => {
   const { database, ledger } = createFixture();
   assert.throws(() => ledger.append(requestedEvent(), {
@@ -171,13 +326,18 @@ test("a projection failure rolls back the event, projection, outbox, and ledger 
   }
 });
 
-test("local migration is idempotent and preserves legacy tasks as import-only projections", () => {
+test("local migration upgrades 0014 to idempotent 0015 hardening and preserves legacy import projections", () => {
   const database = new DatabaseSync(":memory:");
   fixtures.push({ database });
   createTasksTable(database);
   database.prepare(`
     INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run("legacy-task", "legacy-project", "todo", null, 7, "2026-01-01T00:00:00.000Z", "2026-02-01T00:00:00.000Z");
+  database.exec(WORKFLOW_LEDGER_SCHEMA_SQL);
+  assert.equal(database.prepare(`
+    SELECT count(*) AS count FROM sqlite_schema
+    WHERE type = 'trigger' AND name = 'workflow_ledger_events_prevent_replace_collision'
+  `).get().count, 0);
   migrateLocalWorkflowLedger(database);
   migrateLocalWorkflowLedger(database);
   assert.deepEqual({ ...database.prepare("SELECT * FROM tasks WHERE id = 'legacy-task'").get() }, {
@@ -190,9 +350,16 @@ test("local migration is idempotent and preserves legacy tasks as import-only pr
   assert.equal(database.prepare("SELECT count(*) AS count FROM workflow_ledger_events").get().count, 0);
 });
 
-test("the Cloud migration has the same append-only ledger and legacy projection boundary", async () => {
+test("Cloud 0014→0015 is idempotent, blocks REPLACE plus head rewrites, and audits event/outbox tampering", async () => {
   const cloud = await createCloudWorkerHarness();
   fixtures.push({ cloud });
+  const hardeningSql = await readFile(
+    path.join(projectRoot, "cloud", "migrations", "0015_workflow_ledger_hardening.sql"),
+    "utf8",
+  );
+  const hardeningStatements = cloudMigrationStatements(hardeningSql);
+  await cloud.db.exec(hardeningStatements);
+  await cloud.db.exec(hardeningStatements);
   const tables = await cloud.db.prepare(`
     SELECT name FROM sqlite_master
     WHERE type = 'table' AND name IN (
@@ -205,8 +372,80 @@ test("the Cloud migration has the same append-only ledger and legacy projection 
     "workflow_outbox", "workflow_work_item_projections",
   ]);
   const triggers = await cloud.db.prepare(`
-    SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'workflow_ledger_events_append_only_%'
+    SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'workflow_ledger_events_%'
     ORDER BY name
   `).all();
-  assert.equal(triggers.results.length, 2);
+  assert.deepEqual(triggers.results.map((row) => row.name), [
+    "workflow_ledger_events_append_only_delete",
+    "workflow_ledger_events_append_only_update",
+    "workflow_ledger_events_prevent_replace_collision",
+  ]);
+
+  const first = createLedgerEventEnvelope(requestedEvent());
+  const second = createLedgerEventEnvelope(executedEvent({ prevHash: first.eventHash }));
+  const firstRow = cloudLedgerRow(first, 1);
+  const secondRow = cloudLedgerRow(second, 2);
+  await insertCloudLedgerRow(cloud, firstRow);
+  await insertCloudLedgerRow(cloud, secondRow);
+  await cloud.db.prepare(`
+    INSERT INTO workflow_ledger_head (singleton, last_sequence, last_event_hash, updated_at)
+    VALUES (?, ?, ?, ?)
+  `).bind(1, 2, second.eventHash, firstRow.created_at).run();
+  for (const event of [first, second]) {
+    const sequence = event === first ? 1 : 2;
+    await cloud.db.prepare(`
+      INSERT INTO workflow_outbox (event_id, sequence, topic, payload_json, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).bind(
+      event.eventId, sequence, `workflow.${event.eventType}`, canonicalJson(event), firstRow.created_at,
+    ).run();
+  }
+
+  for (const column of ["sequence", "event_id", "idempotency_key", "event_hash"]) {
+    await assert.rejects(
+      () => insertCloudLedgerRow(cloud, replacementCandidate(firstRow, column), { replace: true }),
+      /WORKFLOW_LEDGER_APPEND_ONLY/,
+      column,
+    );
+  }
+  const originalHead = {
+    ...await cloud.db.prepare("SELECT * FROM workflow_ledger_head WHERE singleton = 1").first(),
+  };
+  await assert.rejects(
+    () => cloud.db.batch([
+      cloud.db.prepare(`
+        UPDATE workflow_ledger_head
+        SET last_sequence = ?, last_event_hash = ?, updated_at = ?
+        WHERE singleton = 1
+      `).bind(1, "e".repeat(64), "2026-08-24T12:08:00.000Z"),
+      cloudLedgerInsertStatement(cloud, replacementCandidate(firstRow, "sequence"), { replace: true }),
+    ]),
+    /WORKFLOW_LEDGER_APPEND_ONLY/,
+  );
+  assert.deepEqual(
+    { ...await cloud.db.prepare("SELECT * FROM workflow_ledger_head WHERE singleton = 1").first() },
+    originalHead,
+  );
+  assert.equal(auditWorkflowLedgerRows(await cloudAuditInput(cloud)).projections.at(0).lastSequence, 2);
+
+  await cloud.db.exec("DROP TRIGGER workflow_ledger_events_append_only_update");
+  await cloud.db.prepare(`
+    UPDATE workflow_ledger_events SET event_type = 'transition.executed' WHERE sequence = 1
+  `).run();
+  const eventTypeTampered = await cloudAuditInput(cloud);
+  assert.throws(
+    () => auditWorkflowLedgerRows(eventTypeTampered),
+    (error) => error instanceof WorkflowContractError && error.code === WORKFLOW_ERROR_CODES.LEDGER_HASH_INVALID,
+  );
+  await cloud.db.prepare(`
+    UPDATE workflow_ledger_events SET event_type = 'transition.requested' WHERE sequence = 1
+  `).run();
+  await cloud.db.prepare(`
+    UPDATE workflow_outbox SET payload_json = '{}' WHERE sequence = 2
+  `).run();
+  const outboxTampered = await cloudAuditInput(cloud);
+  assert.throws(
+    () => auditWorkflowLedgerRows(outboxTampered),
+    (error) => error instanceof WorkflowContractError && error.code === WORKFLOW_ERROR_CODES.LEDGER_HASH_INVALID,
+  );
 });

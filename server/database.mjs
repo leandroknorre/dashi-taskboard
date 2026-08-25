@@ -469,7 +469,7 @@ export class TaskboardDatabase {
   constructor(filename) {
     mkdirSync(path.dirname(filename), { recursive: true });
     this.database = new DatabaseSync(filename);
-    this.database.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
+    this.database.exec("PRAGMA foreign_keys = ON; PRAGMA recursive_triggers = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
     this.#migrate();
     this.interruptAbandonedAiChatRuns();
   }

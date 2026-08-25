@@ -108,12 +108,36 @@ export const WORKFLOW_LEDGER_BACKFILL_SQL = `
   ON CONFLICT(work_item_id) DO NOTHING;
 `;
 
+/**
+ * Corrective migration 0015. SQLite's INSERT OR REPLACE deletes conflicting
+ * rows instead of issuing UPDATE/DELETE triggers unless recursive triggers are
+ * enabled. Checking the collision in BEFORE INSERT is the non-bypassable
+ * guard: REPLACE cannot get as far as its implicit delete.
+ */
+export const WORKFLOW_LEDGER_HARDENING_0015_SQL = `
+  CREATE TRIGGER IF NOT EXISTS workflow_ledger_events_prevent_replace_collision
+  BEFORE INSERT ON workflow_ledger_events
+  WHEN EXISTS (
+    SELECT 1
+    FROM workflow_ledger_events AS existing
+    WHERE existing.sequence = NEW.sequence
+      OR existing.event_id = NEW.event_id
+      OR existing.idempotency_key = NEW.idempotency_key
+      OR existing.event_hash = NEW.event_hash
+  )
+  BEGIN SELECT RAISE(ABORT, 'WORKFLOW_LEDGER_APPEND_ONLY'); END;
+`;
+
 /** Applies the local schema after the pre-existing task schema is available. */
 export function migrateLocalWorkflowLedger(database) {
+  // Defense in depth for old SQLite REPLACE semantics. The collision trigger
+  // above is still the required guard because this pragma is connection-local.
+  database.exec("PRAGMA recursive_triggers = ON");
   database.exec("BEGIN IMMEDIATE");
   try {
     database.exec(WORKFLOW_LEDGER_SCHEMA_SQL);
     database.exec(WORKFLOW_LEDGER_BACKFILL_SQL);
+    database.exec(WORKFLOW_LEDGER_HARDENING_0015_SQL);
     database.exec("COMMIT");
   } catch (error) {
     database.exec("ROLLBACK");
@@ -129,7 +153,7 @@ function isoNow() {
   return new Date().toISOString();
 }
 
-function eventIntent(event) {
+export function ledgerEventIntent(event) {
   const {
     eventId: _eventId,
     prevHash: _prevHash,
@@ -168,26 +192,150 @@ function eventFromRow(row) {
   let event;
   try {
     event = normalizeLedgerEventEnvelope(JSON.parse(row.envelope_json));
-  } catch (error) {
-    if (error instanceof WorkflowContractError) {
-      throw ledgerError("Ledger event envelope is malformed or its hash is invalid", {
-        sequence: row.sequence,
-        eventId: row.event_id,
-      });
-    }
-    throw error;
-  }
-  if (
-    row.event_id !== event.eventId
-    || row.event_hash !== event.eventHash
-    || row.prev_hash !== event.prevHash
-  ) {
-    throw ledgerError("Ledger row columns do not match its immutable event envelope", {
+  } catch {
+    throw ledgerError("Ledger event envelope is malformed or its hash is invalid", {
       sequence: row.sequence,
       eventId: row.event_id,
     });
   }
+  const expected = {
+    event_id: event.eventId,
+    event_type: event.eventType,
+    workflow_id: event.workflowId,
+    revision_id: event.revisionId,
+    aggregate_type: event.aggregateType,
+    aggregate_id: event.aggregateId,
+    correlation_id: event.correlationId,
+    causation_id: event.causationId,
+    idempotency_key: event.idempotencyKey,
+    idempotency_fingerprint: ledgerEventIntent(event),
+    prev_hash: event.prevHash,
+    event_hash: event.eventHash,
+    occurred_at: event.occurredAt,
+  };
+  const mismatches = Object.entries(expected)
+    .filter(([column, value]) => row[column] !== value)
+    .map(([column]) => column);
+  if (mismatches.length > 0 || !validStorageTimestamp(row.created_at)) {
+    throw ledgerError("Ledger row columns do not match its immutable event envelope", {
+      sequence: row.sequence,
+      eventId: row.event_id,
+      mismatches: mismatches.length > 0 ? mismatches : ["created_at"],
+    });
+  }
   return event;
+}
+
+function validStorageTimestamp(value) {
+  return typeof value === "string"
+    && !Number.isNaN(Date.parse(value))
+    && new Date(value).toISOString() === value;
+}
+
+function auditOutbox(rows, events, outboxRows) {
+  if (outboxRows.length !== rows.length) {
+    throw ledgerError("Workflow outbox does not contain exactly one row per ledger event", {
+      eventCount: rows.length,
+      outboxCount: outboxRows.length,
+    });
+  }
+  const bySequence = new Map(outboxRows.map((outbox) => [outbox.sequence, outbox]));
+  const expected = [];
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    const event = events[index];
+    const outbox = bySequence.get(row.sequence);
+    const expectedPayload = canonicalJson(event);
+    if (
+      !outbox
+      || outbox.event_id !== event.eventId
+      || outbox.topic !== `workflow.${event.eventType}`
+      || outbox.payload_json !== expectedPayload
+      || outbox.created_at !== row.created_at
+      || !validStorageTimestamp(outbox.created_at)
+      || !Number.isSafeInteger(outbox.attempts)
+      || outbox.attempts < 0
+      || (outbox.dispatched_at !== null && !validStorageTimestamp(outbox.dispatched_at))
+    ) {
+      throw ledgerError("Workflow outbox row does not match its immutable ledger event", {
+        sequence: row.sequence,
+        eventId: event.eventId,
+      });
+    }
+    expected.push({
+      eventId: event.eventId,
+      sequence: row.sequence,
+      topic: `workflow.${event.eventType}`,
+      payload: event,
+      createdAt: outbox.created_at,
+      dispatchedAt: outbox.dispatched_at,
+      attempts: outbox.attempts,
+    });
+  }
+  return expected;
+}
+
+export function auditWorkflowLedgerRows({
+  eventRows,
+  head,
+  outboxRows,
+  project = defaultProjection,
+}) {
+  const rows = [...eventRows].sort((left, right) => left.sequence - right.sequence);
+  let expectedSequence = 1;
+  let previousHash = null;
+  const projections = new Map();
+  const events = [];
+  for (const row of rows) {
+    if (row.sequence !== expectedSequence) {
+      throw ledgerError("Ledger sequence is truncated or contains a gap", {
+        expectedSequence,
+        actualSequence: row.sequence,
+      });
+    }
+    const event = eventFromRow(row);
+    if (event.prevHash !== previousHash) {
+      throw ledgerError("Ledger hash chain is broken", { sequence: row.sequence });
+    }
+    const key = `${event.aggregateType}\u0000${event.aggregateId}`;
+    const previous = projections.get(key);
+    const state = project(previous?.state ?? null, event);
+    projections.set(key, {
+      aggregateType: event.aggregateType,
+      aggregateId: event.aggregateId,
+      workflowId: event.workflowId,
+      revisionId: event.revisionId,
+      lastSequence: row.sequence,
+      lastEventId: event.eventId,
+      lastEventType: event.eventType,
+      lastEventHash: event.eventHash,
+      state,
+    });
+    events.push(event);
+    previousHash = event.eventHash;
+    expectedSequence += 1;
+  }
+  if (rows.length === 0) {
+    if (head) throw ledgerError("Ledger head exists but no ledger events remain");
+  } else if (
+    !head
+    || head.last_sequence !== rows.at(-1).sequence
+    || head.last_event_hash !== previousHash
+    || !validStorageTimestamp(head.updated_at)
+  ) {
+    throw ledgerError("Ledger head does not match the replayed immutable chain");
+  }
+  const outbox = auditOutbox(rows, events, outboxRows);
+  return { projections: [...projections.values()], outbox };
+}
+
+function auditLedger(database, { project }) {
+  return auditWorkflowLedgerRows({
+    eventRows: database.prepare("SELECT * FROM workflow_ledger_events ORDER BY sequence").all(),
+    head: database.prepare("SELECT * FROM workflow_ledger_head WHERE singleton = 1").get(),
+    outboxRows: database.prepare("SELECT * FROM workflow_outbox ORDER BY sequence").all(),
+    project,
+  });
 }
 
 /**
@@ -221,7 +369,7 @@ export class WorkflowLedger {
           eventId: input.eventId ?? storedEvent.eventId,
           prevHash: storedEvent.prevHash,
         });
-        if (existing.idempotency_fingerprint !== eventIntent(candidate)) {
+        if (existing.idempotency_fingerprint !== ledgerEventIntent(candidate)) {
           throw new WorkflowContractError(
             WORKFLOW_ERROR_CODES.IDEMPOTENCY_CONFLICT,
             "idempotencyKey was already used for a different ledger event",
@@ -270,7 +418,7 @@ export class WorkflowLedger {
       `).run(
         sequence, event.eventId, event.eventType, event.workflowId, event.revisionId,
         event.aggregateType, event.aggregateId, event.correlationId, event.causationId,
-        event.idempotencyKey, eventIntent(event), event.prevHash, event.eventHash,
+        event.idempotencyKey, ledgerEventIntent(event), event.prevHash, event.eventHash,
         canonicalJson(event), event.occurredAt, timestamp,
       );
       this.database.prepare(`
@@ -320,51 +468,12 @@ export class WorkflowLedger {
   }
 
   replay({ project = defaultProjection } = {}) {
-    const rows = this.database.prepare(`
-      SELECT * FROM workflow_ledger_events ORDER BY sequence
-    `).all();
-    const head = this.database.prepare("SELECT * FROM workflow_ledger_head WHERE singleton = 1").get();
-    let expectedSequence = 1;
-    let previousHash = null;
-    const projections = new Map();
-    for (const row of rows) {
-      if (row.sequence !== expectedSequence) {
-        throw ledgerError("Ledger sequence is truncated or contains a gap", {
-          expectedSequence,
-          actualSequence: row.sequence,
-        });
-      }
-      const event = eventFromRow(row);
-      if (event.prevHash !== previousHash) {
-        throw ledgerError("Ledger hash chain is broken", { sequence: row.sequence });
-      }
-      const key = `${event.aggregateType}\u0000${event.aggregateId}`;
-      const previous = projections.get(key);
-      const state = project(previous?.state ?? null, event);
-      projections.set(key, {
-        aggregateType: event.aggregateType,
-        aggregateId: event.aggregateId,
-        workflowId: event.workflowId,
-        revisionId: event.revisionId,
-        lastSequence: row.sequence,
-        lastEventId: event.eventId,
-        lastEventType: event.eventType,
-        lastEventHash: event.eventHash,
-        state,
-      });
-      previousHash = event.eventHash;
-      expectedSequence += 1;
-    }
-    if (rows.length === 0) {
-      if (head) throw ledgerError("Ledger head exists but no ledger events remain");
-    } else if (
-      !head
-      || head.last_sequence !== rows.at(-1).sequence
-      || head.last_event_hash !== previousHash
-    ) {
-      throw ledgerError("Ledger head does not match the replayed immutable chain");
-    }
-    return [...projections.values()];
+    return auditLedger(this.database, { project }).projections;
+  }
+
+  /** Returns the reconstructed event-to-outbox correspondence after auditing it. */
+  audit({ project = defaultProjection } = {}) {
+    return auditLedger(this.database, { project });
   }
 
   rebuildProjections({ project = defaultProjection } = {}) {

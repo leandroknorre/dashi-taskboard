@@ -2,7 +2,14 @@
 
 This phase supplies durable, append-only storage only. `WorkflowLedger` writes
 one canonical event, its generic aggregate projection, and one outbox record in
-the same SQLite transaction. It also replays the chain and validates its head.
+the same SQLite transaction. It also replays the chain, validates every
+denormalized event field, validates the outbox/event correspondence, and checks
+the immutable chain head.
+
+Migration 0015 blocks SQLite `INSERT OR REPLACE` before its implicit delete can
+replace an existing event. `recursive_triggers` is enabled as extra defense,
+but the collision trigger—not a connection-local pragma—is the enforcement
+boundary.
 
 `workflow_work_item_projections` is a compatibility projection for pre-existing
 tasks. Its `work_item.imported` marker is not a ledger event and must not be
