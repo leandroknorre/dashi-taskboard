@@ -1,4 +1,4 @@
-import { automationRequestFingerprint, redactAndLimit } from "../shared/automation-runs.mjs";
+import { automationRequestFingerprint, normalizeResultCommand, redactAndLimit } from "../shared/automation-runs.mjs";
 import { canonicalJson } from "../shared/workflow-control.mjs";
 
 /**
@@ -139,6 +139,11 @@ function redactedParsedJson(value) {
   return redactAndLimit(JSON.parse(value), { limit: Number.POSITIVE_INFINITY });
 }
 
+function completeActor(actorType, actorId) {
+  return typeof actorType === "string" && actorType.length > 0
+    && typeof actorId === "string" && actorId.length > 0;
+}
+
 function runResponseFromRow(row, overrides = {}) {
   return {
     runId: row.run_id,
@@ -181,7 +186,7 @@ function unavailableReplay(reason) {
 
 function normalizedStoredFingerprint(request) {
   if (/^sha256:[a-f0-9]{64}$/.test(request.request_fingerprint)) {
-    return { fingerprint: request.request_fingerprint, valid: true };
+    return { fingerprint: request.request_fingerprint, valid: true, isHashed: true, legacyCommand: null };
   }
   try {
     const envelope = JSON.parse(request.request_fingerprint);
@@ -191,21 +196,36 @@ function normalizedStoredFingerprint(request) {
       || Array.isArray(envelope)
       || typeof envelope.operation !== "string"
       || typeof envelope.runId !== "string"
+      || envelope.operation !== request.operation
+      || envelope.runId !== request.run_id
     ) {
-      return { fingerprint: automationRequestFingerprint("legacy", "unavailable", {}), valid: false };
+      return {
+        fingerprint: automationRequestFingerprint("legacy", "unavailable", {}),
+        valid: false,
+        isHashed: false,
+        legacyCommand: null,
+      };
     }
     const { operation, runId, ...command } = envelope;
     const { leaseToken, ...withoutLease } = command;
     const redactedCommand = redactAndLimit(withoutLease, { limit: Number.POSITIVE_INFINITY });
+    const legacyCommand = {
+      ...redactedCommand,
+      ...(typeof leaseToken === "string" ? { leaseToken } : {}),
+    };
     return {
-      fingerprint: automationRequestFingerprint(operation, runId, {
-        ...redactedCommand,
-        ...(typeof leaseToken === "string" ? { leaseToken } : {}),
-      }),
+      fingerprint: automationRequestFingerprint(operation, runId, legacyCommand),
       valid: true,
+      isHashed: false,
+      legacyCommand,
     };
   } catch {
-    return { fingerprint: automationRequestFingerprint("legacy", "unavailable", {}), valid: false };
+    return {
+      fingerprint: automationRequestFingerprint("legacy", "unavailable", {}),
+      valid: false,
+      isHashed: false,
+      legacyCommand: null,
+    };
   }
 }
 
@@ -234,7 +254,7 @@ function legacyDispatchResponse(database, request) {
     && run.dispatched_by_actor_id === event.actor_id
     && typeof eventPayload.leaseExpiresAt === "string";
   const actor = { actorType: event.actor_type, actorId: event.actor_id };
-  if (!hasStableOriginalLease || event.actor_type === null || event.actor_id === null) {
+  if (!hasStableOriginalLease || !completeActor(event.actor_type, event.actor_id)) {
     return { ...unavailableReplay("historical_dispatch_response_superseded"), ...actor };
   }
   try {
@@ -261,14 +281,62 @@ function legacyDispatchResponse(database, request) {
   }
 }
 
-function legacyResultResponse(database, request) {
+function legacyResultResponse(database, request, legacyCommand) {
+  if (legacyCommand === null) return unavailableReplay("historical_result_actor_unproven");
+  let command;
+  try {
+    command = normalizeResultCommand(legacyCommand);
+  } catch {
+    return unavailableReplay("historical_result_command_invalid");
+  }
+  if (command.idempotencyKey !== request.idempotency_key) {
+    return unavailableReplay("historical_result_request_mismatch");
+  }
   const run = database.prepare("SELECT * FROM workflow_automation_runs WHERE run_id = ?").get(request.run_id);
   if (!run) return unavailableReplay("historical_result_response_missing");
   try {
+    const isTerminalResult = ["succeeded", "failed", "cancelled"].includes(run.status);
+    const commandMatchesRun = isTerminalResult
+      && run.status === command.status
+      && run.version === command.expectedVersion + 1
+      && run.lease_token === command.leaseToken
+      && run.completed_at === request.created_at
+      && run.updated_at === request.created_at
+      && canonicalJson(redactedParsedJson(run.result_json)) === canonicalJson(command.result);
+    if (!commandMatchesRun) return unavailableReplay("historical_result_response_unlinked");
+
+    const events = database.prepare(`
+      SELECT * FROM workflow_automation_run_events
+      WHERE run_id = ?
+        AND version = ?
+        AND event_type = ?
+        AND status = ?
+        AND created_at = ?
+      ORDER BY event_id
+    `).all(request.run_id, run.version, `run.${run.status}`, run.status, request.created_at);
+    if (events.length !== 1) return unavailableReplay("historical_result_actor_ambiguous");
+    const event = events[0];
+    const previous = database.prepare(`
+      SELECT 1 FROM workflow_automation_run_events
+      WHERE run_id = ? AND version = ? AND event_type = 'run.dispatched' AND status = 'dispatched'
+    `).get(request.run_id, run.version - 1);
+    const requestActorIsConsistent = (request.actor_type === null && request.actor_id === null)
+      || (completeActor(request.actor_type, request.actor_id)
+        && request.actor_type === event.actor_type
+        && request.actor_id === event.actor_id);
+    if (
+      !previous
+      || event.payload_json !== run.result_json
+      || !["user", "agent"].includes(event.actor_type)
+      || !completeActor(event.actor_type, event.actor_id)
+      || !requestActorIsConsistent
+    ) {
+      return unavailableReplay("historical_result_actor_unproven");
+    }
     return {
-      leaseToken: request.lease_token ?? null,
-      actorType: request.actor_type ?? null,
-      actorId: request.actor_id ?? null,
+      leaseToken: null,
+      actorType: event.actor_type,
+      actorId: event.actor_id,
       responseJson: redactedJson({ run: runResponseFromRow(run) }),
       replayState: "available",
     };
@@ -329,12 +397,15 @@ export function migrateLocalAutomationRuns(database) {
     for (const request of requests) {
       const fingerprint = normalizedStoredFingerprint(request);
       const sanitizedResponse = request.response_json === null ? null : sanitizedStoredJson(request.response_json);
+      const hasRecordedActor = completeActor(request.actor_type, request.actor_id);
       const alreadySafe = fingerprint.valid
+        && fingerprint.isHashed
         && request.replay_state === "available"
         && request.response_json !== null
-        && sanitizedResponse === null;
+        && sanitizedResponse === null
+        && hasRecordedActor;
       if (alreadySafe) continue;
-      if (fingerprint.valid && request.replay_state === "available" && request.response_json !== null) {
+      if (fingerprint.valid && fingerprint.isHashed && request.replay_state === "available" && request.response_json !== null && hasRecordedActor) {
         updates.push({
           request,
           fingerprint: fingerprint.fingerprint,
@@ -352,7 +423,7 @@ export function migrateLocalAutomationRuns(database) {
         ? unavailableReplay("historical_request_fingerprint_invalid")
         : request.operation === "dispatch"
           ? legacyDispatchResponse(database, request)
-          : legacyResultResponse(database, request);
+          : legacyResultResponse(database, request, fingerprint.legacyCommand);
       updates.push({ request, fingerprint: fingerprint.fingerprint, historical });
     }
     if (updates.length > 0) {

@@ -29,6 +29,15 @@ newer lease. Each request keeps a redacted historical response snapshot; a
 pre-release request can only be recovered when its original lease is provably
 still the recorded attempt. If a newer reclaim has superseded it, replay is
 marked unavailable and fails closed rather than copying the active lease.
+Legacy result replay likewise requires a uniquely linked terminal run event
+with a complete recorded actor; an absent or inconsistent actor is never a
+wildcard and makes the replay unavailable for every caller.
+
+Physical storage stays private: never export or copy a live SQLite database,
+its `-wal`/`-shm` files, or a live diagnostic snapshot into a public artifact.
+Private backup retention may require a separately operated checkpoint or
+rotation policy. This migration intentionally does not run destructive
+`VACUUM`, checkpoint, or rotate physical database files.
 
 ## Local API
 

@@ -126,7 +126,7 @@ function publishMode(fixture, mode) {
   });
 }
 
-function replaceRequestTableWithLegacyRow(fixture, { runId, command, createdAt }) {
+function replaceRequestTableWithLegacyRow(fixture, { runId, command, createdAt, operation = "dispatch" }) {
   fixture.database.database.exec("DROP TABLE workflow_automation_run_requests");
   fixture.database.database.exec(`
     CREATE TABLE workflow_automation_run_requests (
@@ -140,11 +140,12 @@ function replaceRequestTableWithLegacyRow(fixture, { runId, command, createdAt }
   fixture.database.database.prepare(`
     INSERT INTO workflow_automation_run_requests (
       idempotency_key, run_id, operation, request_fingerprint, created_at
-    ) VALUES (?, ?, 'dispatch', ?, ?)
+    ) VALUES (?, ?, ?, ?, ?)
   `).run(
     command.idempotencyKey,
     runId,
-    canonicalJson({ operation: "dispatch", runId, ...command }),
+    operation,
+    canonicalJson({ operation, runId, ...command }),
     createdAt,
   );
 }
@@ -601,6 +602,284 @@ test("legacy dispatch reclaimed before migration fails closed instead of receivi
     (error) => error?.status === 409 && error?.code === "AUTOMATION_RUN_IDEMPOTENCY_CONFLICT",
   );
   assert.notEqual(reclaimed.leaseToken, original.leaseToken);
+});
+
+test("legacy result migration recovers its actor only from the linked terminal event", async () => {
+  const instant = "2026-08-28T12:00:00.000Z";
+  const resultActor = { type: "agent", id: "legacy-result-agent", name: "Legacy Result Agent", avatarUrl: null };
+  const differentActor = { type: "agent", id: "legacy-result-other", name: "Legacy Result Other", avatarUrl: null };
+  const fixture = await createFixture({ clock: () => instant });
+  const task = createTask(fixture, "Legacy result actor recovery");
+  const created = transition(fixture, task, "legacy-result-recovery-transition");
+  const dispatched = fixture.runs.dispatch(created.automationRun.runId, {
+    expectedVersion: 1,
+    idempotencyKey: "legacy-result-recovery-dispatch",
+  }, { actor: human });
+  const command = {
+    expectedVersion: 2,
+    leaseToken: dispatched.leaseToken,
+    status: "succeeded",
+    result: { summary: "legacy terminal result" },
+    idempotencyKey: "legacy-result-recovery-result",
+  };
+  fixture.runs.recordResult(created.automationRun.runId, command, { actor: resultActor });
+  const request = fixture.database.database.prepare(`
+    SELECT created_at FROM workflow_automation_run_requests WHERE idempotency_key = ?
+  `).get(command.idempotencyKey);
+  replaceRequestTableWithLegacyRow(fixture, {
+    runId: created.automationRun.runId,
+    command,
+    createdAt: request.created_at,
+    operation: "result",
+  });
+
+  migrateLocalAutomationRuns(fixture.database.database);
+  const recovered = fixture.database.database.prepare(`
+    SELECT actor_type, actor_id, response_json, replay_state
+    FROM workflow_automation_run_requests WHERE idempotency_key = ?
+  `).get(command.idempotencyKey);
+  assert.equal(recovered.actor_type, resultActor.type);
+  assert.equal(recovered.actor_id, resultActor.id);
+  assert.equal(recovered.replay_state, "available");
+  assert.doesNotMatch(recovered.response_json, new RegExp(dispatched.leaseToken, "i"));
+
+  const replay = fixture.runs.recordResult(created.automationRun.runId, command, { actor: resultActor });
+  assert.equal(replay.idempotent, true);
+  assert.throws(
+    () => fixture.runs.recordResult(created.automationRun.runId, command, { actor: differentActor }),
+    (error) => error?.status === 409 && error?.code === "AUTOMATION_RUN_IDEMPOTENCY_CONFLICT",
+  );
+});
+
+test("legacy result without actor proof is unavailable to both the original and a different actor", async () => {
+  const instant = "2026-08-29T12:00:00.000Z";
+  const resultActor = { type: "agent", id: "legacy-result-unproven", name: "Legacy Result Unproven", avatarUrl: null };
+  const differentActor = { type: "agent", id: "legacy-result-intruder", name: "Legacy Result Intruder", avatarUrl: null };
+  const fixture = await createFixture({ clock: () => instant });
+  const task = createTask(fixture, "Legacy result actor unavailable");
+  const created = transition(fixture, task, "legacy-result-unavailable-transition");
+  const dispatched = fixture.runs.dispatch(created.automationRun.runId, {
+    expectedVersion: 1,
+    idempotencyKey: "legacy-result-unavailable-dispatch",
+  }, { actor: human });
+  const command = {
+    expectedVersion: 2,
+    leaseToken: dispatched.leaseToken,
+    status: "succeeded",
+    result: { summary: "do not replay this historical result" },
+    idempotencyKey: "legacy-result-unavailable-result",
+  };
+  fixture.runs.recordResult(created.automationRun.runId, command, { actor: resultActor });
+  const request = fixture.database.database.prepare(`
+    SELECT created_at FROM workflow_automation_run_requests WHERE idempotency_key = ?
+  `).get(command.idempotencyKey);
+  const unlinkedCreatedAt = new Date(Date.parse(request.created_at) + 1).toISOString();
+  replaceRequestTableWithLegacyRow(fixture, {
+    runId: created.automationRun.runId,
+    command,
+    createdAt: unlinkedCreatedAt,
+    operation: "result",
+  });
+
+  migrateLocalAutomationRuns(fixture.database.database);
+  migrateLocalAutomationRuns(fixture.database.database);
+  const unavailable = fixture.database.database.prepare(`
+    SELECT actor_type, actor_id, response_json, replay_state
+    FROM workflow_automation_run_requests WHERE idempotency_key = ?
+  `).get(command.idempotencyKey);
+  assert.equal(unavailable.actor_type, null);
+  assert.equal(unavailable.actor_id, null);
+  assert.equal(unavailable.replay_state, "unavailable");
+  assert.doesNotMatch(unavailable.response_json, /do not replay this historical result/);
+
+  for (const actor of [resultActor, differentActor]) {
+    assert.throws(
+      () => fixture.runs.recordResult(created.automationRun.runId, command, { actor }),
+      (error) => error?.status === 409 && error?.code === "AUTOMATION_RUN_REPLAY_UNAVAILABLE",
+    );
+  }
+});
+
+test("reentry downgrades a previously available result replay when its actor proof is missing", async () => {
+  const resultActor = { type: "agent", id: "previous-result-actor", name: "Previous Result Actor", avatarUrl: null };
+  const differentActor = { type: "agent", id: "previous-result-intruder", name: "Previous Result Intruder", avatarUrl: null };
+  const fixture = await createFixture();
+  const task = createTask(fixture, "Previously migrated result actor");
+  const created = transition(fixture, task, "previous-result-actor-transition");
+  const dispatched = fixture.runs.dispatch(created.automationRun.runId, {
+    expectedVersion: 1,
+    idempotencyKey: "previous-result-actor-dispatch",
+  }, { actor: human });
+  const command = {
+    expectedVersion: 2,
+    leaseToken: dispatched.leaseToken,
+    status: "succeeded",
+    result: { summary: "previously available response" },
+    idempotencyKey: "previous-result-actor-result",
+  };
+  fixture.runs.recordResult(created.automationRun.runId, command, { actor: resultActor });
+  fixture.database.database.exec("DROP TRIGGER workflow_automation_run_requests_immutable_update");
+  fixture.database.database.prepare(`
+    UPDATE workflow_automation_run_requests
+    SET actor_type = NULL, actor_id = NULL
+    WHERE idempotency_key = ?
+  `).run(command.idempotencyKey);
+
+  migrateLocalAutomationRuns(fixture.database.database);
+  const unavailable = fixture.database.database.prepare(`
+    SELECT actor_type, actor_id, response_json, replay_state
+    FROM workflow_automation_run_requests WHERE idempotency_key = ?
+  `).get(command.idempotencyKey);
+  assert.equal(unavailable.actor_type, null);
+  assert.equal(unavailable.actor_id, null);
+  assert.equal(unavailable.replay_state, "unavailable");
+  assert.doesNotMatch(unavailable.response_json, /previously available response/);
+
+  for (const actor of [resultActor, differentActor]) {
+    assert.throws(
+      () => fixture.runs.recordResult(created.automationRun.runId, command, { actor }),
+      (error) => error?.status === 409 && error?.code === "AUTOMATION_RUN_REPLAY_UNAVAILABLE",
+    );
+  }
+});
+
+test("a raw legacy result fingerprint with a mismatched actor is rehashed and fails closed", async () => {
+  const instant = "2026-08-30T12:00:00.000Z";
+  const resultActor = { type: "agent", id: "raw-result-actor", name: "Raw Result Actor", avatarUrl: null };
+  const mismatchedActor = { type: "agent", id: "raw-result-mismatch", name: "Raw Result Mismatch", avatarUrl: null };
+  const fixture = await createFixture({ clock: () => instant });
+  const task = createTask(fixture, "Raw legacy result mismatch");
+  const created = transition(fixture, task, "raw-result-mismatch-transition");
+  const dispatched = fixture.runs.dispatch(created.automationRun.runId, {
+    expectedVersion: 1,
+    idempotencyKey: "raw-result-mismatch-dispatch",
+  }, { actor: human });
+  const secret = "raw-result-private-value";
+  const command = {
+    expectedVersion: 2,
+    leaseToken: dispatched.leaseToken,
+    status: "succeeded",
+    result: { summary: "raw result must not replay", privateKey: secret },
+    idempotencyKey: "raw-result-mismatch-result",
+  };
+  const completed = fixture.runs.recordResult(created.automationRun.runId, command, { actor: resultActor });
+  const database = fixture.database.database;
+  database.exec("DROP TRIGGER workflow_automation_run_requests_immutable_update");
+  database.prepare(`
+    UPDATE workflow_automation_run_requests
+    SET request_fingerprint = ?, actor_type = ?, actor_id = ?, response_json = ?, replay_state = 'available'
+    WHERE idempotency_key = ?
+  `).run(
+    canonicalJson({ operation: "result", runId: created.automationRun.runId, ...command }),
+    mismatchedActor.type,
+    mismatchedActor.id,
+    canonicalJson({ run: completed.run }),
+    command.idempotencyKey,
+  );
+
+  migrateLocalAutomationRuns(database);
+  const unavailable = database.prepare(`
+    SELECT request_fingerprint, actor_type, actor_id, response_json, replay_state
+    FROM workflow_automation_run_requests WHERE idempotency_key = ?
+  `).get(command.idempotencyKey);
+  assert.match(unavailable.request_fingerprint, /^sha256:[a-f0-9]{64}$/);
+  assert.equal(unavailable.request_fingerprint.includes(secret), false);
+  assert.equal(unavailable.request_fingerprint.includes(dispatched.leaseToken), false);
+  assert.equal(unavailable.actor_type, null);
+  assert.equal(unavailable.actor_id, null);
+  assert.equal(unavailable.replay_state, "unavailable");
+  assert.doesNotMatch(unavailable.response_json, /raw result must not replay/);
+
+  for (const actor of [resultActor, mismatchedActor]) {
+    assert.throws(
+      () => fixture.runs.recordResult(created.automationRun.runId, command, { actor }),
+      (error) => error?.status === 409 && error?.code === "AUTOMATION_RUN_REPLAY_UNAVAILABLE",
+    );
+  }
+});
+
+test("a raw legacy result fingerprint with its event actor is rehashed and replays only to that actor", async () => {
+  const instant = "2026-08-31T12:00:00.000Z";
+  const resultActor = { type: "agent", id: "raw-result-match", name: "Raw Result Match", avatarUrl: null };
+  const differentActor = { type: "agent", id: "raw-result-other", name: "Raw Result Other", avatarUrl: null };
+  const fixture = await createFixture({ clock: () => instant });
+  const task = createTask(fixture, "Raw legacy result recovery");
+  const created = transition(fixture, task, "raw-result-recovery-transition");
+  const dispatched = fixture.runs.dispatch(created.automationRun.runId, {
+    expectedVersion: 1,
+    idempotencyKey: "raw-result-recovery-dispatch",
+  }, { actor: human });
+  const secret = "raw-result-recovery-private";
+  const command = {
+    expectedVersion: 2,
+    leaseToken: dispatched.leaseToken,
+    status: "succeeded",
+    result: { summary: "raw result can recover", privateKey: secret },
+    idempotencyKey: "raw-result-recovery-result",
+  };
+  const completed = fixture.runs.recordResult(created.automationRun.runId, command, { actor: resultActor });
+  const database = fixture.database.database;
+  database.exec("DROP TRIGGER workflow_automation_run_requests_immutable_update");
+  database.prepare(`
+    UPDATE workflow_automation_run_requests
+    SET request_fingerprint = ?, actor_type = ?, actor_id = ?, response_json = ?, replay_state = 'available'
+    WHERE idempotency_key = ?
+  `).run(
+    canonicalJson({ operation: "result", runId: created.automationRun.runId, ...command }),
+    resultActor.type,
+    resultActor.id,
+    canonicalJson({ run: completed.run }),
+    command.idempotencyKey,
+  );
+
+  migrateLocalAutomationRuns(database);
+  const recovered = database.prepare(`
+    SELECT request_fingerprint, actor_type, actor_id, response_json, replay_state
+    FROM workflow_automation_run_requests WHERE idempotency_key = ?
+  `).get(command.idempotencyKey);
+  assert.match(recovered.request_fingerprint, /^sha256:[a-f0-9]{64}$/);
+  assert.equal(recovered.request_fingerprint.includes(secret), false);
+  assert.equal(recovered.request_fingerprint.includes(dispatched.leaseToken), false);
+  assert.equal(recovered.actor_type, resultActor.type);
+  assert.equal(recovered.actor_id, resultActor.id);
+  assert.equal(recovered.replay_state, "available");
+  assert.doesNotMatch(recovered.response_json, new RegExp(dispatched.leaseToken, "i"));
+
+  assert.equal(fixture.runs.recordResult(created.automationRun.runId, command, { actor: resultActor }).idempotent, true);
+  assert.throws(
+    () => fixture.runs.recordResult(created.automationRun.runId, command, { actor: differentActor }),
+    (error) => error?.status === 409 && error?.code === "AUTOMATION_RUN_IDEMPOTENCY_CONFLICT",
+  );
+});
+
+test("a result recorded without an explicit actor uses the local actor instead of a replay wildcard", async () => {
+  const fixture = await createFixture();
+  const task = createTask(fixture, "Result local actor default");
+  const created = transition(fixture, task, "result-local-actor-transition");
+  const dispatched = fixture.runs.dispatch(created.automationRun.runId, {
+    expectedVersion: 1,
+    idempotencyKey: "result-local-actor-dispatch",
+  }, { actor: human });
+  const command = {
+    expectedVersion: 2,
+    leaseToken: dispatched.leaseToken,
+    status: "succeeded",
+    result: { summary: "local actor result" },
+    idempotencyKey: "result-local-actor-result",
+  };
+  fixture.runs.recordResult(created.automationRun.runId, command);
+  const stored = fixture.database.database.prepare(`
+    SELECT actor_type, actor_id FROM workflow_automation_run_requests WHERE idempotency_key = ?
+  `).get(command.idempotencyKey);
+  assert.equal(stored.actor_type, "user");
+  assert.equal(stored.actor_id, "local-user");
+  assert.equal(fixture.runs.recordResult(created.automationRun.runId, command).idempotent, true);
+  assert.throws(
+    () => fixture.runs.recordResult(created.automationRun.runId, command, {
+      actor: { type: "agent", id: "foreign-result-actor", name: "Foreign Result Actor", avatarUrl: null },
+    }),
+    (error) => error?.status === 409 && error?.code === "AUTOMATION_RUN_IDEMPOTENCY_CONFLICT",
+  );
 });
 
 test("shadow and disabled policies record stage entry without a dispatchable effect", async () => {
