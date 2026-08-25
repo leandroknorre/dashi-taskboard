@@ -1947,6 +1947,196 @@ async function resolveStageForTask(env, projectId, { stageId, status }) {
   return { stageId: row.id, status: row.canonical_status };
 }
 
+const TRANSITION_IDENTIFIER = /^[a-z][a-z0-9_-]{0,63}$/;
+const TRANSITION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const TRANSITION_HASH = /^[0-9a-f]{64}$/;
+
+function transitionError(code, message, details) {
+  const status = code === "ACTION_NOT_FOUND" || code === "INVALID_CONTRACT" ? 400 : 409;
+  return new ApiError(status, code, message, details);
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+async function sha256(value) {
+  const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function terminalKind(stage) {
+  return stage.terminal_kind === "done" ? "completed" : stage.terminal_kind === "canceled" ? "canceled" : "none";
+}
+
+async function ensureProjectWorkflow(env, projectId) {
+  const existing = await env.DB.prepare("SELECT * FROM workflow_definitions WHERE project_id = ?").bind(projectId).first();
+  if (existing) return existing;
+  const stages = await all(env.DB.prepare(`
+    SELECT id, canonical_status, terminal_kind, sort_order
+    FROM workflow_stages WHERE project_id = ? ORDER BY sort_order, id
+  `).bind(projectId));
+  if (stages.length === 0) throw transitionError("WORKFLOW_PIN_MISSING", "Project has no workflow stages");
+  const timestamp = now();
+  const workflowId = `workflow_${(await sha256(projectId)).slice(0, 24)}`;
+  const revisionId = uuid();
+  const profileRevisionId = uuid();
+  const bindings = stages.map((stage, index) => ({
+    taskStageId: stage.id, contractStageId: `stage_${index + 1}`,
+    canonicalStatus: stage.canonical_status, terminalKind: terminalKind(stage), order: index + 1,
+  }));
+  const transitions = [];
+  const rules = [];
+  for (const from of bindings) for (const to of bindings) {
+    if (from.taskStageId === to.taskStageId) continue;
+    const actionKey = `legacy_move_${from.order}_${to.order}`;
+    const requiresAcceptance = to.terminalKind === "completed";
+    transitions.push({ transitionId: actionKey, fromStageId: from.contractStageId, toStageId: to.contractStageId,
+      requiresAcceptance, irreversible: false, gateIds: requiresAcceptance ? ["human-acceptance"] : [], authorization: { required: false, action: null } });
+    rules.push({ actionKey, transitionId: actionKey, fromTaskStageId: from.taskStageId, toTaskStageId: to.taskStageId,
+      fromContractStageId: from.contractStageId, toContractStageId: to.contractStageId, toTerminalKind: to.terminalKind, legacy: 1 });
+  }
+  if (transitions.length === 0) transitions.push({ transitionId: "stay_stage_1", fromStageId: "stage_1", toStageId: "stage_1", requiresAcceptance: false, irreversible: false, gateIds: [], authorization: { required: false, action: null } });
+  const definition = { schemaVersion: 1, workflowId, revisionId, revision: 1, createdAt: timestamp, immutable: true,
+    agentProfileRevisions: [{ agentProfileId: "manual", agentProfileRevisionId: profileRevisionId, revision: 1, createdAt: timestamp, immutable: true, mode: "manual" }],
+    stages: bindings.map((binding) => ({ stageId: binding.contractStageId, name: binding.contractStageId.replace("_", " "), terminalKind: binding.terminalKind, agentProfileRevisionId: profileRevisionId })),
+    gates: [{ gateId: "human-acceptance", kind: "acceptance", requiredEvidenceTypes: ["human_acceptance"] }], transitions };
+  const statements = [
+    env.DB.prepare("INSERT INTO workflow_definitions (workflow_id, project_id, current_revision_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)").bind(workflowId, projectId, revisionId, timestamp, timestamp),
+    env.DB.prepare("INSERT INTO workflow_revisions (revision_id, workflow_id, revision, definition_json, immutable, created_at) VALUES (?, ?, 1, ?, 1, ?)").bind(revisionId, workflowId, JSON.stringify(definition), timestamp),
+    ...bindings.map((binding) => env.DB.prepare("INSERT INTO workflow_revision_stage_bindings (revision_id, contract_stage_id, task_stage_id, canonical_status, terminal_kind, stage_order) VALUES (?, ?, ?, ?, ?, ?)").bind(revisionId, binding.contractStageId, binding.taskStageId, binding.canonicalStatus, binding.terminalKind, binding.order)),
+    ...rules.map((rule) => env.DB.prepare("INSERT INTO workflow_transition_rules (revision_id, action_key, transition_id, from_task_stage_id, to_task_stage_id, from_contract_stage_id, to_contract_stage_id, to_terminal_kind, legacy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(revisionId, rule.actionKey, rule.transitionId, rule.fromTaskStageId, rule.toTaskStageId, rule.fromContractStageId, rule.toContractStageId, rule.toTerminalKind, rule.legacy)),
+  ];
+  try {
+    await env.DB.batch(statements);
+  } catch (error) {
+    const raced = await env.DB.prepare("SELECT * FROM workflow_definitions WHERE project_id = ?").bind(projectId).first();
+    if (raced) return raced;
+    throw error;
+  }
+  return { workflow_id: workflowId, project_id: projectId, current_revision_id: revisionId };
+}
+
+async function transitionContext(env, taskId) {
+  const task = await requireTaskRow(env, taskId);
+  const definition = await ensureProjectWorkflow(env, task.project_id);
+  await env.DB.prepare(`INSERT OR IGNORE INTO workflow_task_pins (task_id, workflow_id, revision_id, pinned_at)
+    VALUES (?, ?, ?, ?)`).bind(task.id, definition.workflow_id, definition.current_revision_id, task.created_at).run();
+  const pin = await env.DB.prepare("SELECT * FROM workflow_task_pins WHERE task_id = ?").bind(task.id).first();
+  const revision = pin && await env.DB.prepare("SELECT * FROM workflow_revisions WHERE revision_id = ?").bind(pin.revision_id).first();
+  if (!pin || !revision) throw transitionError("WORKFLOW_PIN_MISSING", "Task has no pinned workflow revision");
+  return { task, pin, revision, definition: JSON.parse(revision.definition_json) };
+}
+
+function parseTransition(body, idempotencyKey) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["expectedStateVersion", "actionKey", "gateEvidence", "authorizationId"]));
+  if (idempotencyKey === null) throw new ApiError(400, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key header is required");
+  const key = stringField(idempotencyKey, "Idempotency-Key", { required: true, maxLength: 64 });
+  if (!TRANSITION_IDENTIFIER.test(key)) throw new ApiError(400, "INVALID_FIELD", "Idempotency-Key must be a stable identifier");
+  if (!Number.isSafeInteger(body.expectedStateVersion) || body.expectedStateVersion < 1) throw new ApiError(400, "INVALID_FIELD", "'expectedStateVersion' must be a positive integer");
+  const actionKey = stringField(body.actionKey, "actionKey", { required: true, maxLength: 64 });
+  if (!TRANSITION_IDENTIFIER.test(actionKey)) throw new ApiError(400, "INVALID_FIELD", "actionKey must be a stable identifier");
+  if (body.gateEvidence !== undefined && !Array.isArray(body.gateEvidence)) throw new ApiError(400, "INVALID_FIELD", "'gateEvidence' must be an array");
+  return { expectedStateVersion: body.expectedStateVersion, actionKey, gateEvidence: body.gateEvidence ?? [], authorizationId: body.authorizationId === undefined ? null : stringField(body.authorizationId, "authorizationId", { nullable: true, maxLength: 96 }), idempotencyKey: key };
+}
+
+function assertTransitionPolicy(context, rule, command, authorization, descendants, occurredAt) {
+  if (context.task.version !== command.expectedStateVersion) throw transitionError("EXPECTED_STATE_CONFLICT", "Task changed since the requested transition state", { expectedStateVersion: command.expectedStateVersion, actualStateVersion: context.task.version });
+  if (context.task.archived_at !== null) throw transitionError("TASK_ARCHIVED", "Archived tasks cannot transition");
+  if (!rule || rule.from_task_stage_id !== context.task.stage_id) throw transitionError("ACTION_NOT_FOUND", "actionKey is not available from the task's pinned workflow state");
+  const transition = context.definition.transitions.find((item) => item.transitionId === rule.transition_id && item.fromStageId === rule.from_contract_stage_id && item.toStageId === rule.to_contract_stage_id);
+  if (!transition) throw transitionError("ACTION_NOT_FOUND", "Transition is not defined by the pinned workflow");
+  for (const gateId of transition.gateIds) {
+    const gate = context.definition.gates.find((item) => item.gateId === gateId);
+    const evidence = command.gateEvidence.filter((item) => item?.gateId === gateId && item.status === "valid");
+    const validHumanAcceptance = evidence.some((item) => item.type === "human_acceptance" && item.actor?.kind === "human" && TRANSITION_UUID.test(item.evidenceId ?? "") && TRANSITION_UUID.test(item.record?.evidenceEventId ?? "") && TRANSITION_HASH.test(item.record?.eventHash ?? ""));
+    if (gate?.kind === "acceptance" && !validHumanAcceptance) throw transitionError("ACCEPTANCE_EVIDENCE_REQUIRED", "Transition requires valid human acceptance evidence", { gateId });
+    if (!gate?.requiredEvidenceTypes?.every((type) => evidence.some((item) => item.type === type))) throw transitionError("GATE_UNSATISFIED", `Gate ${gateId} is missing required evidence`, { gateId });
+  }
+  if (transition.authorization?.required) {
+    if (!authorization) throw transitionError("HUMAN_AUTH_REQUIRED", "This transition requires an exact human authorization");
+    const scope = authorization.scope;
+    if (authorization.status === "revoked") throw transitionError("AUTHORIZATION_REVOKED", "Human authorization has been revoked");
+    if (authorization.action !== transition.authorization.action || scope?.workflowId !== context.pin.workflow_id || scope?.revisionId !== context.pin.revision_id || scope?.transitionId !== rule.transition_id || scope?.target?.type !== "task" || scope?.target?.id !== context.task.id) throw transitionError("HUMAN_AUTH_SCOPE_MISMATCH", "Human authorization does not exactly cover this action");
+    if (authorization.expiresAt && Date.parse(occurredAt) > Date.parse(authorization.expiresAt)) throw transitionError("HUMAN_AUTH_REQUIRED", "Human authorization is expired for this action");
+  }
+  if (rule.to_terminal_kind === "completed") {
+    const incomplete = descendants.filter((item) => item.required && item.status !== "done");
+    if (incomplete.length) throw transitionError("REQUIRED_DESCENDANT_INCOMPLETE", "A completed task requires every required descendant to be done", { taskIds: incomplete.map((item) => item.task_id) });
+  }
+}
+
+async function transitionTask(env, taskId, command, actor, { sortOrder, threadId, threadBinding } = {}) {
+  const fingerprint = canonicalJson({ taskId, expectedStateVersion: command.expectedStateVersion, actionKey: command.actionKey, gateEvidence: command.gateEvidence, authorizationId: command.authorizationId, sortOrder: sortOrder ?? null, threadId: threadId ?? null, threadBinding: threadBinding ?? null });
+  const existing = await env.DB.prepare("SELECT * FROM workflow_transition_requests WHERE idempotency_key = ?").bind(command.idempotencyKey).first();
+  if (existing) {
+    if (existing.task_id !== taskId || existing.expected_state_version !== command.expectedStateVersion || existing.action_key !== command.actionKey || existing.request_fingerprint !== fingerprint) throw transitionError("IDEMPOTENCY_CONFLICT", "Idempotency-Key was already used for a different transition request");
+    const event = await env.DB.prepare("SELECT envelope_json FROM workflow_ledger_events WHERE event_id = ?").bind(existing.event_id).first();
+    if (!event) throw transitionError("LEDGER_HASH_INVALID", "Transition request points to a missing ledger event");
+    return { task: await getTask(env, taskId), transition: requestFromRow(existing), event: JSON.parse(event.envelope_json), idempotent: true };
+  }
+  const context = await transitionContext(env, taskId);
+  const rule = await env.DB.prepare("SELECT * FROM workflow_transition_rules WHERE revision_id = ? AND action_key = ?").bind(context.pin.revision_id, command.actionKey).first();
+  let authorization = null;
+  if (command.authorizationId) {
+    const row = await env.DB.prepare("SELECT authorization_json FROM workflow_authorizations WHERE authorization_id = ?").bind(command.authorizationId).first();
+    if (!row) throw transitionError("HUMAN_AUTH_REQUIRED", "Referenced human authorization was not found");
+    try { authorization = JSON.parse(row.authorization_json); } catch { throw transitionError("INVALID_CONTRACT", "Stored human authorization is malformed"); }
+  }
+  const descendants = await all(env.DB.prepare(`WITH RECURSIVE descendants(task_id, required_path) AS (
+    SELECT target_task_id, CASE WHEN json_extract(metadata, '$.required') = 1 THEN 1 ELSE 0 END FROM task_relations WHERE relation_type = 'parent' AND source_task_id = ?
+    UNION ALL SELECT relations.target_task_id, CASE WHEN descendants.required_path = 1 AND json_extract(relations.metadata, '$.required') = 1 THEN 1 ELSE 0 END FROM task_relations AS relations JOIN descendants ON descendants.task_id = relations.source_task_id WHERE relations.relation_type = 'parent'
+  ) SELECT descendants.task_id, descendants.required_path AS required, tasks.status FROM descendants JOIN tasks ON tasks.id = descendants.task_id`).bind(context.task.id));
+  const timestamp = now();
+  assertTransitionPolicy(context, rule, command, authorization, descendants, timestamp);
+  const destination = await env.DB.prepare("SELECT * FROM workflow_revision_stage_bindings WHERE revision_id = ? AND task_stage_id = ?").bind(context.pin.revision_id, rule.to_task_stage_id).first();
+  if (!destination) throw transitionError("ACTION_NOT_FOUND", "Transition destination binding is unavailable");
+  if (sortOrder === undefined) {
+    const placement = await env.DB.prepare("SELECT MIN(sort_order) AS minimum FROM tasks WHERE project_id = ? AND stage_id = ? AND archived_at IS NULL AND id != ?").bind(context.task.project_id, destination.task_stage_id, context.task.id).first();
+    sortOrder = placement?.minimum == null ? 1000 : placement.minimum - 1000;
+  }
+  const storedBinding = storedThreadBindingForExisting(context.task, threadBinding, threadId);
+  const threadAssignment = storedBinding ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?, thread_codex_host_id = ?, thread_workspace_path = ?,` : "";
+  const head = await env.DB.prepare("SELECT * FROM workflow_ledger_head WHERE singleton = 1").first();
+  const sequence = (head?.last_sequence ?? 0) + 1;
+  const event = { schemaVersion: 1, eventId: uuid(), eventType: "transition.requested", occurredAt: timestamp, workflowId: context.pin.workflow_id, revisionId: context.pin.revision_id, aggregateType: "task", aggregateId: context.task.id, correlationId: uuid(), causationId: null, idempotencyKey: command.idempotencyKey, prevHash: head?.last_event_hash ?? null, payload: { transitionId: rule.transition_id, fromStageId: rule.from_contract_stage_id, toStageId: rule.to_contract_stage_id, target: { type: "task", id: context.task.id } } };
+  event.eventHash = await sha256(canonicalJson(event));
+  const requestId = uuid();
+  const state = { lastEventType: event.eventType, payload: event.payload, task: { id: context.task.id, stageId: destination.task_stage_id, status: destination.canonical_status, version: context.task.version + 1 } };
+  const requestInsert = env.DB.prepare(`INSERT INTO workflow_transition_requests (request_id, task_id, idempotency_key, request_fingerprint, expected_state_version, action_key, workflow_id, revision_id, transition_id, from_stage_id, to_stage_id, event_id, event_hash, created_at)
+    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ? AND version = ?)`)
+    .bind(requestId, context.task.id, command.idempotencyKey, fingerprint, command.expectedStateVersion, rule.action_key, context.pin.workflow_id, context.pin.revision_id, rule.transition_id, rule.from_task_stage_id, rule.to_task_stage_id, event.eventId, event.eventHash, timestamp, context.task.id, context.task.version);
+  const eventInsert = env.DB.prepare(`INSERT INTO workflow_ledger_events (sequence,event_id,event_type,workflow_id,revision_id,aggregate_type,aggregate_id,correlation_id,causation_id,idempotency_key,idempotency_fingerprint,prev_hash,event_hash,envelope_json,occurred_at,created_at)
+    SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ? AND version = ?)`)
+    .bind(sequence,event.eventId,event.eventType,event.workflowId,event.revisionId,event.aggregateType,event.aggregateId,event.correlationId,null,event.idempotencyKey,fingerprint,event.prevHash,event.eventHash,JSON.stringify(event),timestamp,timestamp,context.task.id,context.task.version);
+  const statements = [eventInsert, requestInsert,
+    head ? env.DB.prepare("UPDATE workflow_ledger_head SET last_sequence = ?, last_event_hash = ?, updated_at = ? WHERE singleton = 1").bind(sequence, event.eventHash, timestamp) : env.DB.prepare("INSERT INTO workflow_ledger_head (singleton, last_sequence, last_event_hash, updated_at) VALUES (1, ?, ?, ?)").bind(sequence, event.eventHash, timestamp),
+    env.DB.prepare(`UPDATE tasks SET status = ?, stage_id = ?, sort_order = ?, ${threadAssignment} version = version + 1, updated_at = ? WHERE id = ? AND version = ?`).bind(destination.canonical_status, destination.task_stage_id, sortOrder, ...(storedBinding ?? []), timestamp, context.task.id, context.task.version),
+    taskActivityStatement(env, context.task.id, actor, taskFieldChanges(taskFromRow(context.task), { status: destination.canonical_status, stageId: destination.task_stage_id, ...(storedBinding && context.task.thread_id !== storedBinding[0] ? { threadId: storedBinding[0] } : {}) }), timestamp, context.task.version + 1),
+    env.DB.prepare(`INSERT INTO workflow_aggregate_projections (aggregate_type,aggregate_id,workflow_id,revision_id,last_sequence,last_event_id,last_event_type,last_event_hash,state_json,created_at,updated_at) VALUES ('task',?,?,?,?,?,?,?,?,?,?) ON CONFLICT(aggregate_type,aggregate_id) DO UPDATE SET workflow_id=excluded.workflow_id,revision_id=excluded.revision_id,last_sequence=excluded.last_sequence,last_event_id=excluded.last_event_id,last_event_type=excluded.last_event_type,last_event_hash=excluded.last_event_hash,state_json=excluded.state_json,updated_at=excluded.updated_at`).bind(context.task.id,event.workflowId,event.revisionId,sequence,event.eventId,event.eventType,event.eventHash,JSON.stringify(state),timestamp,timestamp),
+    env.DB.prepare(`INSERT INTO workflow_work_item_projections (work_item_id,project_id,status,stage_id,task_version,projection_kind,imported_at,source_updated_at,last_event_sequence,last_event_hash) VALUES (?, ?, ?, ?, ?, 'work_item.imported', ?, ?, ?, ?) ON CONFLICT(work_item_id) DO UPDATE SET status=excluded.status,stage_id=excluded.stage_id,task_version=excluded.task_version,source_updated_at=excluded.source_updated_at,last_event_sequence=excluded.last_event_sequence,last_event_hash=excluded.last_event_hash`).bind(context.task.id,context.task.project_id,destination.canonical_status,destination.task_stage_id,context.task.version + 1,context.task.created_at,timestamp,sequence,event.eventHash),
+    env.DB.prepare("INSERT INTO workflow_outbox (event_id, sequence, topic, payload_json, created_at) VALUES (?, ?, 'workflow.transition.requested', ?, ?)").bind(event.eventId, sequence, JSON.stringify(event), timestamp),
+  ];
+  try { await env.DB.batch(statements); } catch (error) {
+    const raced = await env.DB.prepare("SELECT * FROM workflow_transition_requests WHERE idempotency_key = ?").bind(command.idempotencyKey).first();
+    if (raced && raced.request_fingerprint === fingerprint) return transitionTask(env, taskId, command, actor, { sortOrder, threadId, threadBinding });
+    const latest = await requireTaskRow(env, taskId);
+    if (latest.version !== command.expectedStateVersion) throw transitionError("EXPECTED_STATE_CONFLICT", "Task changed during transition application", { expectedStateVersion: command.expectedStateVersion, actualStateVersion: latest.version });
+    throw error;
+  }
+  const request = await env.DB.prepare("SELECT * FROM workflow_transition_requests WHERE request_id = ?").bind(requestId).first();
+  return { task: await getTask(env, taskId), transition: requestFromRow(request), event, idempotent: false };
+}
+
+function requestFromRow(row) {
+  return { requestId: row.request_id, taskId: row.task_id, idempotencyKey: row.idempotency_key, expectedStateVersion: row.expected_state_version, actionKey: row.action_key, workflowId: row.workflow_id, revisionId: row.revision_id, transitionId: row.transition_id, fromStageId: row.from_stage_id, toStageId: row.to_stage_id, eventId: row.event_id, eventHash: row.event_hash, createdAt: row.created_at };
+}
+
 async function createTask(env, input, actor) {
   const project = await env.DB.prepare(`
     SELECT
@@ -1965,6 +2155,7 @@ async function createTask(env, input, actor) {
   if (!project) {
     throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${input.projectId}' does not exist`);
   }
+  await ensureProjectWorkflow(env, input.projectId);
   const stage = await resolveStageForTask(env, input.projectId, input);
   input.status = stage.status;
   input.stageId = stage.stageId;
@@ -2096,6 +2287,10 @@ async function createTask(env, input, actor) {
     );
   }
   return getTask(env, id);
+}
+
+async function legacyTransitionIdempotencyKey({ taskId, version, status, stageId, sortOrder }) {
+  return `legacy_${(await sha256(canonicalJson({ taskId, version, status, stageId: stageId ?? null, sortOrder: sortOrder ?? null }))).slice(0, 56)}`;
 }
 
 async function updateTask(env, id, input, actor) {
@@ -3674,6 +3869,18 @@ async function routeApi(request, env, actor, url) {
     return json(200, { workspace: await getNestedWorkspace(env, taskId, options) });
   }
 
+  const taskTransitionMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/transitions$/);
+  if (taskTransitionMatch) {
+    requireNoQuery(url, "Transition routes");
+    if (request.method !== "POST") methodNotAllowed(["POST"]);
+    const taskId = decodePathPart(taskTransitionMatch[1], "Task id");
+    const command = parseTransition(
+      await readJson(request),
+      request.headers.get("idempotency-key"),
+    );
+    return json(200, await transitionTask(env, taskId, command, actor));
+  }
+
   const relationMatch = pathname.match(
     /^\/api\/tasks\/([^/]+)\/relations\/([^/]+)\/([^/]+)$/,
   );
@@ -3826,13 +4033,32 @@ async function routeApi(request, env, actor, url) {
       return json(200, { task });
     }
     if (!action && request.method === "PATCH") {
+      const input = parseTaskPatch(await readJson(request));
+      const changesWorkflowState = Object.hasOwn(input.changes, "status") || Object.hasOwn(input.changes, "stageId");
+      // A cross-project PATCH changes the task's owning workflow, so it stays
+      // on the existing project-move path. Same-project state changes are
+      // always recorded through TransitionService below.
+      if (changesWorkflowState && !Object.hasOwn(input.changes, "projectId")) {
+        const otherChanges = Object.keys(input.changes).filter((field) => field !== "status" && field !== "stageId");
+        if (otherChanges.length || input.assigneeTarget !== undefined || input.threadId !== undefined || input.threadBinding !== undefined) {
+          throw new ApiError(409, "TRANSITION_REQUIRED", "Legacy status or stage changes must be sent alone so TransitionService can record one atomic transition");
+        }
+        const current = await requireTaskRow(env, taskId);
+        const target = await resolveStageForTask(env, current.project_id, {
+          status: input.changes.status ?? taskFromRow(current).status,
+          stageId: input.changes.stageId,
+        });
+        if (target.stageId === current.stage_id) throw transitionError("ACTION_NOT_FOUND", "Legacy transition must change the task stage");
+        const idempotencyKey = await legacyTransitionIdempotencyKey({ taskId: current.id, version: input.version, status: target.status, stageId: target.stageId });
+        const context = await transitionContext(env, current.id);
+        const rule = await env.DB.prepare(`SELECT action_key FROM workflow_transition_rules
+          WHERE revision_id = ? AND from_task_stage_id = ? AND to_task_stage_id = ? AND legacy = 1`).bind(context.pin.revision_id, current.stage_id, target.stageId).first();
+        if (!rule) throw transitionError("ACTION_NOT_FOUND", "Legacy transition is not defined by the pinned workflow");
+        const result = await transitionTask(env, current.id, { expectedStateVersion: input.version, actionKey: rule.action_key, gateEvidence: [], authorizationId: null, idempotencyKey }, actor);
+        return json(200, { ...result, legacy: true });
+      }
       return json(200, {
-        task: await updateTask(
-          env,
-          taskId,
-          parseTaskPatch(await readJson(request)),
-          actor,
-        ),
+        task: await updateTask(env, taskId, input, actor),
       });
     }
     if (!action && request.method === "DELETE") {
@@ -3841,9 +4067,17 @@ async function routeApi(request, env, actor, url) {
       return empty(204);
     }
     if (action === "move" && request.method === "POST") {
-      return json(200, {
-        task: await moveTask(env, taskId, parseMove(await readJson(request)), actor),
-      });
+      const input = parseMove(await readJson(request));
+      const current = await requireTaskRow(env, taskId);
+      const target = await resolveStageForTask(env, current.project_id, input);
+      if (target.stageId === current.stage_id) throw transitionError("ACTION_NOT_FOUND", "Legacy transition must change the task stage");
+      const idempotencyKey = await legacyTransitionIdempotencyKey({ taskId: current.id, version: input.version, status: target.status, stageId: target.stageId, sortOrder: input.sortOrder });
+      const context = await transitionContext(env, current.id);
+      const rule = await env.DB.prepare(`SELECT action_key FROM workflow_transition_rules
+        WHERE revision_id = ? AND from_task_stage_id = ? AND to_task_stage_id = ? AND legacy = 1`).bind(context.pin.revision_id, current.stage_id, target.stageId).first();
+      if (!rule) throw transitionError("ACTION_NOT_FOUND", "Legacy transition is not defined by the pinned workflow");
+      const result = await transitionTask(env, current.id, { expectedStateVersion: input.version, actionKey: rule.action_key, gateEvidence: [], authorizationId: null, idempotencyKey }, actor, { sortOrder: input.sortOrder, threadId: input.threadId, threadBinding: input.threadBinding });
+      return json(200, { ...result, legacy: true });
     }
     if (action === "archive" && request.method === "POST") {
       return json(200, {

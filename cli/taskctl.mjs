@@ -90,6 +90,7 @@ const COMMAND_OPTIONS = new Map([
     "if-version",
     "json",
   ])],
+  ["issue transition", new Set(["action-key", "gate-evidence", "authorization-id", "idempotency-key", "if-version", "json"])],
   ["issue archive", new Set(["thread-id", "if-version", "json"])],
   ["issue restore", new Set(["thread-id", "if-version", "json"])],
   ["issue tree", new Set(["direction", "depth", "json"])],
@@ -128,7 +129,7 @@ Commands:
   project readme set [PROJECT_ID] (--content TEXT | --file FILE) [--if-version N]
   cloud login --url URL --actor-name NAME
   cloud status|logout
-  issue list|get|create|update|move|archive|restore|tree|rollup|relation
+  issue list|get|create|update|move|transition|archive|restore|tree|rollup|relation
   comment list ISSUE_ID [--after CURSOR]
   comment add ISSUE_ID (--body TEXT | --body-file FILE) [--thread-id ID]
   comment update COMMENT_ID --body TEXT --if-version N [--thread-id ID]
@@ -174,6 +175,8 @@ Actions:
        --binding-codex-host-id ID --binding-workspace-path PATH]
      | --clear-binding-thread]
     [--if-version N] [--json]
+  transition ISSUE_ID --action-key ACTION --idempotency-key KEY
+    [--gate-evidence JSON] [--authorization-id ID] [--if-version N] [--json]
   archive ISSUE_ID [--thread-id ID] [--if-version N] [--json]
   restore ISSUE_ID [--thread-id ID] [--if-version N] [--json]
   tree ISSUE_ID --direction descendants|ancestors --depth N [--json]
@@ -309,7 +312,7 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, cloud login/status/logout, issue list/get/create/update/move/archive/restore/tree/rollup/relation, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme, cloud login/status/logout, issue list/get/create/update/move/transition/archive/restore/tree/rollup/relation, comment list/add/update/delete, attachment list/download/upload, context current",
     );
   }
   validateOptions(parsed.options, allowedOptions);
@@ -383,6 +386,9 @@ async function execute(parsed, overrides) {
     case "issue move":
       expectOperandCount(parsed, 1);
       return moveIssue(api, parsed.operands[0], parsed.options, overrides);
+    case "issue transition":
+      expectOperandCount(parsed, 1);
+      return transitionIssue(api, parsed.operands[0], parsed.options);
     case "issue archive":
       expectOperandCount(parsed, 1);
       return archiveIssue(api, parsed.operands[0], parsed.options, overrides, "archive");
@@ -492,7 +498,7 @@ function createApiClient(overrides, { baseUrl: explicitBaseUrl } = {}) {
   const baseUrl = normalizeBaseUrl(explicitBaseUrl ?? DEFAULT_API_URL);
 
   return {
-    async request(method, pathname, body) {
+    async request(method, pathname, body, { headers: extraHeaders = {} } = {}) {
       let response;
       try {
         response = await fetchImplementation(resolveApiUrl(baseUrl, pathname), {
@@ -501,6 +507,7 @@ function createApiClient(overrides, { baseUrl: explicitBaseUrl } = {}) {
             accept: "application/json",
             "x-taskboard-client": "taskctl",
             ...(body === undefined ? {} : { "content-type": "application/json" }),
+            ...extraHeaders,
           },
           ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         });
@@ -924,6 +931,24 @@ async function moveIssue(api, taskId, options, overrides) {
     ...optionalField("threadBinding", threadBinding),
     version: await resolveVersion(api, taskId, options["if-version"]),
   });
+}
+
+async function transitionIssue(api, taskId, options) {
+  const actionKey = requiredOption(options, "action-key").trim();
+  const idempotencyKey = requiredOption(options, "idempotency-key").trim();
+  if (!/^[a-z][a-z0-9_-]{0,63}$/.test(actionKey)) throw usageError("--action-key must be a stable identifier");
+  if (!/^[a-z][a-z0-9_-]{0,63}$/.test(idempotencyKey)) throw usageError("--idempotency-key must be a stable identifier");
+  let gateEvidence = [];
+  if (options["gate-evidence"] !== undefined) {
+    try { gateEvidence = JSON.parse(options["gate-evidence"]); } catch { throw usageError("--gate-evidence must be JSON"); }
+    if (!Array.isArray(gateEvidence)) throw usageError("--gate-evidence must be a JSON array");
+  }
+  return api.request("POST", `${taskPath(taskId)}/transitions`, {
+    expectedStateVersion: await resolveVersion(api, taskId, options["if-version"]),
+    actionKey,
+    gateEvidence,
+    ...optionalField("authorizationId", options["authorization-id"]),
+  }, { headers: { "idempotency-key": idempotencyKey } });
 }
 
 function threadBindingFromOptions(options) {

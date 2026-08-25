@@ -45,6 +45,23 @@ test("parseArgs supports equals syntax and boolean --json", () => {
   });
 });
 
+test("issue transition posts the explicit transition contract and idempotency header", async () => {
+  const calls = [];
+  const result = await run(
+    ["issue", "transition", "TASK-1", "--action-key", "legacy_move_5_2", "--idempotency-key", "retry_key_1", "--if-version", "7"],
+    async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return response({ task: { id: "TASK-1" }, idempotent: false });
+    },
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(calls[0].url, "http://127.0.0.1:47823/api/tasks/TASK-1/transitions");
+  assert.equal(calls[0].init.headers["idempotency-key"], "retry_key_1");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    expectedStateVersion: 7, actionKey: "legacy_move_5_2", gateEvidence: [],
+  });
+});
+
 test("project list uses the default local service and adds schemaVersion", async () => {
   const calls = [];
   const result = await run(["project", "list"], async (url, init) => {
