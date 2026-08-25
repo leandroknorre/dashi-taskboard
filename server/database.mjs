@@ -2256,7 +2256,13 @@ export class TaskboardDatabase {
     const workspace = {
       overview: workspaceOverviewFromTask(this.getTask(root.id)),
       breadcrumb,
-      children: paginateWorkspaceItems(directChildren, options, error),
+      children: paginateWorkspaceItems(
+        directChildren,
+        options.childrenCursor,
+        options.limit,
+        "children",
+        error,
+      ),
     };
     if (!options.descendants) return workspace;
 
@@ -2292,7 +2298,13 @@ export class TaskboardDatabase {
       }
       frontier = next;
     }
-    workspace.descendants = paginateWorkspaceItems(descendants, options, error);
+    workspace.descendants = paginateWorkspaceItems(
+      descendants,
+      options.descendantsCursor,
+      options.limit,
+      "descendants",
+      error,
+    );
     return workspace;
   }
 

@@ -1182,13 +1182,17 @@ test("nested workspace is a read-only projection with a deep breadcrumb and page
   const program = await createIssue("Program");
   const area = await createIssue("Area");
   const composite = await createIssue("Composite", "todo");
-  const child = await createIssue("Child", "in_progress");
+  const child = await createIssue("A", "in_progress");
+  const sibling = await createIssue("B", "todo");
   const grandchild = await createIssue("Grandchild", "in_review");
+  const greatGrandchild = await createIssue("Great grandchild", "done");
   for (const [nested, parent] of [
     [area, program],
     [composite, area],
     [child, composite],
+    [sibling, composite],
     [grandchild, child],
+    [greatGrandchild, grandchild],
   ]) {
     assert.equal((await addParent(nested, parent)).response.status, 200);
   }
@@ -1203,24 +1207,37 @@ test("nested workspace is a read-only projection with a deep breadcrumb and page
   assert.equal(direct.body.workspace.overview.status, "todo");
   assert.equal(direct.body.workspace.overview.macroBucket, "ready");
   assert.equal(Object.hasOwn(direct.body.workspace.overview, "relations"), false);
-  assert.deepEqual(direct.body.workspace.children.items.map((item) => [item.id, item.status, item.macroBucket]), [
-    [child.id, "in_progress", "active"],
-  ]);
   assert.equal(Object.hasOwn(direct.body.workspace, "descendants"), false);
   assert.equal(Object.hasOwn(direct.body.workspace, "rollup"), false);
+  const nextChild = await request(
+    baseUrl,
+    `/api/tasks/${composite.id}/workspace?limit=1&childrenCursor=${encodeURIComponent(direct.body.workspace.children.nextCursor)}`,
+  );
+  const directChildIds = [
+    ...direct.body.workspace.children.items.map((item) => item.id),
+    ...nextChild.body.workspace.children.items.map((item) => item.id),
+  ];
+  assert.deepEqual([
+    ...direct.body.workspace.children.items,
+    ...nextChild.body.workspace.children.items,
+  ].map((item) => [item.status, item.macroBucket]).sort(), [
+    ["in_progress", "active"],
+    ["todo", "ready"],
+  ].sort());
+  assert.deepEqual([...directChildIds].sort(), [child.id, sibling.id].sort());
 
-  const descendants = await request(
-    baseUrl,
-    `/api/tasks/${composite.id}/workspace?descendants=true&limit=1`,
-  );
-  assert.deepEqual(descendants.body.workspace.descendants.items.map((item) => item.id), [child.id]);
-  const next = await request(
-    baseUrl,
-    `/api/tasks/${composite.id}/workspace?descendants=true&limit=1&cursor=${encodeURIComponent(descendants.body.workspace.descendants.nextCursor)}`,
-  );
-  assert.deepEqual(next.body.workspace.descendants.items.map((item) => [item.id, item.status, item.macroBucket]), [
-    [grandchild.id, "in_review", "review"],
-  ]);
+  let descendantsCursor = null;
+  const descendantIds = [];
+  do {
+    const query = new URLSearchParams({ descendants: "true", limit: "1" });
+    if (descendantsCursor) query.set("descendantsCursor", descendantsCursor);
+    const page = await request(baseUrl, `/api/tasks/${composite.id}/workspace?${query}`);
+    assert.equal(page.response.status, 200);
+    assert.deepEqual(page.body.workspace.children.items.map((item) => item.id), [directChildIds[0]]);
+    descendantIds.push(...page.body.workspace.descendants.items.map((item) => item.id));
+    descendantsCursor = page.body.workspace.descendants.nextCursor;
+  } while (descendantsCursor);
+  assert.deepEqual(descendantIds, [...directChildIds, grandchild.id, greatGrandchild.id]);
 
   const mutation = await request(baseUrl, `/api/tasks/${composite.id}/workspace`, { method: "POST" });
   assert.equal(mutation.response.status, 405);

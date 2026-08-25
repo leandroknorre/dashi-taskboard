@@ -22,6 +22,8 @@ export function workspaceItemFromRow(row, { parentId = null, depth = 0, path = [
     macroBucket: macroBucketForStatus(row.status),
     priority: row.priority,
     archivedAt: row.archived_at,
+    // Parent-edge metadata stays on the relation API. Including it here would couple this
+    // read model to optional rollups before rollup semantics are part of the contract.
     parentId,
     depth,
     path,
@@ -46,7 +48,7 @@ export function workspaceOverviewFromTask(task) {
 }
 
 export function parseNestedWorkspaceQuery(searchParams, createError) {
-  const allowed = new Set(["descendants", "limit", "cursor"]);
+  const allowed = new Set(["descendants", "limit", "cursor", "childrenCursor", "descendantsCursor"]);
   for (const key of searchParams.keys()) {
     if (!allowed.has(key)) {
       throw createError("UNKNOWN_QUERY_PARAMETER", `Unknown query parameter '${key}'`);
@@ -72,17 +74,49 @@ export function parseNestedWorkspaceQuery(searchParams, createError) {
       `'limit' must be an integer from 1 to ${NESTED_WORKSPACE_MAX_LIMIT}`,
     );
   }
-  const cursor = searchParams.get("cursor");
-  if (cursor !== null && (!cursor.startsWith("workspace:") || cursor.length <= "workspace:".length)) {
-    throw createError("INVALID_NESTED_WORKSPACE_CURSOR", "'cursor' is invalid");
+  const parseCursor = (value, kind, name) => {
+    if (value === null) return null;
+    const prefix = `workspace:${kind}:`;
+    if (!value.startsWith(prefix) || value.length <= prefix.length) {
+      throw createError(
+        "INVALID_NESTED_WORKSPACE_CURSOR",
+        `'${name}' must be a ${kind} workspace cursor`,
+      );
+    }
+    return value;
+  };
+  let childrenCursor = parseCursor(searchParams.get("childrenCursor"), "children", "childrenCursor");
+  let descendantsCursor = parseCursor(
+    searchParams.get("descendantsCursor"),
+    "descendants",
+    "descendantsCursor",
+  );
+  const legacyCursor = searchParams.get("cursor");
+  if (legacyCursor !== null) {
+    const match = /^workspace:(children|descendants):.+$/.exec(legacyCursor);
+    if (!match) {
+      throw createError(
+        "INVALID_NESTED_WORKSPACE_CURSOR",
+        "'cursor' is ambiguous; use 'childrenCursor' or 'descendantsCursor'",
+      );
+    }
+    if (match[1] === "children" && childrenCursor === null) childrenCursor = legacyCursor;
+    else if (match[1] === "descendants" && descendantsCursor === null) descendantsCursor = legacyCursor;
+    else throw createError("INVALID_NESTED_WORKSPACE_CURSOR", "Workspace cursor is repeated");
   }
-  return { descendants: descendants === "true", limit, cursor };
+  if (!descendants && descendantsCursor !== null) {
+    throw createError(
+      "INVALID_NESTED_WORKSPACE_CURSOR",
+      "'descendantsCursor' requires 'descendants=true'",
+    );
+  }
+  return { descendants: descendants === "true", limit, childrenCursor, descendantsCursor };
 }
 
-export function paginateWorkspaceItems(items, { cursor, limit }, createError) {
+export function paginateWorkspaceItems(items, cursor, limit, kind, createError) {
   let start = 0;
   if (cursor) {
-    const lastId = cursor.slice("workspace:".length);
+    const lastId = cursor.slice(`workspace:${kind}:`.length);
     const index = items.findIndex((item) => item.id === lastId);
     if (index === -1) {
       throw createError("INVALID_NESTED_WORKSPACE_CURSOR", "'cursor' does not belong to this workspace");
@@ -93,7 +127,7 @@ export function paginateWorkspaceItems(items, { cursor, limit }, createError) {
   return {
     items: page,
     nextCursor: start + page.length < items.length && page.length > 0
-      ? `workspace:${page.at(-1).id}`
+      ? `workspace:${kind}:${page.at(-1).id}`
       : null,
   };
 }

@@ -1326,7 +1326,13 @@ async function getNestedWorkspace(env, id, options) {
   const workspace = {
     overview: workspaceOverviewFromTask(await getTask(env, root.id)),
     breadcrumb,
-    children: paginateWorkspaceItems(directChildren, options, error),
+    children: paginateWorkspaceItems(
+      directChildren,
+      options.childrenCursor,
+      options.limit,
+      "children",
+      error,
+    ),
   };
   if (!options.descendants) return workspace;
 
@@ -1362,7 +1368,13 @@ async function getNestedWorkspace(env, id, options) {
     }
     frontier = next;
   }
-  workspace.descendants = paginateWorkspaceItems(descendants, options, error);
+  workspace.descendants = paginateWorkspaceItems(
+    descendants,
+    options.descendantsCursor,
+    options.limit,
+    "descendants",
+    error,
+  );
   return workspace;
 }
 

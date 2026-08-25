@@ -1191,8 +1191,10 @@ test("nested workspace keeps the local read-model contract in cloud", async () =
   const program = await createTask(projectId, "Program");
   const area = await createTask(projectId, "Area");
   const composite = await createTask(projectId, "Composite", alice, { status: "todo" });
-  const child = await createTask(projectId, "Child", alice, { status: "in_progress" });
+  const child = await createTask(projectId, "A", alice, { status: "in_progress" });
+  const sibling = await createTask(projectId, "B", alice, { status: "todo" });
   const grandchild = await createTask(projectId, "Grandchild", alice, { status: "in_review" });
+  const greatGrandchild = await createTask(projectId, "Great grandchild", alice, { status: "done" });
   const addParent = async (nested, parent) => cloud.request(
     `/api/tasks/${nested.id}/relations/parent/${parent.id}`,
     { method: "POST", actorName: alice, json: { version: nested.version } },
@@ -1201,7 +1203,9 @@ test("nested workspace keeps the local read-model contract in cloud", async () =
     [area.body.task, program.body.task],
     [composite.body.task, area.body.task],
     [child.body.task, composite.body.task],
+    [sibling.body.task, composite.body.task],
     [grandchild.body.task, child.body.task],
+    [greatGrandchild.body.task, grandchild.body.task],
   ]) {
     assert.equal((await addParent(nested, parent)).response.status, 200);
   }
@@ -1219,23 +1223,43 @@ test("nested workspace keeps the local read-model contract in cloud", async () =
   assert.equal(direct.body.workspace.overview.status, "todo");
   assert.equal(direct.body.workspace.overview.macroBucket, "ready");
   assert.equal(Object.hasOwn(direct.body.workspace.overview, "relations"), false);
-  assert.deepEqual(direct.body.workspace.children.items.map((item) => [item.id, item.status, item.macroBucket]), [
-    [child.body.task.id, "in_progress", "active"],
-  ]);
   assert.equal(Object.hasOwn(direct.body.workspace, "descendants"), false);
   assert.equal(Object.hasOwn(direct.body.workspace, "rollup"), false);
+  const nextChild = await cloud.request(
+    `/api/tasks/${composite.body.task.id}/workspace?limit=1&childrenCursor=${encodeURIComponent(direct.body.workspace.children.nextCursor)}`,
+    { actorName: alice },
+  );
+  const directChildIds = [
+    ...direct.body.workspace.children.items.map((item) => item.id),
+    ...nextChild.body.workspace.children.items.map((item) => item.id),
+  ];
+  assert.deepEqual([
+    ...direct.body.workspace.children.items,
+    ...nextChild.body.workspace.children.items,
+  ].map((item) => [item.status, item.macroBucket]).sort(), [
+    ["in_progress", "active"],
+    ["todo", "ready"],
+  ].sort());
+  assert.deepEqual([...directChildIds].sort(), [child.body.task.id, sibling.body.task.id].sort());
 
-  const descendants = await cloud.request(
-    `/api/tasks/${composite.body.task.id}/workspace?descendants=true&limit=1`,
-    { actorName: alice },
-  );
-  assert.deepEqual(descendants.body.workspace.descendants.items.map((item) => item.id), [child.body.task.id]);
-  const next = await cloud.request(
-    `/api/tasks/${composite.body.task.id}/workspace?descendants=true&limit=1&cursor=${encodeURIComponent(descendants.body.workspace.descendants.nextCursor)}`,
-    { actorName: alice },
-  );
-  assert.deepEqual(next.body.workspace.descendants.items.map((item) => [item.id, item.status, item.macroBucket]), [
-    [grandchild.body.task.id, "in_review", "review"],
+  let descendantsCursor = null;
+  const descendantIds = [];
+  do {
+    const query = new URLSearchParams({ descendants: "true", limit: "1" });
+    if (descendantsCursor) query.set("descendantsCursor", descendantsCursor);
+    const page = await cloud.request(
+      `/api/tasks/${composite.body.task.id}/workspace?${query}`,
+      { actorName: alice },
+    );
+    assert.equal(page.response.status, 200);
+    assert.deepEqual(page.body.workspace.children.items.map((item) => item.id), [directChildIds[0]]);
+    descendantIds.push(...page.body.workspace.descendants.items.map((item) => item.id));
+    descendantsCursor = page.body.workspace.descendants.nextCursor;
+  } while (descendantsCursor);
+  assert.deepEqual(descendantIds, [
+    ...directChildIds,
+    grandchild.body.task.id,
+    greatGrandchild.body.task.id,
   ]);
 
   const mutation = await cloud.request(`/api/tasks/${composite.body.task.id}/workspace`, {
