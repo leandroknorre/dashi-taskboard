@@ -78,6 +78,34 @@ async function openEventStream(baseUrl, headers) {
   });
 }
 
+function completeWithin(promise, timeoutMs, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} did not complete within ${timeoutMs}ms`)), timeoutMs);
+      timer.unref();
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+async function openPersistentEventStream(baseUrl) {
+  const target = new URL("/api/events", baseUrl);
+  return new Promise((resolve, reject) => {
+    const outgoing = httpRequest(target, (response) => {
+      const closed = new Promise((streamResolve, streamReject) => {
+        response.once("end", streamResolve);
+        response.once("close", streamResolve);
+        response.once("error", streamReject);
+      });
+      response.resume();
+      resolve({ response, closed });
+    });
+    outgoing.once("error", reject);
+    outgoing.end();
+  });
+}
+
 async function openWebSocket(url, headers) {
   return new Promise((resolve, reject) => {
     const client = new WebSocket(url, { headers });
@@ -118,6 +146,33 @@ test("health and the default local project are available", async () => {
   assert.equal(result.body.projects[0].name, "全局");
   assert.equal(result.body.projects[0].workspacePath, null);
   assert.equal(result.body.projects[0].issueCount, 0);
+});
+
+test("close is concurrent-safe and terminates persistent SSE connections", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-close-test-"));
+  const app = createTaskboardServer({ dataDirectory: directory });
+  const address = await app.listen({ host: "127.0.0.1", port: 0 });
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  runningApps.push({ app, directory });
+
+  const stream = await openPersistentEventStream(baseUrl);
+  assert.equal(stream.response.statusCode, 200);
+
+  const firstClose = app.close();
+  const secondClose = app.close();
+  assert.strictEqual(firstClose, secondClose);
+  await completeWithin(Promise.all([firstClose, secondClose]), 1_000, "concurrent app.close()");
+  await completeWithin(stream.closed, 1_000, "SSE stream shutdown");
+
+  await assert.rejects(new Promise((resolve, reject) => {
+    const request = httpRequest(new URL(baseUrl), { agent: false }, (response) => {
+      response.resume();
+      resolve();
+    });
+    request.once("error", reject);
+    request.end();
+  }), { code: "ECONNREFUSED" });
+  assert.throws(() => app.database.database.prepare("SELECT 1").get());
 });
 
 test("launcher mode proves service identity and hides every route behind its instance token", async () => {

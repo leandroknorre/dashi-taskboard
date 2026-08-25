@@ -3701,6 +3701,58 @@ export function createTaskboardServer(options = {}) {
   });
 
   let listening = false;
+  let closePromise = null;
+
+  function closeHttpServer() {
+    if (!listening) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+      // server.close() deliberately waits for active requests.  That is the
+      // right default for ordinary shutdown, but a taskboard process must be
+      // able to stop while a browser holds an SSE or keep-alive connection.
+      // These APIs are available on every supported Node runtime; guard them
+      // so the server remains embeddable on older runtimes as well.
+      server.closeIdleConnections?.();
+      server.closeAllConnections?.();
+    });
+  }
+
+  async function closeOnce() {
+    // Stop realtime producers before closing HTTP connections.  In
+    // particular, EventHub and the AI stream both own timers and responses
+    // that otherwise keep server.close() pending indefinitely.
+    for (const { localSocket, remoteSocket } of cloudRealtimeSockets) {
+      localSocket.terminate();
+      remoteSocket.terminate();
+    }
+    cloudRealtimeSockets.clear();
+    cloudRealtimeServer.close();
+    events.close();
+    for (const response of aiEventResponses) response.end();
+    aiEventResponses.clear();
+
+    // Start the listener shutdown before awaiting the longer-lived services,
+    // then force any remaining keep-alive sockets closed.
+    const serverClosed = closeHttpServer();
+    let firstError = null;
+    const closeStep = async (operation) => {
+      try {
+        await operation();
+      } catch (error) {
+        firstError ??= error;
+      }
+    };
+    try {
+      await closeStep(() => aiChat.close());
+      await closeStep(() => projectSummary.close());
+      await closeStep(() => serverClosed);
+    } finally {
+      listening = false;
+    }
+    await closeStep(() => database.close());
+    if (firstError) throw firstError;
+  }
+
   return {
     database,
     aiChat,
@@ -3730,26 +3782,9 @@ export function createTaskboardServer(options = {}) {
       listening = true;
       return server.address();
     },
-    async close() {
-      for (const { localSocket, remoteSocket } of cloudRealtimeSockets) {
-        localSocket.terminate();
-        remoteSocket.terminate();
-      }
-      cloudRealtimeSockets.clear();
-      cloudRealtimeServer.close();
-      const serverClosed = listening
-        ? new Promise((resolve, reject) => {
-            server.close((error) => error ? reject(error) : resolve());
-          })
-        : Promise.resolve();
-      events.close();
-      for (const response of aiEventResponses) response.end();
-      aiEventResponses.clear();
-      await aiChat.close();
-      await projectSummary.close();
-      await serverClosed;
-      listening = false;
-      database.close();
+    close() {
+      if (!closePromise) closePromise = closeOnce();
+      return closePromise;
     },
   };
 }
