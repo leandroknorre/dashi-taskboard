@@ -72,11 +72,14 @@ function renderWorkspace(view: "overview" | "board" | "list" | "tree" = "overvie
 
 describe("NestedWorkspaceView", () => {
   it("shows the manual purpose, rollup provenance and freshness in overview", () => {
-    renderWorkspace();
+    const { onOpenTask, onOpenWorkspace } = renderWorkspace();
     expect(screen.getByText("Ship the public workspace.")).toBeTruthy();
     expect(screen.getByText("0/2")).toBeTruthy();
     expect(screen.getByText(/Derived from/)).toBeTruthy();
     expect(screen.getByText(/Fresh at read time/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Open workspace Release workspace" }));
+    expect(onOpenWorkspace).toHaveBeenCalledWith("TASK-1");
+    expect(onOpenTask).not.toHaveBeenCalled();
   });
 
   it("groups board cards by macro bucket while displaying the actual stage", () => {
@@ -97,5 +100,8 @@ describe("NestedWorkspaceView", () => {
     expect(onDescendantsChange).toHaveBeenCalledWith(true);
     fireEvent.click(screen.getByText("Program"));
     expect(onOpenWorkspace).toHaveBeenCalledWith("TASK-0");
+    expect(screen.getByRole("tablist", { name: "Workspace views" })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "List" }).getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByRole("tabpanel").getAttribute("aria-labelledby")).toBe("nested-workspace-tab-list");
   });
 });

@@ -148,15 +148,29 @@ export function NestedWorkspaceView({
         ))}
       </nav>
 
-      <button className="nested-workspace-super-card" type="button" onClick={() => onOpenTask(root)}>
+      <button
+        className="nested-workspace-super-card"
+        type="button"
+        aria-label={text(`打开工作区 ${root.title}`, `Open workspace ${root.title}`)}
+        onClick={() => onOpenWorkspace(root.identifier)}
+      >
         <span><small>{root.identifier}</small><strong>{root.title}</strong></span>
         <StatusChip item={root} />
       </button>
 
       <div className="nested-workspace-toolbar">
-        <div className="view-tabs" aria-label={text("工作区视图", "Workspace views")}>
+        <div className="view-tabs" role="tablist" aria-label={text("工作区视图", "Workspace views")}>
           {(["overview", "board", "list", "tree"] as const).map((candidate) => (
-            <button className={`view-tab${view === candidate ? " active" : ""}`} type="button" key={candidate} onClick={() => onViewChange(candidate)}>
+            <button
+              className={`view-tab${view === candidate ? " active" : ""}`}
+              type="button"
+              role="tab"
+              aria-selected={view === candidate}
+              aria-controls={`nested-workspace-panel-${candidate}`}
+              id={`nested-workspace-tab-${candidate}`}
+              key={candidate}
+              onClick={() => onViewChange(candidate)}
+            >
               {candidate[0].toUpperCase() + candidate.slice(1)}
             </button>
           ))}
@@ -169,11 +183,17 @@ export function NestedWorkspaceView({
         )}
       </div>
 
-      {view === "overview" ? <WorkspaceOverview workspace={workspace} rollup={rollup} />
-        : items.length === 0 ? <p className="nested-workspace-empty">{text("没有可显示的子项。", "No child items to show.")}</p>
-        : view === "board" ? <WorkspaceBoard items={items} onOpenTask={onOpenTask} />
-        : view === "list" ? <WorkspaceList items={items} onOpenTask={onOpenTask} />
-        : <WorkspaceTree items={items} onOpenTask={onOpenTask} />}
+      <div
+        id={`nested-workspace-panel-${view}`}
+        role="tabpanel"
+        aria-labelledby={`nested-workspace-tab-${view}`}
+      >
+        {view === "overview" ? <WorkspaceOverview workspace={workspace} rollup={rollup} />
+          : items.length === 0 ? <p className="nested-workspace-empty">{text("没有可显示的子项。", "No child items to show.")}</p>
+          : view === "board" ? <WorkspaceBoard items={items} onOpenTask={onOpenTask} />
+          : view === "list" ? <WorkspaceList items={items} onOpenTask={onOpenTask} />
+          : <WorkspaceTree items={items} onOpenTask={onOpenTask} />}
+      </div>
 
       {view !== "overview" && page.nextCursor && (
         <button className="button secondary nested-workspace-load-more" type="button" disabled={loadingMore} onClick={onLoadMore}>

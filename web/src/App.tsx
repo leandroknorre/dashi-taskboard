@@ -66,6 +66,7 @@ import { DashboardView } from "./components/DashboardView";
 import { ProjectReadmeView } from "./components/ProjectReadmeView";
 import { IssueListView } from "./components/IssueListView";
 import { NestedWorkspaceView } from "./components/NestedWorkspaceView";
+import type { GanttViewport } from "./components/GanttView";
 import { JiraConnectionDialog } from "./components/JiraConnectionDialog";
 import { ArchivedTasksColumn, OtherTasksPanel } from "./components/OtherTasksPanel";
 import {
@@ -159,6 +160,18 @@ type BoardView = "readme" | "dashboard" | "issues" | "list" | "gantt";
 type DetailSourceScroll =
   | { projectId: string; view: "issues"; stageId: string; scrollTop: number }
   | { projectId: string; view: "list"; scrollTop: number };
+type WorkspaceOriginScroll =
+  | { projectId: string; view: "issues"; columns: Partial<Record<string, number>> }
+  | { projectId: string; view: "list"; scrollTop: number }
+  | { projectId: string; view: "gantt"; x: number; y: number };
+type NestedWorkspaceLoad = {
+  key: string;
+  workspace: NestedWorkspace | null;
+  rollup: TaskRollup | null;
+  loading: boolean;
+  loadingMore: boolean;
+  error: string | null;
+};
 type GanttZoom = "day" | "week" | "month";
 type ActionError = string | readonly [string, string];
 type ProjectLoadError = {
@@ -174,6 +187,19 @@ type TasksLoadError = {
 };
 type LoadError = ProjectLoadError | TasksLoadError;
 const GANTT_ZOOM_OPTIONS: GanttZoom[] = ["day", "week", "month"];
+
+function nestedWorkspaceLoadKey(identifier: string | null, descendants: boolean) {
+  return identifier ? `${identifier}|${descendants ? "descendants" : "children"}` : "";
+}
+
+const EMPTY_NESTED_WORKSPACE_LOAD: NestedWorkspaceLoad = {
+  key: "",
+  workspace: null,
+  rollup: null,
+  loading: false,
+  loadingMore: false,
+  error: null,
+};
 
 const AiChat = lazy(() => import("./components/AiChat").then((module) => ({
   default: module.AiChat,
@@ -736,11 +762,9 @@ export function App() {
     () => readWorkspaceView(window.location.search),
   );
   const [workspaceDescendants, setWorkspaceDescendants] = useState(false);
-  const [nestedWorkspace, setNestedWorkspace] = useState<NestedWorkspace | null>(null);
-  const [workspaceRollup, setWorkspaceRollup] = useState<TaskRollup | null>(null);
-  const [workspaceLoading, setWorkspaceLoading] = useState(false);
-  const [workspaceLoadingMore, setWorkspaceLoadingMore] = useState(false);
-  const [workspaceError, setWorkspaceError] = useState<string | null>(null);
+  const [nestedWorkspaceLoad, setNestedWorkspaceLoad] = useState<NestedWorkspaceLoad>(
+    EMPTY_NESTED_WORKSPACE_LOAD,
+  );
   const [tasks, setTasks] = useState<Task[]>([]);
   const [archivedTasks, setArchivedTasks] = useState<Task[]>([]);
   const [tasksLoading, setTasksLoading] = useState(false);
@@ -831,8 +855,13 @@ export function App() {
   const dragRegionRef = useRef<HTMLDivElement>(null);
   const issueListRef = useRef<HTMLDivElement>(null);
   const boardColumnScrollRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const ganttViewportRef = useRef<GanttViewport | null>(null);
+  const [ganttViewportVersion, setGanttViewportVersion] = useState(0);
   const detailSourceProjectIdRef = useRef<string | null>(null);
   const pendingDetailSourceScrollRef = useRef<DetailSourceScroll | null>(null);
+  const pendingWorkspaceOriginScrollRef = useRef<WorkspaceOriginScroll | null>(null);
+  const nestedWorkspaceRequestRef = useRef(0);
+  const nestedWorkspacePageRequestRef = useRef(0);
   const taskScopeProjectId = detailSourceProjectIdRef.current ?? selectedProjectId;
   const taskScopeProjectIdRef = useRef(taskScopeProjectId);
   taskScopeProjectIdRef.current = taskScopeProjectId;
@@ -1579,9 +1608,19 @@ export function App() {
       const routeProjectId = url.searchParams.get("project") ?? GLOBAL_PROJECT_ID;
       const routeIssueIdentifier = readIssueIdentifier(url.search);
       const routeWorkspaceIdentifier = readWorkspaceIdentifier(url.search);
+      if (!workspaceIdentifier && routeWorkspaceIdentifier) {
+        saveWorkspaceOriginScroll(captureWorkspaceOriginScroll());
+      }
+      if (workspaceIdentifier && !routeWorkspaceIdentifier) {
+        const state = window.history.state;
+        const source = state && typeof state === "object"
+          ? (state as { nestedWorkspaceSourceScroll?: WorkspaceOriginScroll }).nestedWorkspaceSourceScroll
+          : null;
+        if (source) pendingWorkspaceOriginScrollRef.current = source;
+      }
       setWorkspaceIdentifier(routeWorkspaceIdentifier);
       setWorkspaceView(readWorkspaceView(url.search));
-      if (!routeWorkspaceIdentifier) setWorkspaceDescendants(false);
+      if (routeWorkspaceIdentifier !== workspaceIdentifier) setWorkspaceDescendants(false);
       if (routeIssueIdentifier && boardView === "list" && issueListRef.current) {
         pendingDetailSourceScrollRef.current = {
           projectId: selectedProjectId,
@@ -1613,7 +1652,7 @@ export function App() {
 
     window.addEventListener("popstate", syncRouteFromLocation);
     return () => window.removeEventListener("popstate", syncRouteFromLocation);
-  }, [boardView, selectedProjectId]);
+  }, [boardView, selectedProjectId, workspaceIdentifier]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -1636,30 +1675,117 @@ export function App() {
     }
   }, [selectedProjectId]);
 
+  const nestedWorkspaceCurrentKey = nestedWorkspaceLoadKey(
+    workspaceIdentifier,
+    workspaceDescendants,
+  );
+  const activeNestedWorkspaceLoad = nestedWorkspaceLoad.key === nestedWorkspaceCurrentKey
+    ? nestedWorkspaceLoad
+    : {
+        ...EMPTY_NESTED_WORKSPACE_LOAD,
+        key: nestedWorkspaceCurrentKey,
+        loading: Boolean(workspaceIdentifier),
+      };
+
   useEffect(() => {
+    const requestId = ++nestedWorkspaceRequestRef.current;
+    const requestKey = nestedWorkspaceLoadKey(workspaceIdentifier, workspaceDescendants);
+    nestedWorkspacePageRequestRef.current += 1;
     if (!workspaceIdentifier) {
-      setNestedWorkspace(null);
-      setWorkspaceRollup(null);
-      setWorkspaceError(null);
+      setNestedWorkspaceLoad(EMPTY_NESTED_WORKSPACE_LOAD);
       return;
     }
+
     const controller = new AbortController();
-    setWorkspaceLoading(true);
-    setWorkspaceError(null);
+    // Replacing the entire record is deliberate: a prior workspace may never flash while
+    // a new route is loading or has failed.
+    setNestedWorkspaceLoad({
+      key: requestKey,
+      workspace: null,
+      rollup: null,
+      loading: true,
+      loadingMore: false,
+      error: null,
+    });
+    const rollup = getTaskRollup(workspaceIdentifier, controller.signal)
+      // Nested workspaces remain readable while the separately shipped rollup endpoint is
+      // unavailable. The view never fabricates a derived value.
+      .catch((error) => {
+        if (error instanceof ApiError && error.status === 404) return null;
+        throw error;
+      });
     void Promise.all([
       getNestedWorkspace(workspaceIdentifier, { descendants: workspaceDescendants }, controller.signal),
-      getTaskRollup(workspaceIdentifier, controller.signal),
-    ]).then(([workspace, rollup]) => {
-      if (controller.signal.aborted) return;
-      setNestedWorkspace(workspace);
-      setWorkspaceRollup(rollup);
+      rollup,
+    ]).then(([workspace, nextRollup]) => {
+      if (controller.signal.aborted || requestId !== nestedWorkspaceRequestRef.current) return;
+      setNestedWorkspaceLoad({
+        key: requestKey,
+        workspace,
+        rollup: nextRollup,
+        loading: false,
+        loadingMore: false,
+        error: null,
+      });
     }).catch((error) => {
-      if (!controller.signal.aborted) setWorkspaceError(errorMessage(error));
-    }).finally(() => {
-      if (!controller.signal.aborted) setWorkspaceLoading(false);
+      if (controller.signal.aborted || requestId !== nestedWorkspaceRequestRef.current) return;
+      setNestedWorkspaceLoad({
+        key: requestKey,
+        workspace: null,
+        rollup: null,
+        loading: false,
+        loadingMore: false,
+        error: errorMessage(error),
+      });
     });
     return () => controller.abort();
   }, [workspaceDescendants, workspaceIdentifier]);
+
+  useLayoutEffect(() => {
+    if (workspaceIdentifier) return;
+    const source = pendingWorkspaceOriginScrollRef.current;
+    if (!source) return;
+    if (source.projectId !== selectedProjectId) {
+      setSelectedProjectId(source.projectId);
+      return;
+    }
+    if (source.view !== boardView) {
+      setBoardView(source.view);
+      return;
+    }
+    if (source.view === "list") {
+      if (!issueListRef.current) return;
+      issueListRef.current.scrollTop = source.scrollTop;
+      pendingWorkspaceOriginScrollRef.current = null;
+      return;
+    }
+    if (source.view === "issues") {
+      const entries = Object.entries(source.columns) as Array<[string, number]>;
+      if (entries.some(([stageId]) => !boardColumnScrollRefs.current[stageId])) return;
+      for (const [stageId, scrollTop] of entries) {
+        const column = boardColumnScrollRefs.current[stageId];
+        if (column) column.scrollTop = scrollTop;
+      }
+      pendingWorkspaceOriginScrollRef.current = null;
+    }
+    // Gantt restores after DHTMLX has parsed its virtual rows; see restoreViewport below.
+  }, [boardView, ganttViewportVersion, selectedProjectId, tasksLoading, workspaceIdentifier]);
+
+  const workspaceGanttRestore = !workspaceIdentifier
+    && pendingWorkspaceOriginScrollRef.current?.view === "gantt"
+    && pendingWorkspaceOriginScrollRef.current.projectId === selectedProjectId
+    && boardView === "gantt"
+    ? {
+        x: pendingWorkspaceOriginScrollRef.current.x,
+        y: pendingWorkspaceOriginScrollRef.current.y,
+      }
+    : null;
+  const acknowledgeWorkspaceGanttRestore = useCallback(() => {
+    if (pendingWorkspaceOriginScrollRef.current?.view === "gantt") {
+      pendingWorkspaceOriginScrollRef.current = null;
+      setGanttViewportVersion((current) => current + 1);
+    }
+  }, []);
 
   useEffect(() => {
     if (!selectedProjectId) {
@@ -2346,6 +2472,39 @@ export function App() {
     }
   }
 
+  function captureWorkspaceOriginScroll(): WorkspaceOriginScroll | null {
+    if (boardView === "issues") {
+      const columns = Object.fromEntries(
+        Object.entries(boardColumnScrollRefs.current).flatMap(([stageId, element]) => (
+          element ? [[stageId, element.scrollTop] as const] : []
+        )),
+      ) as Partial<Record<string, number>>;
+      return { projectId: selectedProjectId, view: "issues", columns };
+    }
+    if (boardView === "list" && issueListRef.current) {
+      return { projectId: selectedProjectId, view: "list", scrollTop: issueListRef.current.scrollTop };
+    }
+    if (boardView === "gantt") {
+      const viewport = ganttViewportRef.current?.getScrollState();
+      if (viewport) return { projectId: selectedProjectId, view: "gantt", ...viewport };
+    }
+    return null;
+  }
+
+  function saveWorkspaceOriginScroll(source: WorkspaceOriginScroll | null) {
+    if (!source) return;
+    pendingWorkspaceOriginScrollRef.current = source;
+    const state = window.history.state && typeof window.history.state === "object"
+      ? window.history.state
+      : {};
+    window.history.replaceState({ ...state, nestedWorkspaceSourceScroll: source }, "", window.location.href);
+  }
+
+  const setGanttViewport = useCallback((viewport: GanttViewport | null) => {
+    ganttViewportRef.current = viewport;
+    if (viewport) setGanttViewportVersion((current) => current + 1);
+  }, []);
+
   function selectWorkspaceView(view: WorkspaceView) {
     if (!workspaceIdentifier) return;
     setWorkspaceView(view);
@@ -2354,6 +2513,11 @@ export function App() {
   }
 
   function openNestedWorkspace(identifier: string) {
+    if (identifier === workspaceIdentifier) {
+      selectWorkspaceView("overview");
+      return;
+    }
+    if (!workspaceIdentifier) saveWorkspaceOriginScroll(captureWorkspaceOriginScroll());
     setWorkspaceDescendants(false);
     setWorkspaceIdentifier(identifier);
     setWorkspaceView("overview");
@@ -2362,36 +2526,58 @@ export function App() {
   }
 
   function loadMoreNestedWorkspace() {
-    if (!workspaceIdentifier || !nestedWorkspace) return;
-    const page = workspaceDescendants ? nestedWorkspace.descendants : nestedWorkspace.children;
+    const requestKey = nestedWorkspaceCurrentKey;
+    const current = activeNestedWorkspaceLoad;
+    if (!workspaceIdentifier || !current.workspace) return;
+    const page = workspaceDescendants ? current.workspace.descendants : current.workspace.children;
     if (!page?.nextCursor) return;
-    setWorkspaceLoadingMore(true);
+    const requestId = ++nestedWorkspacePageRequestRef.current;
+    setNestedWorkspaceLoad((previous) => previous.key === requestKey
+      ? { ...previous, loadingMore: true, error: null }
+      : previous);
     void getNestedWorkspace(workspaceIdentifier, {
       descendants: workspaceDescendants,
-      cursor: page.nextCursor,
+      ...(workspaceDescendants
+        ? { descendantsCursor: page.nextCursor }
+        : { childrenCursor: page.nextCursor }),
     }).then((next) => {
-      setNestedWorkspace((current) => {
-        if (!current) return current;
+      if (requestId !== nestedWorkspacePageRequestRef.current) return;
+      setNestedWorkspaceLoad((previous) => {
+        if (previous.key !== requestKey || !previous.workspace) return previous;
         if (workspaceDescendants) {
-          if (!current.descendants || !next.descendants) return current;
+          if (!previous.workspace.descendants || !next.descendants) return previous;
           return {
-            ...current,
-            descendants: {
-              items: [...current.descendants.items, ...next.descendants.items],
-              nextCursor: next.descendants.nextCursor,
+            ...previous,
+            workspace: {
+              ...previous.workspace,
+              descendants: {
+                items: [...previous.workspace.descendants.items, ...next.descendants.items],
+                nextCursor: next.descendants.nextCursor,
+              },
             },
+            loadingMore: false,
+            error: null,
           };
         }
         return {
-          ...current,
-          children: {
-            items: [...current.children.items, ...next.children.items],
-            nextCursor: next.children.nextCursor,
+          ...previous,
+          workspace: {
+            ...previous.workspace,
+            children: {
+              items: [...previous.workspace.children.items, ...next.children.items],
+              nextCursor: next.children.nextCursor,
+            },
           },
+          loadingMore: false,
+          error: null,
         };
       });
-    }).catch((error) => setWorkspaceError(errorMessage(error)))
-      .finally(() => setWorkspaceLoadingMore(false));
+    }).catch((error) => {
+      if (requestId !== nestedWorkspacePageRequestRef.current) return;
+      setNestedWorkspaceLoad((previous) => previous.key === requestKey
+        ? { ...previous, loadingMore: false, error: errorMessage(error) }
+        : previous);
+    });
   }
 
   function updateProjectBoardDisplaySettings(value: BoardDisplaySettings) {
@@ -3724,20 +3910,20 @@ export function App() {
             onError={setActionError}
           />
         ) : workspaceIdentifier ? (
-          workspaceLoading && !nestedWorkspace ? (
+          activeNestedWorkspaceLoad.loading && !activeNestedWorkspaceLoad.workspace ? (
             <div className="board-view-loading">{text("正在打开嵌套工作区…", "Opening nested workspace…")}</div>
-          ) : workspaceError && !nestedWorkspace ? (
+          ) : activeNestedWorkspaceLoad.error && !activeNestedWorkspaceLoad.workspace ? (
             <div className="page-empty">
               <h2>{text("无法打开嵌套工作区", "Could not open nested workspace")}</h2>
-              <p>{workspaceError}</p>
+              <p>{activeNestedWorkspaceLoad.error}</p>
             </div>
-          ) : nestedWorkspace ? (
+          ) : activeNestedWorkspaceLoad.workspace ? (
             <NestedWorkspaceView
-              workspace={nestedWorkspace}
-              rollup={workspaceRollup}
+              workspace={activeNestedWorkspaceLoad.workspace}
+              rollup={activeNestedWorkspaceLoad.rollup}
               view={workspaceView}
               descendants={workspaceDescendants}
-              loadingMore={workspaceLoadingMore}
+              loadingMore={activeNestedWorkspaceLoad.loadingMore}
               onViewChange={selectWorkspaceView}
               onDescendantsChange={setWorkspaceDescendants}
               onLoadMore={loadMoreNestedWorkspace}
@@ -3820,6 +4006,7 @@ export function App() {
         ) : boardView === "gantt" ? (
           <Suspense fallback={<div className="board-view-loading">{text("正在打开甘特图…", "Opening Gantt…")}</div>}>
             <GanttView
+              ref={setGanttViewport}
               tasks={filteredTasks}
               presentations={taskPresentations}
               hasActiveFilters={hasActiveTaskFilters}
@@ -3827,6 +4014,8 @@ export function App() {
               hideCompleted={ganttHideCompleted}
               todayRequest={ganttTodayRequest}
               workflowStages={stageWorkflow?.definition.stages}
+              restoreViewport={workspaceGanttRestore}
+              onRestoreViewport={acknowledgeWorkspaceGanttRestore}
               onOpenTask={openTaskDetail}
               onUpdate={updateTaskProperties}
             />

@@ -5,6 +5,7 @@ import type { Task, WorkflowStage } from "../types";
 
 const gantt = vi.hoisted(() => {
   let container: HTMLElement | null = null;
+  let scroll = { x: 0, y: 0 };
   const tasks = new Map<string, Record<string, unknown>>();
   const config: Record<string, unknown> = { columns: [], show_grid: true, grid_width: 360 };
   const paint = () => {
@@ -28,7 +29,7 @@ const gantt = vi.hoisted(() => {
     attachEvent: vi.fn(),
     init: vi.fn((node: HTMLElement) => { container = node; }),
     destructor: vi.fn(),
-    getScrollState: vi.fn(() => ({ x: 0, y: 0 })),
+    getScrollState: vi.fn(() => ({ ...scroll })),
     isTaskExists: vi.fn((id: string) => tasks.has(id)),
     getTask: vi.fn((id: string) => tasks.get(id)),
     refreshData: vi.fn(),
@@ -42,13 +43,14 @@ const gantt = vi.hoisted(() => {
     dateFromPos: vi.fn(() => new Date("2026-08-24T00:00:00")),
     posFromDate: vi.fn(() => 0),
     showDate: vi.fn(),
-    scrollTo: vi.fn(),
+    scrollTo: vi.fn((x: number, y: number) => { scroll = { x, y }; }),
     setSizes: vi.fn(),
   };
   return {
     instance,
     reset() {
       container = null;
+      scroll = { x: 0, y: 0 };
       tasks.clear();
       Object.assign(config, { columns: [], show_grid: true, grid_width: 360 });
       vi.clearAllMocks();
@@ -187,5 +189,33 @@ describe("GanttView workflow stages", () => {
         expect.objectContaining({ id: "gantt-group-stage-14", taskboardGroup: true }),
       ]),
     }));
+  });
+
+  it("restores a virtualized 60-card Gantt viewport after parsing", async () => {
+    const onRestoreViewport = vi.fn();
+    const cards = Array.from({ length: 60 }, (_, index) => task(
+      `issue-${index + 1}`,
+      `Card ${index + 1}`,
+      "todo",
+    ));
+    render(
+      <GanttView
+        tasks={cards}
+        presentations={emptyPresentations}
+        hasActiveFilters={false}
+        zoom="week"
+        hideCompleted={false}
+        todayRequest={0}
+        restoreViewport={{ x: 0, y: 3247 }}
+        onRestoreViewport={onRestoreViewport}
+        onOpenTask={noop}
+        onUpdate={async (current) => current}
+      />,
+    );
+    await waitFor(() => expect(gantt.instance.parse).toHaveBeenCalled());
+    expect(gantt.instance.config.smart_rendering).toBe(true);
+    expect(gantt.instance.scrollTo).toHaveBeenCalledWith(0, 3247);
+    expect(gantt.instance.getScrollState()).toEqual({ x: 0, y: 3247 });
+    expect(onRestoreViewport).toHaveBeenCalledOnce();
   });
 });

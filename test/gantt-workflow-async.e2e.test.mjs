@@ -67,7 +67,7 @@ function seedWorkflowFixture(directory) {
       schemaVersion: 2,
       stages: [...initial.definition.stages, ...extras],
     });
-    for (let index = 0; index < 35; index += 1) {
+    for (let index = 0; index < 60; index += 1) {
       const stage = workflow.definition.stages[index % workflow.definition.stages.length];
       database.createTask({
         projectId: "alpha",

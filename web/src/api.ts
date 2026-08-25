@@ -568,13 +568,19 @@ export async function getTask(taskId: string, signal?: AbortSignal): Promise<Tas
 
 export function getNestedWorkspace(
   taskId: string,
-  options: { descendants?: boolean; limit?: number; cursor?: string | null } = {},
+  options: {
+    descendants?: boolean;
+    limit?: number;
+    childrenCursor?: string | null;
+    descendantsCursor?: string | null;
+  } = {},
   signal?: AbortSignal,
 ): Promise<NestedWorkspace> {
   const params = new URLSearchParams();
   if (options.descendants) params.set("descendants", "true");
   if (options.limit) params.set("limit", String(options.limit));
-  if (options.cursor) params.set("cursor", options.cursor);
+  if (options.childrenCursor) params.set("childrenCursor", options.childrenCursor);
+  if (options.descendantsCursor) params.set("descendantsCursor", options.descendantsCursor);
   const suffix = params.size ? `?${params}` : "";
   return request<{ workspace: NestedWorkspace }>(
     `/api/tasks/${encodeURIComponent(taskId)}/workspace${suffix}`,

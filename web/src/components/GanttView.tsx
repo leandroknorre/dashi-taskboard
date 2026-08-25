@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { Gantt, type GanttStatic, type Task as GanttTask } from "dhtmlx-gantt";
 import "../vendor/dhtmlxgantt.css";
 import type { Task, TaskDraft, WorkflowStage } from "../types";
@@ -40,8 +40,16 @@ interface GanttViewProps {
   hideCompleted: boolean;
   todayRequest: number;
   workflowStages?: readonly WorkflowStage[];
+  /** Applied after DHTMLX parses virtual rows, rather than before it can overwrite the viewport. */
+  restoreViewport?: { x: number; y: number } | null;
+  onRestoreViewport?: () => void;
   onOpenTask: (task: Task) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
+}
+
+export interface GanttViewport {
+  getScrollState: () => { x: number; y: number } | null;
+  scrollTo: (x: number, y: number) => void;
 }
 
 let pendingDetailViewport: { projectId: string; x: number; y: number } | null = null;
@@ -109,7 +117,7 @@ function dateCellClass(date: Date) {
   return classes.join(" ");
 }
 
-export function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCompleted, todayRequest, workflowStages, onOpenTask, onUpdate }: GanttViewProps) {
+export const GanttView = forwardRef<GanttViewport, GanttViewProps>(function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCompleted, todayRequest, workflowStages, restoreViewport = null, onRestoreViewport, onOpenTask, onUpdate }, viewportRef) {
   const { language, locale, text } = useTaskboardI18n();
   const i18nRef = useRef({ language, locale, text });
   const containerRef = useRef<HTMLDivElement>(null);
@@ -124,6 +132,10 @@ export function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCo
   const tasksRef = useRef(tasks);
   const onOpenTaskRef = useRef(onOpenTask);
   const onUpdateRef = useRef(onUpdate);
+  useImperativeHandle(viewportRef, () => ({
+    getScrollState: () => ganttRef.current?.getScrollState() ?? null,
+    scrollTo: (x, y) => ganttRef.current?.scrollTo(x, y),
+  }), []);
   tasksRef.current = tasks;
   onOpenTaskRef.current = onOpenTask;
   onUpdateRef.current = onUpdate;
@@ -475,7 +487,10 @@ export function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCo
     instance.config.end_date = addDays(rangeEnd, 8);
     instance.clearAll();
     instance.parse({ data, links });
-    if (restoredViewport) {
+    if (restoreViewport) {
+      instance.scrollTo(restoreViewport.x, restoreViewport.y);
+      onRestoreViewport?.();
+    } else if (restoredViewport) {
       instance.scrollTo(restoredViewport.x, restoredViewport.y);
     } else if (anchorDate) {
       instance.scrollTo(Math.max(0, instance.posFromDate(anchorDate) - timelineWidth / 2), previousScroll.y);
@@ -484,7 +499,7 @@ export function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCo
     }
     if (restoredViewport) pendingDetailViewport = null;
     hasParsedDataRef.current = true;
-  }, [ganttGroups, ganttReady, presentations, visibleTasks]);
+  }, [ganttGroups, ganttReady, onRestoreViewport, presentations, restoreViewport, visibleTasks]);
 
   useEffect(() => {
     ganttRef.current?.ext.zoom.setLevel(zoom);
@@ -542,4 +557,4 @@ export function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCo
       </div>
     </div>
   );
-}
+});

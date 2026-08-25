@@ -74,3 +74,22 @@ test("the app restores issue detail from the URL and follows browser history", (
   assert.match(appSource, /function closeTaskDetail\(\)[\s\S]*?window\.history\.replaceState/);
   assert.match(appSource, /onEdit=\{openTaskDetail\}/);
 });
+
+test("workspace changes replace the read record atomically and scope pagination cursors", () => {
+  assert.match(appSource, /setNestedWorkspaceLoad\(\{\s*key: requestKey,\s*workspace: null,\s*rollup: null,/);
+  assert.match(appSource, /requestId !== nestedWorkspaceRequestRef\.current/);
+  assert.match(appSource, /requestId !== nestedWorkspacePageRequestRef\.current/);
+  assert.match(appSource, /childrenCursor: page\.nextCursor/);
+  assert.match(appSource, /descendantsCursor: page\.nextCursor/);
+  assert.doesNotMatch(appSource, /cursor:\s*page\.nextCursor/);
+});
+
+test("workspace history saves and restores an origin viewport without opening the issue detail", async () => {
+  const workspaceSource = await readFile(new URL("../web/src/components/NestedWorkspaceView.tsx", import.meta.url), "utf8");
+  assert.match(appSource, /function saveWorkspaceOriginScroll[\s\S]*?window\.history\.replaceState/);
+  assert.match(appSource, /saveWorkspaceOriginScroll\(captureWorkspaceOriginScroll\(\)\)[\s\S]*?window\.history\.pushState/);
+  assert.match(appSource, /nestedWorkspaceSourceScroll/);
+  assert.match(appSource, /restoreViewport=\{workspaceGanttRestore\}/);
+  assert.match(workspaceSource, /onClick=\{\(\) => onOpenWorkspace\(root\.identifier\)\}/);
+  assert.doesNotMatch(workspaceSource, /nested-workspace-super-card[\s\S]{0,300}onOpenTask\(root\)/);
+});
