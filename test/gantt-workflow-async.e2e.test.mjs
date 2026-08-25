@@ -351,9 +351,14 @@ async function connectCdp(port) {
         if (socket.readyState !== WebSocket.CLOSED) socket.close();
         try {
           await withTimeout(closed, teardownTimeoutMs, "Chrome DevTools WebSocket did not close");
-        } catch {
+        } catch (closeError) {
           socket.terminate();
-          await withTimeout(closed, teardownTimeoutMs, "Chrome DevTools WebSocket did not terminate").catch(() => {});
+          try {
+            await withTimeout(closed, teardownTimeoutMs, "Chrome DevTools WebSocket did not terminate");
+          } catch (terminateError) {
+            throw new AggregateError([closeError, terminateError], "Chrome DevTools WebSocket teardown failed");
+          }
+          throw closeError;
         } finally {
           socket.off("error", onError);
           socket.off("close", onClose);
@@ -370,9 +375,14 @@ async function stop(child) {
   child.kill("SIGTERM");
   try {
     await withTimeout(exited, teardownTimeoutMs, "Chrome did not stop after SIGTERM");
-  } catch {
+  } catch (terminateError) {
     if (child.exitCode === null) child.kill("SIGKILL");
-    await withTimeout(exited, teardownTimeoutMs, "Chrome did not stop after SIGKILL").catch(() => {});
+    try {
+      await withTimeout(exited, teardownTimeoutMs, "Chrome did not stop after SIGKILL");
+    } catch (killError) {
+      throw new AggregateError([terminateError, killError], "Chrome teardown failed");
+    }
+    throw terminateError;
   }
 }
 
@@ -393,16 +403,21 @@ test("App repaints real DHTMLX Gantt when the project workflow arrives late", { 
   const cleanup = () => {
     if (cleanupPromise) return cleanupPromise;
     cleanupPromise = (async () => {
-      await cdp?.close();
-      await stop(child);
-      await proxy?.close();
-      app?.server.closeAllConnections?.();
-      await app?.close();
-      await rm(directory, { recursive: true, force: true });
+      let firstError;
+      const attempt = async (operation) => {
+        try { await operation(); } catch (error) { firstError ??= error; }
+      };
+      await attempt(() => cdp?.close());
+      await attempt(() => stop(child));
+      await attempt(() => proxy?.close());
+      await attempt(() => app?.server.closeAllConnections?.());
+      await attempt(() => app?.close());
+      await attempt(() => rm(directory, { recursive: true, force: true }));
+      if (firstError) throw firstError;
     })();
     return cleanupPromise;
   };
-  const onAbort = () => { void cleanup(); };
+  const onAbort = () => { void cleanup().catch(() => {}); };
   t.signal.addEventListener("abort", onAbort, { once: true });
   try {
     seedWorkflowFixture(directory);
@@ -492,15 +507,20 @@ test("Board restores each custom stage rail independently when stages share a ca
   const cleanup = () => {
     if (cleanupPromise) return cleanupPromise;
     cleanupPromise = (async () => {
-      await cdp?.close();
-      await stop(child);
-      app?.server.closeAllConnections?.();
-      await app?.close();
-      await rm(directory, { recursive: true, force: true });
+      let firstError;
+      const attempt = async (operation) => {
+        try { await operation(); } catch (error) { firstError ??= error; }
+      };
+      await attempt(() => cdp?.close());
+      await attempt(() => stop(child));
+      await attempt(() => app?.server.closeAllConnections?.());
+      await attempt(() => app?.close());
+      await attempt(() => rm(directory, { recursive: true, force: true }));
+      if (firstError) throw firstError;
     })();
     return cleanupPromise;
   };
-  const onAbort = () => { void cleanup(); };
+  const onAbort = () => { void cleanup().catch(() => {}); };
   t.signal.addEventListener("abort", onAbort, { once: true });
   try {
     seedBoardScrollFixture(directory);
