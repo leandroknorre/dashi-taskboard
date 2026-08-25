@@ -26,10 +26,10 @@ function capture() {
   };
 }
 
-function jsonResponse(payload, status = 200) {
+function jsonResponse(payload, status = 200, contentType = "application/json") {
   return new Response(JSON.stringify(payload), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": contentType },
   });
 }
 
@@ -230,7 +230,7 @@ test("cloud proxy replaces client identity with Basic Auth and makes exactly one
   });
 });
 
-test("cloud proxy strips device-local fields from every JSON outbound route", async () => {
+test("cloud proxy strips normalized device-local keys from generic structured-suffix JSON", async () => {
   const { createCloudProxy } = await importCloudProxy();
   const calls = [];
   const proxy = createCloudProxy({
@@ -241,22 +241,31 @@ test("cloud proxy strips device-local fields from every JSON outbound route", as
         stageWorkflow: {
           id: "workflow-1",
           codexHostId: "remote-host-must-not-return",
-          nested: { workspacePath: "/remote/must-not-return", safe: true },
+          nested: {
+            workspacePath: "/remote/must-not-return",
+            threadWorkspacePath: "/remote/thread-camel-must-not-return",
+            threadCodexHostId: "remote-thread-camel-host-must-not-return",
+            safe: true,
+          },
           aliases: [{
             codex_host_id: "remote-snake-host-must-not-return",
             thread_workspace_path: "/remote/snake-path-must-not-return",
             safe: "response-array",
+          }, {
+            "thread-workspace-path": "/remote/thread-kebab-path-must-not-return",
+            "thread-codex-host-id": "remote-thread-kebab-host-must-not-return",
+            safe: "response-kebab-array",
           }],
         },
-      });
+      }, 200, "Application/Vnd.Audit+Json; Charset=UTF-8");
     },
   });
 
   const response = await proxy.forward(new Request(
-    "http://127.0.0.1:47823/api/projects/portfolio/stage-workflow",
+    "http://127.0.0.1:47823/api/audit/events",
     {
       method: "PATCH",
-      headers: { "content-type": "application/json; charset=utf-8" },
+      headers: { "content-type": "Application/Vnd.Audit+Json; Charset=UTF-8" },
       body: JSON.stringify({
         stageId: "review",
         workspacePath: "/synthetic/device/workspace",
@@ -266,6 +275,11 @@ test("cloud proxy strips device-local fields from every JSON outbound route", as
             threadId: "thread-1",
             workspacePath: "/synthetic/thread/workspace",
             codexHostId: "synthetic-thread-host",
+          },
+          aliases: {
+            threadWorkspacePath: "/synthetic/thread-camel/workspace",
+            threadCodexHostId: "synthetic-thread-camel-host",
+            safe: "nested-object",
           },
         },
         aliases: [{
@@ -280,6 +294,10 @@ test("cloud proxy strips device-local fields from every JSON outbound route", as
           "workspace-path": "/synthetic/kebab/workspace",
           "codex-host-id": "synthetic-kebab-host",
           safe: "kebab-array-object",
+        }, {
+          "thread-workspace-path": "/synthetic/thread-kebab/workspace",
+          "thread-codex-host-id": "synthetic-thread-kebab-host",
+          safe: "thread-kebab-array-object",
         }],
       }),
     },
@@ -287,11 +305,15 @@ test("cloud proxy strips device-local fields from every JSON outbound route", as
 
   assert.deepEqual(calls, [{
     stageId: "review",
-    nested: { threadBinding: { threadId: "thread-1" } },
+    nested: {
+      threadBinding: { threadId: "thread-1" },
+      aliases: { safe: "nested-object" },
+    },
     aliases: [
       { safe: "array-object" },
       { safe: "thread-array-object" },
       { safe: "kebab-array-object" },
+      { safe: "thread-kebab-array-object" },
     ],
   }]);
   const payload = await response.json();
@@ -299,21 +321,81 @@ test("cloud proxy strips device-local fields from every JSON outbound route", as
     stageWorkflow: {
       id: "workflow-1",
       nested: { safe: true },
-      aliases: [{ safe: "response-array" }],
+      aliases: [{ safe: "response-array" }, { safe: "response-kebab-array" }],
     },
   });
   assert.doesNotMatch(JSON.stringify({ calls, payload }), /synthetic|must-not-return/);
 });
 
+test("cloud proxy recognizes case-insensitive JSON media types and leaves non-JSON opaque", async () => {
+  const { createCloudProxy } = await importCloudProxy();
+  const upstreamBodies = [];
+  const opaqueResponse = "{\"workspacePath\":\"/opaque/remote\",\"codexHostId\":\"opaque-remote-host\"}";
+  const proxy = createCloudProxy({
+    configStore: memoryConfigStore(),
+    fetch: async (_url, init) => {
+      upstreamBodies.push(typeof init.body === "string"
+        ? init.body
+        : await new Response(init.body).text());
+      if (upstreamBodies.length === 1) {
+        return jsonResponse({
+          audit: {
+            workspacePath: "/standard-json/remote",
+            codexHostId: "standard-json-remote-host",
+            safe: true,
+          },
+        }, 200, "APPLICATION/JSON; Charset=UTF-8");
+      }
+      return new Response(opaqueResponse, {
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      });
+    },
+  });
+
+  const jsonResponsePayload = await proxy.forward(new Request(
+    "http://127.0.0.1:47823/api/audit/standard-json",
+    {
+      method: "POST",
+      headers: { "content-type": "APPLICATION/JSON; Charset=UTF-8" },
+      body: JSON.stringify({
+        threadWorkspacePath: "/standard-json/request",
+        threadCodexHostId: "standard-json-request-host",
+        safe: true,
+      }),
+    },
+  ));
+  const textResponse = await proxy.forward(new Request(
+    "http://127.0.0.1:47823/api/audit/opaque",
+    {
+      method: "POST",
+      headers: { "content-type": "text/plain; charset=utf-8" },
+      body: "workspacePath=/opaque/request&codexHostId=opaque-request-host",
+    },
+  ));
+
+  assert.deepEqual(JSON.parse(upstreamBodies[0]), { safe: true });
+  assert.deepEqual(await jsonResponsePayload.json(), { audit: { safe: true } });
+  assert.equal(
+    upstreamBodies[1],
+    "workspacePath=/opaque/request&codexHostId=opaque-request-host",
+  );
+  assert.equal(await textResponse.text(), opaqueResponse);
+});
+
 test("cloud proxy stores local thread identity and never forwards or trusts it from Cloud", async () => {
   const { createCloudProxy } = await importCloudProxy();
   const upstreamBodies = [];
-  const localBinding = {
+  const canonicalLocalBinding = {
     threadId: "remote-thread",
     codexProjectId: "project-a",
     codexProjectKind: "remote",
     codexHostId: "host-a",
     workspacePath: "/srv/shared-repository",
+  };
+  const localBinding = {
+    ...canonicalLocalBinding,
+    threadWorkspacePath: "/must-not-rehydrate/noncanonical-path",
+    threadCodexHostId: "must-not-rehydrate-noncanonical-host",
   };
   const configStore = memoryConfigStore();
   let responseNumber = 0;
@@ -334,19 +416,23 @@ test("cloud proxy stores local thread identity and never forwards or trusts it f
               ...localBinding,
               codexHostId: "other-device-host",
               workspacePath: "/other/device/path",
+              threadWorkspacePath: "/other/device/noncanonical-path",
+              threadCodexHostId: "other-device-noncanonical-host",
             },
             legacyLocalThreadId: null,
             conversationRefs: [{
               threadId: localBinding.threadId,
               codexHostId: "other-device-host",
               workspacePath: "/other/device/path",
+              "thread-workspace-path": "/other/device/noncanonical-ref-path",
+              "thread-codex-host-id": "other-device-noncanonical-ref-host",
               source: "task",
               sourceId: "REMOTE-1",
               title: "Remote task",
               updatedAt: "2026-08-25T00:00:00.000Z",
             }],
           },
-        });
+        }, 200, "Application/Problem+Json; Charset=UTF-8");
       }
       if (responseNumber === 3) {
         return jsonResponse({
@@ -368,6 +454,8 @@ test("cloud proxy stores local thread identity and never forwards or trusts it f
             ...localBinding,
             codexHostId: "other-device-host",
             workspacePath: "/other/device/path",
+            threadWorkspacePath: "/other/device/noncanonical-comment-path",
+            threadCodexHostId: "other-device-noncanonical-comment-host",
           },
           legacyLocalThreadId: null,
         }],
@@ -433,21 +521,28 @@ test("cloud proxy stores local thread identity and never forwards or trusts it f
   ]);
   assert.doesNotMatch(JSON.stringify(upstreamBodies), /host-a|shared-repository|other-device/);
   assert.deepEqual(bindingsBeforeClear, {
-    [localBinding.threadId]: localBinding,
+    [canonicalLocalBinding.threadId]: canonicalLocalBinding,
   });
 
   const createdBody = await created.json();
-  assert.deepEqual(createdBody.task.threadBinding, localBinding);
+  assert.deepEqual(createdBody.task.threadBinding, canonicalLocalBinding);
   assert.deepEqual(createdBody.task.conversationRefs[0], {
-    ...localBinding,
+    ...canonicalLocalBinding,
     source: "task",
     sourceId: "REMOTE-1",
     title: "Remote task",
     updatedAt: "2026-08-25T00:00:00.000Z",
   });
   const commentsBody = await comments.json();
-  assert.deepEqual(commentsBody.comments[0].threadBinding, localBinding);
-  assert.equal(JSON.stringify(commentsBody).includes("other-device"), false);
+  assert.deepEqual(commentsBody.comments[0].threadBinding, canonicalLocalBinding);
+  assert.equal(
+    JSON.stringify({ createdBody, commentsBody }).includes("other-device"),
+    false,
+  );
+  assert.equal(
+    JSON.stringify({ createdBody, commentsBody }).includes("must-not-rehydrate"),
+    false,
+  );
   assert.deepEqual(configStore.state.threadBindings, {});
   assert.equal((await cleared.json()).task.threadBinding, null);
 });

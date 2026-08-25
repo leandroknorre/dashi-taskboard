@@ -10,15 +10,11 @@ const LOCAL_COMPANION_ROUTES = new Set([
   "/api/local/cloud-session",
 ]);
 
-const DEVICE_LOCAL_FIELD_NAMES = new Set([
-  "workspacePath",
-  "codexHostId",
-  "workspace_path",
-  "codex_host_id",
-  "thread_workspace_path",
-  "thread_codex_host_id",
-  "workspace-path",
-  "codex-host-id",
+const DEVICE_LOCAL_FIELD_CANONICAL_NAMES = new Set([
+  "workspacepath",
+  "threadworkspacepath",
+  "codexhostid",
+  "threadcodexhostid",
 ]);
 
 export class CloudProxyError extends Error {
@@ -41,14 +37,57 @@ function basicAuthorization(actorName, sharedKey) {
   return `Basic ${Buffer.from(`${actorName}:${sharedKey}`, "utf8").toString("base64")}`;
 }
 
-function isCompleteLocalThreadBinding(value) {
-  return value
-    && typeof value === "object"
-    && typeof value.threadId === "string"
-    && typeof value.codexProjectId === "string"
-    && (value.codexProjectKind === "local" || value.codexProjectKind === "remote")
-    && typeof value.codexHostId === "string"
-    && typeof value.workspacePath === "string";
+function canonicalDeviceLocalFieldName(value) {
+  return typeof value === "string"
+    ? value.toLowerCase().replace(/[^a-z0-9]/g, "")
+    : "";
+}
+
+function isDeviceLocalFieldName(value) {
+  return DEVICE_LOCAL_FIELD_CANONICAL_NAMES.has(canonicalDeviceLocalFieldName(value));
+}
+
+function isJsonMediaType(contentType) {
+  if (typeof contentType !== "string") return false;
+  const mediaType = contentType.split(";", 1)[0].trim().toLowerCase();
+  return mediaType === "application/json"
+    || /^application\/[a-z0-9!#$&^_.+-]+\+json$/i.test(mediaType);
+}
+
+function isLocalBindingText(value, maxLength) {
+  return typeof value === "string" && Boolean(value.trim()) && value.length <= maxLength;
+}
+
+function canonicalLocalThreadBinding(value, expectedThreadId = null) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const {
+    threadId,
+    codexProjectId,
+    codexProjectKind,
+    codexHostId,
+    workspacePath,
+  } = value;
+  if (
+    !isLocalBindingText(threadId, 256)
+    || (expectedThreadId !== null && threadId !== expectedThreadId)
+    || !isLocalBindingText(codexProjectId, 256)
+    || (codexProjectKind !== "local" && codexProjectKind !== "remote")
+    || !isLocalBindingText(codexHostId, 256)
+    || (codexProjectKind === "local" && codexHostId !== "local")
+    || (codexProjectKind === "remote" && codexHostId === "local")
+    || !isLocalBindingText(workspacePath, 4096)
+    || workspacePath.includes("\0")
+    || (!path.posix.isAbsolute(workspacePath) && !path.win32.isAbsolute(workspacePath))
+  ) return null;
+  // A host integration can include metadata around a binding. Rehydrate only
+  // the exact local contract, never arbitrary fields supplied by that source.
+  return {
+    threadId,
+    codexProjectId,
+    codexProjectKind,
+    codexHostId,
+    workspacePath,
+  };
 }
 
 function stripDeviceLocalFields(value) {
@@ -56,7 +95,7 @@ function stripDeviceLocalFields(value) {
   if (!value || typeof value !== "object") return value;
   const sanitized = {};
   for (const [key, child] of Object.entries(value)) {
-    if (DEVICE_LOCAL_FIELD_NAMES.has(key)) continue;
+    if (isDeviceLocalFieldName(key)) continue;
     sanitized[key] = stripDeviceLocalFields(child);
   }
   return sanitized;
@@ -64,13 +103,10 @@ function stripDeviceLocalFields(value) {
 
 async function resolveLocalThreadBinding(threadId, config, resolveThreadBinding) {
   if (typeof threadId !== "string" || !threadId) return null;
-  const stored = config?.threadBindings?.[threadId];
-  if (isCompleteLocalThreadBinding(stored) && stored.threadId === threadId) return stored;
+  const stored = canonicalLocalThreadBinding(config?.threadBindings?.[threadId], threadId);
+  if (stored) return stored;
   if (typeof resolveThreadBinding !== "function") return null;
-  const resolved = await resolveThreadBinding(threadId);
-  return isCompleteLocalThreadBinding(resolved) && resolved.threadId === threadId
-    ? resolved
-    : null;
+  return canonicalLocalThreadBinding(await resolveThreadBinding(threadId), threadId);
 }
 
 async function prepareRequest(request, {
@@ -83,7 +119,7 @@ async function prepareRequest(request, {
   const url = new URL(request.url);
   let projectWorkspace = null;
   let body = request.body;
-  const isJson = request.headers.get("content-type")?.includes("application/json");
+  const isJson = isJsonMediaType(request.headers.get("content-type"));
   const isProjectCreate = request.method === "POST" && url.pathname === "/api/projects";
   const taskPatchMatch = request.method === "PATCH"
     ? url.pathname.match(/^\/api\/tasks\/([^/]+)$/)
@@ -154,8 +190,9 @@ async function prepareRequest(request, {
       if (isConversationMutation) {
         const explicitBinding = payload.threadBinding;
         let localBinding = null;
-        if (isCompleteLocalThreadBinding(explicitBinding)) {
-          localBinding = explicitBinding;
+        const canonicalExplicitBinding = canonicalLocalThreadBinding(explicitBinding);
+        if (canonicalExplicitBinding) {
+          localBinding = canonicalExplicitBinding;
         } else if (
           !Object.hasOwn(payload, "threadBinding")
           && typeof payload.threadId === "string"
@@ -288,7 +325,7 @@ async function localizeResponse(
   },
 ) {
   if (response.status === 401) return response;
-  if (!response.headers.get("content-type")?.includes("application/json")) return response;
+  if (!isJsonMediaType(response.headers.get("content-type"))) return response;
   const payload = stripDeviceLocalFields(await response.json());
 
   if (response.ok && projectWorkspace) {
@@ -301,8 +338,8 @@ async function localizeResponse(
   const config = await readConfig();
   const resolveLocalBinding = async (threadId) => {
     if (typeof threadId !== "string" || !threadId) return null;
-    const requestBinding = requestThreadBindings?.get(threadId);
-    if (isCompleteLocalThreadBinding(requestBinding)) return requestBinding;
+    const requestBinding = canonicalLocalThreadBinding(requestThreadBindings?.get(threadId), threadId);
+    if (requestBinding) return requestBinding;
     return resolveLocalThreadBinding(threadId, config, resolveThreadBinding);
   };
   if (Array.isArray(payload.projects)) {
