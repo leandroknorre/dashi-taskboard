@@ -401,7 +401,23 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
         : sourceView === "list"
           ? ".issue-list-view"
           : ".gantt_ver_scroll";
-      await eventually(() => cdp.evaluate(`!document.querySelector(".nested-workspace-view") && document.querySelector(${JSON.stringify(selector)})`), `History back did not restore the ${sourceView} source view`);
+      const restored = await eventually(() => cdp.evaluate(`(() => {
+        const url = new URL(location.href);
+        if (document.querySelector(".nested-workspace-view") || !document.querySelector(${JSON.stringify(selector)})) return null;
+        if (url.searchParams.get("issue") || url.searchParams.get("workspace") || url.searchParams.get("view")) return null;
+        return {
+          issue: url.searchParams.get("issue"),
+          workspace: url.searchParams.get("workspace"),
+          view: url.searchParams.get("view"),
+          sourceView: ${JSON.stringify(sourceView)},
+        };
+      })()`), `History back did not restore the ${sourceView} source view`);
+      assert.deepEqual(restored, {
+        issue: null,
+        workspace: null,
+        view: null,
+        sourceView,
+      });
     }
 
     await enterWorkspace("board");
