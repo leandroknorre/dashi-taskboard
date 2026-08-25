@@ -12,8 +12,8 @@ import WebSocket from "ws";
 
 import { createTaskboardServer } from "../server/index.mjs";
 import { TaskboardDatabase } from "../server/database.mjs";
-import { captureStderrTail, chromeStartupDiagnostic } from "./helpers/chrome-diagnostics.mjs";
-import { hasExited, stopChild } from "./helpers/stop-child.mjs";
+import { captureStderrTail, waitForChromeDebugPort } from "./helpers/chrome-diagnostics.mjs";
+import { stopChild } from "./helpers/stop-child.mjs";
 
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
 const delayMs = 1_800;
@@ -243,37 +243,23 @@ async function startDelayedProxy(targetOrigin) {
   };
 }
 
-function chromeDebugPortError(profile, child, stderrTail, startupError) {
-  const diagnostic = chromeStartupDiagnostic({
+async function chromeDebugPort(profile, child, stderrCapture, getStartupError) {
+  return waitForChromeDebugPort({
     child,
-    stderrTail,
-    startupError,
+    stderrTail: stderrCapture.read,
+    getStartupError,
     paths: {
       profile,
       tempDirectory: path.dirname(profile),
       tempRoot: os.tmpdir(),
       homeDirectory: process.env.HOME,
     },
-  });
-  return new Error(`Chrome did not publish its DevTools port (${diagnostic})`);
-}
-
-async function chromeDebugPort(profile, child, stderrTail, getStartupError) {
-  const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline) {
-    if (hasExited(child) || getStartupError()) {
-      throw chromeDebugPortError(profile, child, stderrTail, getStartupError());
-    }
-    try {
+    timeoutMs: 10_000,
+    readPort: async () => {
       const lines = (await readFile(path.join(profile, "DevToolsActivePort"), "utf8")).trim().split("\n");
-      const port = Number(lines[0]);
-      if (port) return port;
-    } catch {
-      // Chrome creates the file asynchronously.
-    }
-    await wait(100);
-  }
-  throw chromeDebugPortError(profile, child, stderrTail, getStartupError());
+      return Number(lines[0]) || null;
+    },
+  });
 }
 
 async function connectCdp(port) {
@@ -409,6 +395,7 @@ test("App repaints real DHTMLX Gantt when the project workflow arrives late", { 
   let proxy;
   let child;
   let cdp;
+  let stderrCapture;
   let cleanupPromise;
   const cleanup = () => {
     if (cleanupPromise) return cleanupPromise;
@@ -419,6 +406,7 @@ test("App repaints real DHTMLX Gantt when the project workflow arrives late", { 
       };
       await attempt(() => cdp?.close());
       await attempt(() => stop(child));
+      await attempt(() => stderrCapture?.dispose());
       await attempt(() => proxy?.close());
       await attempt(() => app?.server.closeAllConnections?.());
       await attempt(() => app?.close());
@@ -446,10 +434,10 @@ test("App repaints real DHTMLX Gantt when the project workflow arrives late", { 
       `--user-data-dir=${profile}`,
       "about:blank",
     ], { stdio: ["ignore", "ignore", "pipe"] });
-    const stderrTail = captureStderrTail(child.stderr);
+    stderrCapture = captureStderrTail(child.stderr);
     let chromeStartupError;
     child.once("error", (error) => { chromeStartupError = error; });
-    const debugPort = await chromeDebugPort(profile, child, stderrTail, () => chromeStartupError);
+    const debugPort = await chromeDebugPort(profile, child, stderrCapture, () => chromeStartupError);
     cdp = await connectCdp(debugPort);
     await cdp.send("Page.enable");
     await cdp.send("Runtime.enable");
@@ -516,6 +504,7 @@ test("Board restores each custom stage rail independently when stages share a ca
   let app;
   let child;
   let cdp;
+  let stderrCapture;
   let cleanupPromise;
   const cleanup = () => {
     if (cleanupPromise) return cleanupPromise;
@@ -526,6 +515,7 @@ test("Board restores each custom stage rail independently when stages share a ca
       };
       await attempt(() => cdp?.close());
       await attempt(() => stop(child));
+      await attempt(() => stderrCapture?.dispose());
       await attempt(() => app?.server.closeAllConnections?.());
       await attempt(() => app?.close());
       await attempt(() => rm(directory, { recursive: true, force: true }));
@@ -551,10 +541,10 @@ test("Board restores each custom stage rail independently when stages share a ca
       `--user-data-dir=${profile}`,
       "about:blank",
     ], { stdio: ["ignore", "ignore", "pipe"] });
-    const stderrTail = captureStderrTail(child.stderr);
+    stderrCapture = captureStderrTail(child.stderr);
     let chromeStartupError;
     child.once("error", (error) => { chromeStartupError = error; });
-    const debugPort = await chromeDebugPort(profile, child, stderrTail, () => chromeStartupError);
+    const debugPort = await chromeDebugPort(profile, child, stderrCapture, () => chromeStartupError);
     cdp = await connectCdp(debugPort);
     await cdp.send("Page.enable");
     await cdp.send("Runtime.enable");
