@@ -81,6 +81,14 @@ test("board detail scroll capture and restoration are keyed by stage id", () => 
   assert.doesNotMatch(appSource, /boardColumnScrollRefs\.current\[[^\]]*canonicalStatus/);
 });
 
+test("workspace origin scroll keeps custom board rails keyed by stage id", () => {
+  assert.match(appSource, /view: "issues"; columns: Partial<Record<string, number>>/);
+  assert.match(appSource, /Object\.entries\(source\.columns\) as Array<\[string, number\]>/);
+  assert.match(appSource, /\(\[stageId\]\) => !boardColumnScrollRefs\.current\[stageId\]/);
+  assert.match(appSource, /Object\.entries\(boardColumnScrollRefs\.current\)\.flatMap\(\(\[stageId, element\]\)/);
+  assert.doesNotMatch(appSource, /WorkspaceOriginScroll[\s\S]*?Record<TaskStatus, number>/);
+});
+
 test("the complete issue status set shares one ordered source", () => {
   assert.deepEqual(taskStatuses(), [
     "backlog",
