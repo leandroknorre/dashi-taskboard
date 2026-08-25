@@ -366,6 +366,35 @@ test("issue move can clear an unconfirmed task binding", async () => {
   });
 });
 
+test("device-local CLI options refuse a direct Cloud origin before any request", async () => {
+  const attempts = [
+    ["project", "create", "--name", "Docs", "--workspace-path", "/device/docs"],
+    ["issue", "create", "--project", "docs", "--title", "Worktree", "--worktree-path", "/device/worktree"],
+    [
+      "issue", "move", "TASK-1", "--status", "todo", "--if-version", "3",
+      "--binding-thread-id", "thread-1",
+      "--binding-codex-project-id", "project-1",
+      "--binding-codex-project-kind", "remote",
+      "--binding-codex-host-id", "host-1",
+      "--binding-workspace-path", "/device/project",
+    ],
+    ["issue", "move", "TASK-1", "--status", "todo", "--if-version", "3", "--clear-binding-thread"],
+  ];
+  for (const argv of attempts) {
+    let calls = 0;
+    const result = await run(argv, async () => {
+      calls += 1;
+      return response({});
+    }, {
+      env: { CODEX_TASKBOARD_URL: "https://tasks.example.test" },
+    });
+    assert.equal(result.exitCode, 2, argv.join(" "));
+    assert.equal(result.stderr.error.code, "USAGE_ERROR");
+    assert.match(result.stderr.error.message, /loopback Taskboard companion/i);
+    assert.equal(calls, 0, argv.join(" "));
+  }
+});
+
 test("an explicit --thread-id overrides CODEX_THREAD_ID on issue writes", async () => {
   let requestBody;
   const result = await run(

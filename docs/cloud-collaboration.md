@@ -30,9 +30,13 @@ not given to taskctl, the local companion, or the frontend.
 
 ## What stays local
 
-The cloud stores project, issue, comment, relation, and attachment data. It does not store a device's absolute project or worktree paths.
+The cloud stores project, issue, comment, relation, and attachment data. It
+does not store a device's absolute project or worktree paths, nor a Codex host
+identifier. D1 keeps at most the opaque Codex `threadId` needed to associate a
+shared task with a local conversation. A complete thread binding
+(`codexProjectId`, kind, host, and workspace path) is device-local state.
 
-Each collaborator runs the **local companion**: a **device-local loopback service** (not a chat persona) for Codex, Git/worktree scanning, installed Skill/MCP discovery, and project path mapping. The companion keeps the cloud URL, actor name, shared password, and device-specific project mappings in `.data/cloud-companion.json` with mode `0600`. Ordinary Taskboard HTTP routes (tasks, comments, attachments) are the shared API; they are not a separate “companion API”.
+Each collaborator runs the **local companion**: a **device-local loopback service** (not a chat persona) for Codex, Git/worktree scanning, installed Skill/MCP discovery, and project path mapping. The companion keeps the cloud URL, actor name, shared password, device-specific project mappings, and complete thread bindings indexed by `threadId` in `.data/cloud-companion.json` with mode `0600`. Before an upstream request it removes `workspacePath` and `codexHostId`; after a Cloud response it rehydrates a complete binding only from that device's local state. Ordinary Taskboard HTTP routes (tasks, comments, attachments) are the shared API; they are not a separate “companion API”.
 
 When cloud mode is active, the cloud is the only business-data source. A failed cloud request fails visibly. The companion does not fall back to the local SQLite database and does not write to both databases. `taskctl cloud logout` returns that device to its separate local mode; it does not merge local and cloud data.
 
@@ -157,9 +161,9 @@ Launch the injected Codex window:
 CODEX_TASKBOARD_HOST=127.0.0.1 npm run codex
 ```
 
-`npm run codex` reuses or starts the loopback companion. Keep it running while using the embedded board. The companion supplies local Codex/Git/Skill/MCP capabilities and sends the shared password to the Worker only in the HTTPS Basic `Authorization` header. It does not write that password to D1 or R2, return it to the browser UI, or print it in logs. Device paths also stay off Cloudflare.
+`npm run codex` reuses or starts the loopback companion. Keep it running while using the embedded board. The companion supplies local Codex/Git/Skill/MCP capabilities and sends the shared password to the Worker only in the HTTPS Basic `Authorization` header. It does not write that password to D1 or R2, return it to the browser UI, or print it in logs. Device paths and Codex host identifiers also stay off Cloudflare.
 
-Do not point `CODEX_TASKBOARD_URL` directly at the cloud origin for this workflow. `taskctl` talks to the loopback companion, which applies Basic Authentication and the device's local project mapping. If the companion uses a non-default loopback port, set `CODEX_TASKBOARD_COMPANION_URL` to that loopback origin.
+Do not point `CODEX_TASKBOARD_URL` directly at the cloud origin for this workflow. `taskctl` talks to the loopback companion, which applies Basic Authentication and the device's local project and thread mapping. `taskctl` rejects device-local options (project/worktree paths and complete binding flags) before making a direct Cloud request. If the companion uses a non-default loopback port, set `CODEX_TASKBOARD_COMPANION_URL` to that loopback origin.
 
 ## Browser-only access
 

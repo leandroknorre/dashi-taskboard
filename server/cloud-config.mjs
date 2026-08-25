@@ -18,6 +18,7 @@ function emptyConfig() {
     actorName: null,
     sharedKey: null,
     projectMappings: {},
+    threadBindings: {},
   };
 }
 
@@ -82,6 +83,74 @@ function validateProjectMappings(value) {
   return projectMappings;
 }
 
+function isAbsoluteWorkspacePath(value) {
+  return path.posix.isAbsolute(value) || path.win32.isAbsolute(value);
+}
+
+function validateThreadBinding(value, expectedThreadId = null) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new CloudConfigError("INVALID_CLOUD_CONFIG", "Cloud thread bindings are invalid");
+  }
+  const allowedKeys = new Set([
+    "threadId",
+    "codexProjectId",
+    "codexProjectKind",
+    "codexHostId",
+    "workspacePath",
+  ]);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) {
+    throw new CloudConfigError("INVALID_CLOUD_CONFIG", "Cloud thread bindings are invalid");
+  }
+  const threadId = value.threadId;
+  const codexProjectId = value.codexProjectId;
+  const codexProjectKind = value.codexProjectKind;
+  const codexHostId = value.codexHostId;
+  const workspacePath = value.workspacePath;
+  if (
+    typeof threadId !== "string"
+    || !threadId.trim()
+    || threadId.length > 256
+    || (expectedThreadId !== null && threadId !== expectedThreadId)
+    || typeof codexProjectId !== "string"
+    || !codexProjectId.trim()
+    || codexProjectId.length > 256
+    || (codexProjectKind !== "local" && codexProjectKind !== "remote")
+    || typeof codexHostId !== "string"
+    || !codexHostId.trim()
+    || codexHostId.length > 256
+    || (codexProjectKind === "local" && codexHostId !== "local")
+    || (codexProjectKind === "remote" && codexHostId === "local")
+    || typeof workspacePath !== "string"
+    || !workspacePath
+    || workspacePath.length > 4096
+    || workspacePath.includes("\0")
+    || !isAbsoluteWorkspacePath(workspacePath)
+  ) {
+    throw new CloudConfigError("INVALID_CLOUD_CONFIG", "Cloud thread bindings are invalid");
+  }
+  return {
+    threadId,
+    codexProjectId,
+    codexProjectKind,
+    codexHostId,
+    workspacePath,
+  };
+}
+
+function validateThreadBindings(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new CloudConfigError("INVALID_CLOUD_CONFIG", "Cloud thread bindings are invalid");
+  }
+  const threadBindings = {};
+  for (const [threadId, binding] of Object.entries(value)) {
+    if (!threadId || threadId.length > 256) {
+      throw new CloudConfigError("INVALID_CLOUD_CONFIG", "Cloud thread bindings are invalid");
+    }
+    threadBindings[threadId] = validateThreadBinding(binding, threadId);
+  }
+  return threadBindings;
+}
+
 function parseConfig(value) {
   if (
     value === null
@@ -97,13 +166,17 @@ function parseConfig(value) {
     "actorName",
     "sharedKey",
     "projectMappings",
+    "threadBindings",
   ]);
   if (Object.keys(value).some((key) => !allowedKeys.has(key))) {
     throw new CloudConfigError("INVALID_CLOUD_CONFIG", "Cloud companion configuration is invalid");
   }
   const projectMappings = validateProjectMappings(value.projectMappings);
+  const threadBindings = value.threadBindings === undefined
+    ? {}
+    : validateThreadBindings(value.threadBindings);
   if (value.remoteUrl === null && value.actorName === null && value.sharedKey === null) {
-    return { ...emptyConfig(), projectMappings };
+    return { ...emptyConfig(), projectMappings, threadBindings };
   }
   const credentials = validateCredentials(value.actorName, value.sharedKey);
   return {
@@ -111,6 +184,7 @@ function parseConfig(value) {
     remoteUrl: normalizeCloudUrl(value.remoteUrl),
     ...credentials,
     projectMappings,
+    threadBindings,
   };
 }
 
@@ -183,6 +257,26 @@ export function createCloudConfigStore({ configPath }) {
           [projectId]: workspacePath,
         },
       }));
+    },
+    setThreadBinding(binding) {
+      const normalized = validateThreadBinding(binding);
+      return update((config) => ({
+        ...config,
+        threadBindings: {
+          ...config.threadBindings,
+          [normalized.threadId]: normalized,
+        },
+      }));
+    },
+    clearThreadBinding(threadId) {
+      if (typeof threadId !== "string" || !threadId.trim() || threadId.length > 256) {
+        throw new CloudConfigError("INVALID_CLOUD_CONFIG", "Cloud thread bindings are invalid");
+      }
+      return update((config) => {
+        const threadBindings = { ...config.threadBindings };
+        delete threadBindings[threadId];
+        return { ...config, threadBindings };
+      });
     },
   };
 }

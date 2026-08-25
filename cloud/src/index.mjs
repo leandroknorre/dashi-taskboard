@@ -318,49 +318,19 @@ function parseThreadId(value) {
 function parseThreadBinding(value) {
   if (value === undefined || value === null) return value;
   assertPlainObject(value);
-  assertAllowedKeys(value, new Set([
-    "threadId",
-    "codexProjectId",
-    "codexProjectKind",
-    "codexHostId",
-    "workspacePath",
-  ]));
+  if (Object.hasOwn(value, "codexHostId") || Object.hasOwn(value, "workspacePath")) {
+    throw new ApiError(
+      400,
+      "DEVICE_LOCAL_FIELD",
+      "threadBinding.codexHostId and threadBinding.workspacePath are device-local; use a local companion",
+    );
+  }
+  assertAllowedKeys(value, new Set(["threadId"]));
   const threadId = stringField(value.threadId, "threadBinding.threadId", {
     required: true,
     maxLength: 256,
   });
-  const identityFields = [
-    value.codexProjectId,
-    value.codexProjectKind,
-    value.codexHostId,
-    value.workspacePath,
-  ];
-  if (identityFields.every((field) => field === undefined)) return { threadId };
-  if (identityFields.some((field) => field === undefined)) {
-    throw new ApiError(400, "INVALID_FIELD", "Thread identity must include project, kind, host, and workspace");
-  }
-  const codexProjectId = stringField(value.codexProjectId, "threadBinding.codexProjectId", {
-    required: true,
-    maxLength: 256,
-  });
-  const codexProjectKind = value.codexProjectKind;
-  const codexHostId = stringField(value.codexHostId, "threadBinding.codexHostId", {
-    required: true,
-    maxLength: 256,
-  });
-  const workspacePath = stringField(value.workspacePath, "threadBinding.workspacePath", {
-    required: true,
-    maxLength: 4096,
-  });
-  if (
-    (codexProjectKind !== "local" && codexProjectKind !== "remote")
-    || (codexProjectKind === "local" && codexHostId !== "local")
-    || (codexProjectKind === "remote" && codexHostId === "local")
-    || workspacePath.includes("\0")
-  ) {
-    throw new ApiError(400, "INVALID_FIELD", "Thread project identity is invalid");
-  }
-  return { threadId, codexProjectId, codexProjectKind, codexHostId, workspacePath };
+  return { threadId };
 }
 
 function parseStageId(value) {
@@ -716,32 +686,14 @@ function commentConversationTitle(body) {
 }
 
 function threadBindingFromRow(row) {
-  if (
-    !row.thread_id
-    || !row.thread_codex_project_id
-    || !row.thread_codex_project_kind
-    || !row.thread_codex_host_id
-    || !row.thread_workspace_path
-  ) return null;
-  return {
-    threadId: row.thread_id,
-    codexProjectId: row.thread_codex_project_id,
-    codexProjectKind: row.thread_codex_project_kind,
-    codexHostId: row.thread_codex_host_id,
-    workspacePath: row.thread_workspace_path,
-  };
+  // Host and workspace identity is deliberately device-local. Return no
+  // Cloud binding even while an older D1 replica is waiting for 0019 cleanup.
+  void row;
+  return null;
 }
 
 function legacyLocalThreadIdFromRow(row) {
-  if (!row.thread_id) return null;
-  return [
-    row.thread_codex_project_id,
-    row.thread_codex_project_kind,
-    row.thread_codex_host_id,
-    row.thread_workspace_path,
-  ].every((value) => value == null)
-    ? row.thread_id
-    : null;
+  return row.thread_id ?? null;
 }
 
 function storedThreadBinding(threadBinding, threadId) {
@@ -749,22 +701,15 @@ function storedThreadBinding(threadBinding, threadId) {
   const binding = threadBinding === undefined ? { threadId } : threadBinding;
   return [
     binding?.threadId ?? null,
-    binding?.codexProjectId ?? null,
-    binding?.codexProjectKind ?? null,
-    binding?.codexHostId ?? null,
-    binding?.workspacePath ?? null,
+    null,
+    null,
+    null,
+    null,
   ];
 }
 
 function storedThreadBindingForExisting(current, threadBinding, threadId) {
-  const currentBinding = threadBindingFromRow(current);
-  if (
-    threadBinding === undefined
-    && currentBinding
-    && currentBinding.threadId === threadId
-  ) {
-    return storedThreadBinding(currentBinding, threadId);
-  }
+  void current;
   return storedThreadBinding(threadBinding, threadId);
 }
 
@@ -1427,18 +1372,16 @@ async function taskActivitiesForTasks(env, taskIds) {
 
 function parseProjectCreate(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["id", "name", "workspacePath"]));
+  if (Object.hasOwn(body, "workspacePath")) {
+    throw new ApiError(
+      400,
+      "DEVICE_LOCAL_FIELD",
+      "workspacePath is device-local; create projects through a local companion",
+    );
+  }
+  assertAllowedKeys(body, new Set(["id", "name"]));
   const name = stringField(body.name, "name", { required: true, maxLength: 120 });
   const id = validateProjectId(body.id ?? slugify(name));
-  if (body.workspacePath !== undefined && body.workspacePath !== null) {
-    const workspacePath = stringField(body.workspacePath, "workspacePath", {
-      required: true,
-      maxLength: 4096,
-    });
-    if (workspacePath.includes("\0")) {
-      throw new ApiError(400, "INVALID_FIELD", "'workspacePath' cannot contain null bytes");
-    }
-  }
   return { id, name };
 }
 

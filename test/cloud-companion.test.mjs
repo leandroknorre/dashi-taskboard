@@ -66,6 +66,7 @@ function memoryConfigStore(overrides = {}) {
     actorName: "Alice",
     sharedKey: "two-person-shared-key",
     projectMappings: {},
+    threadBindings: {},
     ...overrides,
   };
   return {
@@ -75,6 +76,14 @@ function memoryConfigStore(overrides = {}) {
     },
     async setProjectWorkspace(projectId, workspacePath) {
       state.projectMappings[projectId] = workspacePath;
+      return structuredClone(state);
+    },
+    async setThreadBinding(binding) {
+      state.threadBindings[binding.threadId] = structuredClone(binding);
+      return structuredClone(state);
+    },
+    async clearThreadBinding(threadId) {
+      delete state.threadBindings[threadId];
       return structuredClone(state);
     },
   };
@@ -97,6 +106,13 @@ test("cloud config persists Basic Auth credentials and device mappings in a mode
     sharedKey: "two-person-shared-key",
   });
   await store.setProjectWorkspace("portfolio", "/Users/alice/Documents/portfolio");
+  await store.setThreadBinding({
+    threadId: "thread-local",
+    codexProjectId: "portfolio",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/device/portfolio",
+  });
 
   assert.deepEqual(await store.read(), {
     version: 1,
@@ -106,11 +122,22 @@ test("cloud config persists Basic Auth credentials and device mappings in a mode
     projectMappings: {
       portfolio: "/Users/alice/Documents/portfolio",
     },
+    threadBindings: {
+      "thread-local": {
+        threadId: "thread-local",
+        codexProjectId: "portfolio",
+        codexProjectKind: "local",
+        codexHostId: "local",
+        workspacePath: "/device/portfolio",
+      },
+    },
   });
   if (process.platform !== "win32") {
     assert.equal((await stat(configPath)).mode & 0o777, 0o600);
   }
   assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), await store.read());
+  await store.clearThreadBinding("thread-local");
+  assert.deepEqual((await store.read()).threadBindings, {});
 });
 
 test("cloud config only accepts HTTPS origins, except loopback HTTP used in development", async () => {
@@ -203,40 +230,177 @@ test("cloud proxy replaces client identity with Basic Auth and makes exactly one
   });
 });
 
-test("cloud proxy forwards local thread identity without replacing explicit binding changes", async () => {
+test("cloud proxy strips device-local fields from every JSON outbound route", async () => {
+  const { createCloudProxy } = await importCloudProxy();
+  const calls = [];
+  const proxy = createCloudProxy({
+    configStore: memoryConfigStore(),
+    fetch: async (_url, init) => {
+      calls.push(JSON.parse(init.body));
+      return jsonResponse({
+        stageWorkflow: {
+          id: "workflow-1",
+          codexHostId: "remote-host-must-not-return",
+          nested: { workspacePath: "/remote/must-not-return", safe: true },
+          aliases: [{
+            codex_host_id: "remote-snake-host-must-not-return",
+            thread_workspace_path: "/remote/snake-path-must-not-return",
+            safe: "response-array",
+          }],
+        },
+      });
+    },
+  });
+
+  const response = await proxy.forward(new Request(
+    "http://127.0.0.1:47823/api/projects/portfolio/stage-workflow",
+    {
+      method: "PATCH",
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: JSON.stringify({
+        stageId: "review",
+        workspacePath: "/synthetic/device/workspace",
+        nested: {
+          codexHostId: "synthetic-device-host",
+          threadBinding: {
+            threadId: "thread-1",
+            workspacePath: "/synthetic/thread/workspace",
+            codexHostId: "synthetic-thread-host",
+          },
+        },
+        aliases: [{
+          workspace_path: "/synthetic/snake/workspace",
+          codex_host_id: "synthetic-snake-host",
+          safe: "array-object",
+        }, {
+          thread_workspace_path: "/synthetic/thread-snake/workspace",
+          thread_codex_host_id: "synthetic-thread-snake-host",
+          safe: "thread-array-object",
+        }, {
+          "workspace-path": "/synthetic/kebab/workspace",
+          "codex-host-id": "synthetic-kebab-host",
+          safe: "kebab-array-object",
+        }],
+      }),
+    },
+  ));
+
+  assert.deepEqual(calls, [{
+    stageId: "review",
+    nested: { threadBinding: { threadId: "thread-1" } },
+    aliases: [
+      { safe: "array-object" },
+      { safe: "thread-array-object" },
+      { safe: "kebab-array-object" },
+    ],
+  }]);
+  const payload = await response.json();
+  assert.deepEqual(payload, {
+    stageWorkflow: {
+      id: "workflow-1",
+      nested: { safe: true },
+      aliases: [{ safe: "response-array" }],
+    },
+  });
+  assert.doesNotMatch(JSON.stringify({ calls, payload }), /synthetic|must-not-return/);
+});
+
+test("cloud proxy stores local thread identity and never forwards or trusts it from Cloud", async () => {
   const { createCloudProxy } = await importCloudProxy();
   const upstreamBodies = [];
   const localBinding = {
-    threadId: "controller-thread",
+    threadId: "remote-thread",
     codexProjectId: "project-a",
     codexProjectKind: "remote",
     codexHostId: "host-a",
     workspacePath: "/srv/shared-repository",
   };
+  const configStore = memoryConfigStore();
+  let responseNumber = 0;
   const proxy = createCloudProxy({
-    configStore: memoryConfigStore(),
+    configStore,
     resolveThreadBinding: (threadId) => (
       threadId === localBinding.threadId ? localBinding : null
     ),
     fetch: async (_url, init) => {
       upstreamBodies.push(JSON.parse(init.body));
-      return jsonResponse({ task: { id: "REMOTE-1" } });
+      responseNumber += 1;
+      if (responseNumber === 1) {
+        return jsonResponse({
+          task: {
+            id: "REMOTE-1",
+            threadId: localBinding.threadId,
+            threadBinding: {
+              ...localBinding,
+              codexHostId: "other-device-host",
+              workspacePath: "/other/device/path",
+            },
+            legacyLocalThreadId: null,
+            conversationRefs: [{
+              threadId: localBinding.threadId,
+              codexHostId: "other-device-host",
+              workspacePath: "/other/device/path",
+              source: "task",
+              sourceId: "REMOTE-1",
+              title: "Remote task",
+              updatedAt: "2026-08-25T00:00:00.000Z",
+            }],
+          },
+        });
+      }
+      if (responseNumber === 3) {
+        return jsonResponse({
+          task: {
+            id: "REMOTE-1",
+            threadId: null,
+            threadBinding: null,
+            legacyLocalThreadId: null,
+          },
+        });
+      }
+      return jsonResponse({
+        comments: [{
+          id: "comment-1",
+          taskId: "REMOTE-1",
+          body: "Remote comment",
+          threadId: localBinding.threadId,
+          threadBinding: {
+            ...localBinding,
+            codexHostId: "other-device-host",
+            workspacePath: "/other/device/path",
+          },
+          legacyLocalThreadId: null,
+        }],
+      });
     },
   });
 
-  await proxy.forward(new Request(
+  const created = await proxy.forward(new Request(
     "http://127.0.0.1:47823/api/tasks/REMOTE-1/move",
     {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         status: "blocked",
-        threadId: localBinding.threadId,
+        threadId: "controller-thread",
+        threadBinding: localBinding,
         version: 3,
       }),
     },
   ));
-  await proxy.forward(new Request(
+  const comments = await proxy.forward(new Request(
+    "http://127.0.0.1:47823/api/tasks/REMOTE-1/comments",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        threadId: localBinding.threadId,
+        body: "Controller note",
+      }),
+    },
+  ));
+  const bindingsBeforeClear = structuredClone(configStore.state.threadBindings);
+  const cleared = await proxy.forward(new Request(
     "http://127.0.0.1:47823/api/tasks/REMOTE-1/move",
     {
       method: "POST",
@@ -254,8 +418,11 @@ test("cloud proxy forwards local thread identity without replacing explicit bind
     {
       status: "blocked",
       threadId: localBinding.threadId,
-      threadBinding: localBinding,
       version: 3,
+    },
+    {
+      body: "Controller note",
+      threadId: localBinding.threadId,
     },
     {
       status: "todo",
@@ -264,6 +431,25 @@ test("cloud proxy forwards local thread identity without replacing explicit bind
       version: 4,
     },
   ]);
+  assert.doesNotMatch(JSON.stringify(upstreamBodies), /host-a|shared-repository|other-device/);
+  assert.deepEqual(bindingsBeforeClear, {
+    [localBinding.threadId]: localBinding,
+  });
+
+  const createdBody = await created.json();
+  assert.deepEqual(createdBody.task.threadBinding, localBinding);
+  assert.deepEqual(createdBody.task.conversationRefs[0], {
+    ...localBinding,
+    source: "task",
+    sourceId: "REMOTE-1",
+    title: "Remote task",
+    updatedAt: "2026-08-25T00:00:00.000Z",
+  });
+  const commentsBody = await comments.json();
+  assert.deepEqual(commentsBody.comments[0].threadBinding, localBinding);
+  assert.equal(JSON.stringify(commentsBody).includes("other-device"), false);
+  assert.deepEqual(configStore.state.threadBindings, {});
+  assert.equal((await cleared.json()).task.threadBinding, null);
 });
 
 test("cloud companion blocks project moves for issue-linked local AI chats", async () => {
@@ -613,6 +799,20 @@ test("two companions map the same cloud project to different local paths", async
   }
   await alice.setProjectWorkspace("portfolio", "/Users/alice/Documents/portfolio");
   await bob.setProjectWorkspace("portfolio", "/Users/bob/src/portfolio");
+  await alice.setThreadBinding({
+    threadId: "shared-thread",
+    codexProjectId: "portfolio",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/device/alice/portfolio",
+  });
+  await bob.setThreadBinding({
+    threadId: "shared-thread",
+    codexProjectId: "portfolio",
+    codexProjectKind: "remote",
+    codexHostId: "bob-host",
+    workspacePath: "/device/bob/portfolio",
+  });
 
   assert.equal(
     (await alice.read()).projectMappings.portfolio,
@@ -622,8 +822,68 @@ test("two companions map the same cloud project to different local paths", async
     (await bob.read()).projectMappings.portfolio,
     "/Users/bob/src/portfolio",
   );
+  assert.equal(
+    (await alice.read()).threadBindings["shared-thread"].workspacePath,
+    "/device/alice/portfolio",
+  );
+  assert.equal(
+    (await bob.read()).threadBindings["shared-thread"].workspacePath,
+    "/device/bob/portfolio",
+  );
   assert.doesNotMatch(JSON.stringify(await alice.read()), /\/Users\/bob/);
   assert.doesNotMatch(JSON.stringify(await bob.read()), /\/Users\/alice/);
+  assert.doesNotMatch(JSON.stringify(await alice.read()), /\/device\/bob/);
+  assert.doesNotMatch(JSON.stringify(await bob.read()), /\/device\/alice/);
+});
+
+test("two companions rehydrate one Cloud thread only from their own local binding", async () => {
+  const { createCloudProxy } = await importCloudProxy();
+  const threadId = "shared-thread";
+  const aliceBinding = {
+    threadId,
+    codexProjectId: "portfolio",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/device/alice/portfolio",
+  };
+  const bobBinding = {
+    threadId,
+    codexProjectId: "portfolio",
+    codexProjectKind: "remote",
+    codexHostId: "bob-host",
+    workspacePath: "/device/bob/portfolio",
+  };
+  const responseFor = () => jsonResponse({
+    task: {
+      id: "REMOTE-1",
+      threadId,
+      threadBinding: {
+        ...aliceBinding,
+        codexHostId: "cloud-legacy-host",
+        workspacePath: "/cloud/legacy/path",
+      },
+      legacyLocalThreadId: null,
+    },
+  });
+  const alice = createCloudProxy({
+    configStore: memoryConfigStore({ threadBindings: { [threadId]: aliceBinding } }),
+    fetch: async () => responseFor(),
+  });
+  const bob = createCloudProxy({
+    configStore: memoryConfigStore({ threadBindings: { [threadId]: bobBinding } }),
+    fetch: async () => responseFor(),
+  });
+
+  const [aliceBody, bobBody] = await Promise.all([
+    alice.forward(new Request("http://127.0.0.1:47823/api/tasks/REMOTE-1"))
+      .then((response) => response.json()),
+    bob.forward(new Request("http://127.0.0.1:47823/api/tasks/REMOTE-1"))
+      .then((response) => response.json()),
+  ]);
+  assert.deepEqual(aliceBody.task.threadBinding, aliceBinding);
+  assert.deepEqual(bobBody.task.threadBinding, bobBinding);
+  assert.doesNotMatch(JSON.stringify(aliceBody), /bob-host|\/device\/bob|cloud-legacy/);
+  assert.doesNotMatch(JSON.stringify(bobBody), /\/device\/alice|cloud-legacy/);
 });
 
 test("configured server proxies business APIs without touching local rows and advertises push", async () => {

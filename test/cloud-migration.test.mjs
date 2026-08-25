@@ -49,6 +49,57 @@ afterEach(async () => {
   }
 });
 
+test("0019 clears historic device thread identity and rejects future D1 writes", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-cloud-privacy-migration-"));
+  const database = new DatabaseSync(path.join(directory, "privacy.sqlite"));
+  fixtures.push({ directory, database });
+  database.exec(`
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY,
+      thread_codex_host_id TEXT,
+      thread_workspace_path TEXT
+    );
+    CREATE TABLE comments (
+      id TEXT PRIMARY KEY,
+      thread_codex_host_id TEXT,
+      thread_workspace_path TEXT
+    );
+    INSERT INTO tasks VALUES ('task-1', 'historic-host', '/historic/device/path');
+    INSERT INTO comments VALUES ('comment-1', 'historic-host', '/historic/device/path');
+  `);
+
+  const migration = await readFile(
+    path.join(projectRoot, "cloud", "migrations", "0019_thread_host_workspace_privacy.sql"),
+    "utf8",
+  );
+  database.exec(migration);
+  assert.deepEqual(
+    database.prepare("SELECT thread_codex_host_id, thread_workspace_path FROM tasks")
+      .all().map((row) => ({ ...row })),
+    [{ thread_codex_host_id: null, thread_workspace_path: null }],
+  );
+  assert.deepEqual(
+    database.prepare("SELECT thread_codex_host_id, thread_workspace_path FROM comments")
+      .all().map((row) => ({ ...row })),
+    [{ thread_codex_host_id: null, thread_workspace_path: null }],
+  );
+  assert.throws(
+    () => database.prepare(`
+      INSERT INTO tasks (id, thread_codex_host_id, thread_workspace_path)
+      VALUES ('task-2', 'new-host', '/new/device/path')
+    `).run(),
+    /THREAD_HOST_OR_WORKSPACE_FORBIDDEN/,
+  );
+  assert.throws(
+    () => database.prepare(`
+      UPDATE comments
+      SET thread_codex_host_id = 'new-host'
+      WHERE id = 'comment-1'
+    `).run(),
+    /THREAD_HOST_OR_WORKSPACE_FORBIDDEN/,
+  );
+});
+
 async function createMigrationFixture({
   missingAttachmentId = null,
   foreignKeyViolation = false,

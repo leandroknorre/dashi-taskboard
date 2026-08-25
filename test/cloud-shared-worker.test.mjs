@@ -22,7 +22,6 @@ async function createProject(id, actorName = alice) {
     json: {
       id,
       name: id.toUpperCase(),
-      workspacePath: `/Users/${actorName.toLowerCase()}/${id}`,
     },
   });
 }
@@ -495,71 +494,106 @@ test("PATCH rejects a cross-project move that cannot preserve the task workflow 
   );
 });
 
-test("remote thread identity survives controller moves and clears after create failure", async () => {
+test("Cloud rejects device-local thread identity and never persists or serializes it", async () => {
   await createProject("remote-binding");
-  const legacy = await createTask("remote-binding", "Legacy local binding", alice, {
-    threadId: "legacy-local-thread",
-  });
-  assert.equal(legacy.body.task.threadBinding, null);
-  assert.equal(legacy.body.task.legacyLocalThreadId, "legacy-local-thread");
-  assert.equal(legacy.body.task.conversationRefs[0].legacyLocal, true);
-  const binding = {
+  const syntheticBinding = {
     threadId: "remote-thread-a",
     codexProjectId: "remote-project-a",
     codexProjectKind: "remote",
-    codexHostId: "ssh-a",
-    workspacePath: "/same/remote/path",
+    codexHostId: "synthetic-host",
+    workspacePath: "/synthetic/device/path",
   };
-  const created = await createTask("remote-binding", "Remote binding", alice, {
-    status: "todo",
-    threadId: binding.threadId,
-    threadBinding: binding,
+  const rejectedTask = await createTask("remote-binding", "Forbidden binding", alice, {
+    threadId: syntheticBinding.threadId,
+    threadBinding: syntheticBinding,
+  });
+  assert.equal(rejectedTask.response.status, 400, JSON.stringify(rejectedTask.body));
+  assert.equal(rejectedTask.body.error.code, "DEVICE_LOCAL_FIELD");
+  assert.equal(JSON.stringify(rejectedTask.body).includes("synthetic"), false);
+  assert.equal(
+    (await cloud.db.prepare("SELECT count(*) AS count FROM tasks WHERE title = 'Forbidden binding'").first()).count,
+    0,
+  );
+
+  const rejectedProject = await cloud.request("/api/projects", {
+    method: "POST",
+    actorName: alice,
+    json: {
+      id: "forbidden-device-project",
+      name: "Forbidden device project",
+      workspacePath: "/synthetic/project/path",
+    },
+  });
+  assert.equal(rejectedProject.response.status, 400);
+  assert.equal(rejectedProject.body.error.code, "DEVICE_LOCAL_FIELD");
+
+  const created = await createTask("remote-binding", "Cloud thread reference", alice, {
+    threadId: "safe-thread",
   });
   assert.equal(created.response.status, 201, JSON.stringify(created.body));
-  assert.deepEqual(created.body.task.threadBinding, binding);
+  assert.equal(created.body.task.threadBinding, null);
+  assert.equal(created.body.task.legacyLocalThreadId, "safe-thread");
+  assert.equal(created.body.task.conversationRefs[0].legacyLocal, true);
+  assert.equal(JSON.stringify(created.body).includes("workspacePath"), false);
+  assert.deepEqual(
+    await cloud.db.prepare(`
+      SELECT thread_codex_host_id, thread_workspace_path
+      FROM tasks WHERE id = ?
+    `).bind(created.body.task.id).first(),
+    { thread_codex_host_id: null, thread_workspace_path: null },
+  );
+  await assert.rejects(
+    cloud.db.prepare(`
+      UPDATE tasks
+      SET thread_codex_host_id = ?, thread_workspace_path = ?
+      WHERE id = ?
+    `).bind("synthetic-host", "/synthetic/device/path", created.body.task.id).run(),
+    /THREAD_HOST_OR_WORKSPACE_FORBIDDEN/,
+  );
+
+  const rejectedComment = await cloud.request(`/api/tasks/${created.body.task.id}/comments`, {
+    method: "POST",
+    actorName: bob,
+    json: { body: "Forbidden comment binding", threadBinding: syntheticBinding },
+  });
+  assert.equal(rejectedComment.response.status, 400);
+  assert.equal(rejectedComment.body.error.code, "DEVICE_LOCAL_FIELD");
 
   const comment = await cloud.request(`/api/tasks/${created.body.task.id}/comments`, {
     method: "POST",
     actorName: bob,
-    headers: { "x-taskboard-client": "taskctl" },
     json: { body: "Controller note", threadId: "controller-thread" },
   });
+  assert.equal(comment.response.status, 201, JSON.stringify(comment.body));
   assert.equal(comment.body.comment.threadBinding, null);
   assert.equal(comment.body.comment.legacyLocalThreadId, "controller-thread");
+  assert.deepEqual(
+    await cloud.db.prepare(`
+      SELECT thread_codex_host_id, thread_workspace_path
+      FROM comments WHERE id = ?
+    `).bind(comment.body.comment.id).first(),
+    { thread_codex_host_id: null, thread_workspace_path: null },
+  );
+  await assert.rejects(
+    cloud.db.prepare(`
+      UPDATE comments
+      SET thread_codex_host_id = ?, thread_workspace_path = ?
+      WHERE id = ?
+    `).bind("synthetic-host", "/synthetic/device/path", comment.body.comment.id).run(),
+    /THREAD_HOST_OR_WORKSPACE_FORBIDDEN/,
+  );
 
-  const blocked = await cloud.request(`/api/tasks/${created.body.task.id}/move`, {
-    method: "POST",
-    actorName: bob,
-    headers: { "x-taskboard-client": "taskctl" },
-    json: {
-      version: created.body.task.version,
-      status: "blocked",
-      threadId: "controller-thread",
-      threadBinding: binding,
-    },
-  });
-  assert.equal(blocked.response.status, 200, JSON.stringify(blocked.body));
-  assert.deepEqual(blocked.body.task.threadBinding, binding);
-  assert.deepEqual(blocked.body.task.conversationRefs.map((ref) => ref.threadId), [
-    binding.threadId,
-    "controller-thread",
+  const [task, comments] = await Promise.all([
+    cloud.request(`/api/tasks/${created.body.task.id}`, { actorName: alice }),
+    cloud.request(`/api/tasks/${created.body.task.id}/comments`, { actorName: alice }),
   ]);
-
-  const todo = await cloud.request(`/api/tasks/${created.body.task.id}/move`, {
-    method: "POST",
-    actorName: bob,
-    headers: { "x-taskboard-client": "taskctl" },
-    json: {
-      version: blocked.body.task.version,
-      status: "todo",
-      threadId: "controller-thread",
-      threadBinding: null,
-    },
-  });
-  assert.equal(todo.response.status, 200, JSON.stringify(todo.body));
-  assert.equal(todo.body.task.threadId, null);
-  assert.equal(todo.body.task.threadBinding, null);
-  assert.deepEqual(todo.body.task.conversationRefs.map((ref) => ref.threadId), ["controller-thread"]);
+  assert.equal(task.response.status, 200);
+  assert.equal(comments.response.status, 200);
+  const serialized = JSON.stringify({ task: task.body, comments: comments.body });
+  assert.equal(serialized.includes("synthetic-host"), false);
+  assert.equal(serialized.includes("/synthetic/device/path"), false);
+  assert.equal(serialized.includes("codexHostId"), false);
+  assert.equal(serialized.includes("workspacePath"), false);
 });
 
 test("PATCH keeps a related issue unchanged when cross-project transfer is unavailable", async () => {

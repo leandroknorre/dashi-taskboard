@@ -322,10 +322,12 @@ async function execute(parsed, overrides) {
     ? processEnv
     : { ...processEnv, CODEX_TASKBOARD_RUNTIME_FILE: parsed.options["runtime-file"] };
   const usesCompanionControl = command.startsWith("cloud ") || command === "project map";
+  const baseUrl = usesCompanionControl || env.CODEX_TASKBOARD_COMPANION_URL !== undefined
+    ? await resolveCompanionUrl(env, overrides)
+    : await resolveTaskboardBaseUrl(env, overrides);
+  assertDeviceLocalOptionsUseCompanion(parsed.options, baseUrl);
   const api = createApiClient(overrides, {
-    baseUrl: usesCompanionControl || env.CODEX_TASKBOARD_COMPANION_URL !== undefined
-      ? await resolveCompanionUrl(env, overrides)
-      : await resolveTaskboardBaseUrl(env, overrides),
+    baseUrl,
   });
   switch (command) {
     case "project list":
@@ -1255,6 +1257,38 @@ function normalizeBaseUrl(rawUrl) {
   url.search = "";
   url.hash = "";
   return url.toString().replace(/\/$/, "");
+}
+
+function isLoopbackTaskboardUrl(rawUrl) {
+  let url;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+  return url.hostname === "localhost"
+    || url.hostname === "127.0.0.1"
+    || url.hostname === "[::1]";
+}
+
+function assertDeviceLocalOptionsUseCompanion(options, baseUrl) {
+  const deviceLocalOptions = [
+    "workspace-path",
+    "worktree-path",
+    "binding-thread-id",
+    "binding-codex-project-id",
+    "binding-codex-project-kind",
+    "binding-codex-host-id",
+    "binding-workspace-path",
+    "clear-binding-thread",
+  ];
+  if (
+    !deviceLocalOptions.some((option) => options[option] !== undefined)
+    || isLoopbackTaskboardUrl(baseUrl)
+  ) return;
+  throw usageError(
+    "Device-local options require a loopback Taskboard companion; do not send them directly to Cloud",
+  );
 }
 
 function resolveApiUrl(baseUrl, pathname) {

@@ -10,6 +10,17 @@ const LOCAL_COMPANION_ROUTES = new Set([
   "/api/local/cloud-session",
 ]);
 
+const DEVICE_LOCAL_FIELD_NAMES = new Set([
+  "workspacePath",
+  "codexHostId",
+  "workspace_path",
+  "codex_host_id",
+  "thread_workspace_path",
+  "thread_codex_host_id",
+  "workspace-path",
+  "codex-host-id",
+]);
+
 export class CloudProxyError extends Error {
   constructor(status, code, message, details) {
     super(message);
@@ -30,9 +41,44 @@ function basicAuthorization(actorName, sharedKey) {
   return `Basic ${Buffer.from(`${actorName}:${sharedKey}`, "utf8").toString("base64")}`;
 }
 
+function isCompleteLocalThreadBinding(value) {
+  return value
+    && typeof value === "object"
+    && typeof value.threadId === "string"
+    && typeof value.codexProjectId === "string"
+    && (value.codexProjectKind === "local" || value.codexProjectKind === "remote")
+    && typeof value.codexHostId === "string"
+    && typeof value.workspacePath === "string";
+}
+
+function stripDeviceLocalFields(value) {
+  if (Array.isArray(value)) return value.map(stripDeviceLocalFields);
+  if (!value || typeof value !== "object") return value;
+  const sanitized = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (DEVICE_LOCAL_FIELD_NAMES.has(key)) continue;
+    sanitized[key] = stripDeviceLocalFields(child);
+  }
+  return sanitized;
+}
+
+async function resolveLocalThreadBinding(threadId, config, resolveThreadBinding) {
+  if (typeof threadId !== "string" || !threadId) return null;
+  const stored = config?.threadBindings?.[threadId];
+  if (isCompleteLocalThreadBinding(stored) && stored.threadId === threadId) return stored;
+  if (typeof resolveThreadBinding !== "function") return null;
+  const resolved = await resolveThreadBinding(threadId);
+  return isCompleteLocalThreadBinding(resolved) && resolved.threadId === threadId
+    ? resolved
+    : null;
+}
+
 async function prepareRequest(request, {
   assertTaskProjectMoveAllowed,
+  clearThreadBinding,
+  config,
   resolveThreadBinding,
+  setThreadBinding,
 } = {}) {
   const url = new URL(request.url);
   let projectWorkspace = null;
@@ -48,95 +94,202 @@ async function prepareRequest(request, {
   );
   const isConversationMutation = request.method !== "GET"
     && (/^\/api\/tasks(?:\/|$)/.test(url.pathname) || /^\/api\/comments\//.test(url.pathname));
+  const localThreadBindings = new Map();
 
-  if (isJson && (isProjectCreate || isTaskMutation || isConversationMutation)) {
+  // Parse and scrub every JSON request before it can leave the companion. The
+  // route-specific handling below adds local behavior, but the privacy
+  // boundary must not depend on a route allowlist staying current.
+  if (isJson) {
     let payload;
     try {
       payload = await request.clone().json();
     } catch {
       throw new CloudProxyError(400, "INVALID_JSON", "Request body must contain valid JSON");
     }
-    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    const isObjectPayload = payload !== null && typeof payload === "object" && !Array.isArray(payload);
+    if (
+      (isProjectCreate || isTaskMutation || isConversationMutation)
+      && !isObjectPayload
+    ) {
       throw new CloudProxyError(400, "INVALID_BODY", "Request body must be a JSON object");
     }
-    if (
-      taskPatchMatch
-      && typeof payload.projectId === "string"
-      && typeof assertTaskProjectMoveAllowed === "function"
-    ) {
-      let taskId;
-      try {
-        taskId = decodeURIComponent(taskPatchMatch[1]);
-      } catch {
-        throw new CloudProxyError(400, "INVALID_PATH", "Task id contains invalid encoding");
-      }
-      await assertTaskProjectMoveAllowed(taskId, payload.projectId);
-    }
-    if (isProjectCreate && Object.hasOwn(payload, "workspacePath")) {
-      if (typeof payload.workspacePath === "string") {
-        if (!path.isAbsolute(payload.workspacePath)) {
-          throw new CloudProxyError(
-            400,
-            "INVALID_PROJECT_MAPPING",
-            "Project workspacePath must be absolute",
-          );
+    if (isObjectPayload) {
+      if (
+        taskPatchMatch
+        && typeof payload.projectId === "string"
+        && typeof assertTaskProjectMoveAllowed === "function"
+      ) {
+        let taskId;
+        try {
+          taskId = decodeURIComponent(taskPatchMatch[1]);
+        } catch {
+          throw new CloudProxyError(400, "INVALID_PATH", "Task id contains invalid encoding");
         }
-        projectWorkspace = {
-          projectId: typeof payload.id === "string" ? payload.id : null,
-          workspacePath: payload.workspacePath,
+        await assertTaskProjectMoveAllowed(taskId, payload.projectId);
+      }
+      if (isProjectCreate && Object.hasOwn(payload, "workspacePath")) {
+        if (typeof payload.workspacePath === "string") {
+          if (!path.isAbsolute(payload.workspacePath)) {
+            throw new CloudProxyError(
+              400,
+              "INVALID_PROJECT_MAPPING",
+              "Project workspacePath must be absolute",
+            );
+          }
+          projectWorkspace = {
+            projectId: typeof payload.id === "string" ? payload.id : null,
+            workspacePath: payload.workspacePath,
+          };
+        }
+        delete payload.workspacePath;
+      }
+      if (isTaskMutation && payload.developmentContext?.type === "worktree") {
+        payload.developmentContext = {
+          type: "worktree",
+          ...(payload.developmentContext.branch === undefined
+            ? {}
+            : { branch: payload.developmentContext.branch }),
         };
       }
-      delete payload.workspacePath;
+      if (isConversationMutation) {
+        const explicitBinding = payload.threadBinding;
+        let localBinding = null;
+        if (isCompleteLocalThreadBinding(explicitBinding)) {
+          localBinding = explicitBinding;
+        } else if (
+          !Object.hasOwn(payload, "threadBinding")
+          && typeof payload.threadId === "string"
+        ) {
+          localBinding = await resolveLocalThreadBinding(
+            payload.threadId,
+            config,
+            resolveThreadBinding,
+          );
+        }
+
+        if (localBinding) {
+          if (typeof setThreadBinding !== "function") {
+            throw new CloudProxyError(
+              500,
+              "LOCAL_THREAD_BINDING_UNAVAILABLE",
+              "Local thread binding storage is unavailable",
+            );
+          }
+          await setThreadBinding(localBinding);
+          localThreadBindings.set(localBinding.threadId, localBinding);
+          // The Cloud contract retains only the opaque thread identifier. The
+          // complete identity remains in the local companion configuration.
+          payload.threadId = localBinding.threadId;
+          delete payload.threadBinding;
+        } else if (explicitBinding === null) {
+          if (typeof payload.threadId === "string" && typeof clearThreadBinding === "function") {
+            await clearThreadBinding(payload.threadId);
+          }
+        } else if (Object.hasOwn(payload, "threadBinding")) {
+          const threadId = explicitBinding?.threadId;
+          if (typeof threadId === "string") payload.threadId = threadId;
+          delete payload.threadBinding;
+        }
+      }
     }
-    if (isTaskMutation && payload.developmentContext?.type === "worktree") {
-      payload.developmentContext = {
-        type: "worktree",
-        ...(payload.developmentContext.branch === undefined
-          ? {}
-          : { branch: payload.developmentContext.branch }),
-      };
-    }
-    if (
-      isConversationMutation
-      && typeof payload.threadId === "string"
-      && !Object.hasOwn(payload, "threadBinding")
-      && typeof resolveThreadBinding === "function"
-    ) {
-      const threadBinding = resolveThreadBinding(payload.threadId);
-      if (threadBinding) payload.threadBinding = threadBinding;
-    }
-    body = JSON.stringify(payload);
+    body = JSON.stringify(stripDeviceLocalFields(payload));
   }
 
-  return { body, projectWorkspace };
+  return { body, projectWorkspace, localThreadBindings };
 }
 
-async function localizeTask(task, resolveDevelopmentContext) {
-  if (!task || typeof task !== "object" || task.developmentContext?.type !== "worktree") {
-    return task;
-  }
-  const cloudContext = {
-    type: "worktree",
-    ...(task.developmentContext.branch === undefined
-      ? {}
-      : { branch: task.developmentContext.branch }),
-  };
-  const localContext = resolveDevelopmentContext
-    ? await resolveDevelopmentContext(task.projectId, cloudContext)
+async function localizeThreadReference(reference, resolveThreadBinding) {
+  if (!reference || typeof reference !== "object") return reference;
+  const {
+    codexProjectId,
+    codexProjectKind,
+    codexHostId,
+    workspacePath,
+    threadBinding,
+    legacyLocal,
+    ...safeReference
+  } = reference;
+  void codexProjectId;
+  void codexProjectKind;
+  void codexHostId;
+  void workspacePath;
+  void threadBinding;
+  void legacyLocal;
+  const threadId = typeof safeReference.threadId === "string"
+    ? safeReference.threadId
     : null;
-  return {
-    ...task,
-    developmentContext: localContext ?? { ...cloudContext, path: null },
+  const localBinding = await resolveThreadBinding(threadId);
+  if (localBinding) return { ...safeReference, ...localBinding };
+  return threadId
+    ? { ...safeReference, threadId, legacyLocal: true }
+    : safeReference;
+}
+
+async function localizeThreadBoundEntity(entity, resolveThreadBinding) {
+  if (!entity || typeof entity !== "object") return entity;
+  const hasThreadReference = Object.hasOwn(entity, "threadId")
+    || Object.hasOwn(entity, "threadBinding")
+    || Object.hasOwn(entity, "legacyLocalThreadId")
+    || Array.isArray(entity.conversationRefs);
+  if (!hasThreadReference) return entity;
+  const {
+    threadBinding,
+    legacyLocalThreadId,
+    conversationRefs,
+    ...safeEntity
+  } = entity;
+  void threadBinding;
+  void legacyLocalThreadId;
+  const threadId = typeof safeEntity.threadId === "string" ? safeEntity.threadId : null;
+  const localBinding = await resolveThreadBinding(threadId);
+  const localized = {
+    ...safeEntity,
+    threadBinding: localBinding,
+    legacyLocalThreadId: localBinding ? null : threadId,
   };
+  if (Array.isArray(conversationRefs)) {
+    localized.conversationRefs = await Promise.all(
+      conversationRefs.map((reference) => localizeThreadReference(reference, resolveThreadBinding)),
+    );
+  }
+  return localized;
+}
+
+async function localizeTask(task, resolveDevelopmentContext, resolveThreadBinding) {
+  if (!task || typeof task !== "object") return task;
+  let localized = task;
+  if (task.developmentContext?.type === "worktree") {
+    const cloudContext = {
+      type: "worktree",
+      ...(task.developmentContext.branch === undefined
+        ? {}
+        : { branch: task.developmentContext.branch }),
+    };
+    const localContext = resolveDevelopmentContext
+      ? await resolveDevelopmentContext(task.projectId, cloudContext)
+      : null;
+    localized = {
+      ...task,
+      developmentContext: localContext ?? { ...cloudContext, path: null },
+    };
+  }
+  return localizeThreadBoundEntity(localized, resolveThreadBinding);
 }
 
 async function localizeResponse(
   response,
-  { readConfig, setProjectWorkspace, projectWorkspace, resolveDevelopmentContext },
+  {
+    readConfig,
+    requestThreadBindings,
+    resolveDevelopmentContext,
+    resolveThreadBinding,
+    setProjectWorkspace,
+    projectWorkspace,
+  },
 ) {
   if (response.status === 401) return response;
   if (!response.headers.get("content-type")?.includes("application/json")) return response;
-  const payload = await response.json();
+  const payload = stripDeviceLocalFields(await response.json());
 
   if (response.ok && projectWorkspace) {
     const projectId = projectWorkspace.projectId ?? payload.project?.id;
@@ -146,6 +299,12 @@ async function localizeResponse(
   }
 
   const config = await readConfig();
+  const resolveLocalBinding = async (threadId) => {
+    if (typeof threadId !== "string" || !threadId) return null;
+    const requestBinding = requestThreadBindings?.get(threadId);
+    if (isCompleteLocalThreadBinding(requestBinding)) return requestBinding;
+    return resolveLocalThreadBinding(threadId, config, resolveThreadBinding);
+  };
   if (Array.isArray(payload.projects)) {
     payload.projects = payload.projects.map((project) => ({
       ...project,
@@ -163,7 +322,11 @@ async function localizeResponse(
     };
   }
   if (payload.task) {
-    payload.task = await localizeTask(payload.task, resolveDevelopmentContext);
+    payload.task = await localizeTask(
+      payload.task,
+      resolveDevelopmentContext,
+      resolveLocalBinding,
+    );
   }
   if (Array.isArray(payload.tasks)) {
     const contexts = new Map();
@@ -177,7 +340,15 @@ async function localizeResponse(
       }
       : null;
     payload.tasks = await Promise.all(
-      payload.tasks.map((task) => localizeTask(task, resolveOnce)),
+      payload.tasks.map((task) => localizeTask(task, resolveOnce, resolveLocalBinding)),
+    );
+  }
+  if (payload.comment) {
+    payload.comment = await localizeThreadBoundEntity(payload.comment, resolveLocalBinding);
+  }
+  if (Array.isArray(payload.comments)) {
+    payload.comments = await Promise.all(
+      payload.comments.map((comment) => localizeThreadBoundEntity(comment, resolveLocalBinding)),
     );
   }
 
@@ -200,7 +371,9 @@ export function createCloudProxy({
   resolveThreadBinding,
 }) {
   const readConfig = getConfig ?? (() => configStore.read());
+  const clearThreadBinding = configStore?.clearThreadBinding?.bind(configStore);
   const setProjectWorkspace = configStore?.setProjectWorkspace?.bind(configStore);
+  const setThreadBinding = configStore?.setThreadBinding?.bind(configStore);
 
   return {
     async webSocketTarget(pathname = "/api/events") {
@@ -267,7 +440,10 @@ export function createCloudProxy({
 
       const prepared = await prepareRequest(request, {
         assertTaskProjectMoveAllowed,
+        clearThreadBinding,
+        config,
         resolveThreadBinding,
+        setThreadBinding,
       });
       if (prepared.projectWorkspace && !setProjectWorkspace) {
         throw new CloudProxyError(
@@ -300,9 +476,11 @@ export function createCloudProxy({
       }
       return localizeResponse(response, {
         readConfig,
-        setProjectWorkspace,
         projectWorkspace: prepared.projectWorkspace,
+        requestThreadBindings: prepared.localThreadBindings,
         resolveDevelopmentContext,
+        resolveThreadBinding,
+        setProjectWorkspace,
       });
     },
   };
