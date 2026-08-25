@@ -25,7 +25,10 @@ response returns an opaque lease token; list and get responses never expose it.
 If that lease expires, an explicit human can reclaim the same run with its
 current version; this creates a new audited attempt and outbox record without
 creating a second run. A retry of an older idempotency key never reveals the
-newer lease.
+newer lease. Each request keeps a redacted historical response snapshot; a
+pre-release request can only be recovered when its original lease is provably
+still the recorded attempt. If a newer reclaim has superseded it, replay is
+marked unavailable and fails closed rather than copying the active lease.
 
 ## Local API
 
@@ -42,6 +45,10 @@ host-provided `X-Taskboard-User-Id` and `X-Taskboard-User-Name` identity
 headers. This local/shared slice relies on the hosting boundary to authenticate
 and inject those headers; it is not an authorization boundary against an
 untrusted process already running on the same host. Results are bounded to 16
-KiB and redact sensitive key names before persistence. Run lifecycle records
-are append-only: `pending`, `dispatched`, `succeeded`, `failed`, or
+KiB and redact sensitive key names before persistence, including camel-case,
+underscore, and hyphen variants for private/access/API keys, secrets, tokens,
+passwords, authorization, and cookies. Idempotency fingerprints are one-way
+hashes of the normalized command after result redaction, so they never retain a
+result or lease value. Run lifecycle
+records are append-only: `pending`, `dispatched`, `succeeded`, `failed`, or
 `cancelled`.

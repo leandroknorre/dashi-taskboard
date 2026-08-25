@@ -49,8 +49,8 @@ export function automationRunFromRow(row, { includeLease = false } = {}) {
     agentProfileRevisionId: row.agent_profile_revision_id,
     mode: row.mode,
     status: row.status,
-    payload: JSON.parse(row.payload_json),
-    result: row.result_json === null ? null : JSON.parse(row.result_json),
+    payload: redactAndLimit(JSON.parse(row.payload_json), { limit: Number.POSITIVE_INFINITY }),
+    result: row.result_json === null ? null : redactAndLimit(JSON.parse(row.result_json), { limit: Number.POSITIVE_INFINITY }),
     version: row.version,
     dispatchAttempt: row.dispatch_attempt,
     leaseExpiresAt: row.lease_expires_at,
@@ -73,7 +73,7 @@ function runEventFromRow(row) {
     version: row.version,
     type: row.event_type,
     status: row.status,
-    payload: JSON.parse(row.payload_json),
+    payload: redactAndLimit(JSON.parse(row.payload_json), { limit: Number.POSITIVE_INFINITY }),
     actor: row.actor_id === null ? null : { type: row.actor_type, id: row.actor_id },
     createdAt: row.created_at,
   };
@@ -202,9 +202,8 @@ export class AutomationRunService {
     try {
       const replay = this.#idempotentRequest(runId, "dispatch", command.idempotencyKey, fingerprint, actor);
       if (replay) {
-        const run = this.#run(runId);
         this.database.exec("COMMIT");
-        return { idempotent: true, run: automationRunFromRow(run), leaseToken: replay.lease_token };
+        return { idempotent: true, ...this.#idempotentResponse(replay, "dispatch") };
       }
       const current = this.#run(runId);
       const timestamp = this.clock();
@@ -243,7 +242,6 @@ export class AutomationRunService {
       if (update.changes !== 1) {
         throw new AutomationRunError(AUTOMATION_RUN_ERROR_CODES.VERSION_CONFLICT, "Run changed during dispatch");
       }
-      this.#insertRequest(command.idempotencyKey, runId, "dispatch", fingerprint, timestamp, leaseToken, actor);
       this.database.prepare(`
         INSERT INTO workflow_automation_run_events (
           event_id, run_id, version, event_type, status, payload_json, actor_type, actor_id, created_at
@@ -267,8 +265,10 @@ export class AutomationRunService {
         timestamp,
       );
       const run = this.#run(runId);
+      const response = { run: automationRunFromRow(run), leaseToken: run.lease_token };
+      this.#insertRequest(command.idempotencyKey, runId, "dispatch", fingerprint, timestamp, leaseToken, actor, response);
       this.database.exec("COMMIT");
-      return { idempotent: false, run: automationRunFromRow(run), leaseToken: run.lease_token };
+      return { idempotent: false, ...response };
     } catch (error) {
       this.#rollback();
       throw apiError(error);
@@ -285,11 +285,19 @@ export class AutomationRunService {
     const fingerprint = automationRequestFingerprint("result", runId, command);
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      const priorRequest = this.database.prepare(`
+        SELECT run_id, operation FROM workflow_automation_run_requests WHERE idempotency_key = ?
+      `).get(command.idempotencyKey);
+      if (priorRequest?.run_id === runId && priorRequest.operation === "result") {
+        const priorRun = this.#run(runId);
+        if (priorRun.lease_token !== command.leaseToken) {
+          throw new AutomationRunError(AUTOMATION_RUN_ERROR_CODES.LEASE_INVALID, "Result does not hold the active dispatch lease");
+        }
+      }
       const replay = this.#idempotentRequest(runId, "result", command.idempotencyKey, fingerprint, actor);
       if (replay) {
-        const run = this.#run(runId);
         this.database.exec("COMMIT");
-        return { idempotent: true, run: automationRunFromRow(run) };
+        return { idempotent: true, ...this.#idempotentResponse(replay, "result") };
       }
       const current = this.#run(runId);
       if (current.status !== "dispatched") {
@@ -320,7 +328,6 @@ export class AutomationRunService {
       if (update.changes !== 1) {
         throw new AutomationRunError(AUTOMATION_RUN_ERROR_CODES.VERSION_CONFLICT, "Run changed during result recording");
       }
-      this.#insertRequest(command.idempotencyKey, runId, "result", fingerprint, timestamp, null, actor);
       this.database.prepare(`
         INSERT INTO workflow_automation_run_events (
           event_id, run_id, version, event_type, status, payload_json, actor_type, actor_id, created_at
@@ -330,8 +337,10 @@ export class AutomationRunService {
         canonicalJson(command.result), actor?.type ?? "user", actor?.id ?? "local-user", timestamp,
       );
       const run = this.#run(runId);
+      const response = { run: automationRunFromRow(run) };
+      this.#insertRequest(command.idempotencyKey, runId, "result", fingerprint, timestamp, null, actor, response);
       this.database.exec("COMMIT");
-      return { idempotent: false, run: automationRunFromRow(run) };
+      return { idempotent: false, ...response };
     } catch (error) {
       this.#rollback();
       throw apiError(error);
@@ -365,22 +374,52 @@ export class AutomationRunService {
       if (existing.actor_type !== requestedBy.type || existing.actor_id !== requestedBy.id) {
         throw new AutomationRunError(AUTOMATION_RUN_ERROR_CODES.IDEMPOTENCY_CONFLICT, "Idempotency-Key belongs to a different automation run actor");
       }
-    } else if (operation === "dispatch") {
-      const run = this.#run(runId);
-      if (run.dispatched_by_actor_type !== requestedBy.type || run.dispatched_by_actor_id !== requestedBy.id) {
-        throw new AutomationRunError(AUTOMATION_RUN_ERROR_CODES.IDEMPOTENCY_CONFLICT, "Legacy dispatch idempotency key belongs to a different automation run actor");
-      }
+    }
+    if (existing.replay_state !== "available") {
+      throw new AutomationRunError(
+        AUTOMATION_RUN_ERROR_CODES.REPLAY_UNAVAILABLE,
+        "Historical automation run response is unavailable; use a new explicit dispatch when the run is eligible",
+      );
     }
     return existing;
   }
 
-  #insertRequest(idempotencyKey, runId, operation, fingerprint, timestamp, leaseToken = null, actor = undefined) {
+  #idempotentResponse(request, operation) {
+    let stored;
+    try {
+      stored = redactAndLimit(JSON.parse(request.response_json), { limit: Number.POSITIVE_INFINITY });
+    } catch {
+      throw new AutomationRunError(
+        AUTOMATION_RUN_ERROR_CODES.REPLAY_UNAVAILABLE,
+        "Historical automation run response is unavailable; use a new explicit dispatch when the run is eligible",
+      );
+    }
+    if (stored === null || typeof stored !== "object" || Array.isArray(stored) || stored.run === undefined) {
+      throw new AutomationRunError(
+        AUTOMATION_RUN_ERROR_CODES.REPLAY_UNAVAILABLE,
+        "Historical automation run response is unavailable; use a new explicit dispatch when the run is eligible",
+      );
+    }
+    if (operation === "dispatch") {
+      if (typeof request.lease_token !== "string") {
+        throw new AutomationRunError(
+          AUTOMATION_RUN_ERROR_CODES.REPLAY_UNAVAILABLE,
+          "Historical automation run response is unavailable; use a new explicit dispatch when the run is eligible",
+        );
+      }
+      return { run: stored.run, leaseToken: request.lease_token };
+    }
+    return { run: stored.run };
+  }
+
+  #insertRequest(idempotencyKey, runId, operation, fingerprint, timestamp, leaseToken = null, actor = undefined, response) {
     const requestedBy = requestActor(actor);
+    const responseJson = canonicalJson(redactAndLimit({ run: response?.run }, { limit: Number.POSITIVE_INFINITY }));
     this.database.prepare(`
       INSERT INTO workflow_automation_run_requests (
-        idempotency_key, run_id, operation, request_fingerprint, lease_token, actor_type, actor_id, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(idempotencyKey, runId, operation, fingerprint, leaseToken, requestedBy.type, requestedBy.id, timestamp);
+        idempotency_key, run_id, operation, request_fingerprint, lease_token, actor_type, actor_id, response_json, replay_state, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'available', ?)
+    `).run(idempotencyKey, runId, operation, fingerprint, leaseToken, requestedBy.type, requestedBy.id, responseJson, timestamp);
   }
 
   #rollback() {

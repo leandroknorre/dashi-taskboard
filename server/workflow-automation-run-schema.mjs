@@ -1,3 +1,6 @@
+import { automationRequestFingerprint, redactAndLimit } from "../shared/automation-runs.mjs";
+import { canonicalJson } from "../shared/workflow-control.mjs";
+
 /**
  * Local migration 0016. Cloud is intentionally untouched: this first slice
  * only records local run intent and exposes no executor.
@@ -83,6 +86,8 @@ export const WORKFLOW_AUTOMATION_RUN_SCHEMA_SQL = `
     lease_token TEXT,
     actor_type TEXT,
     actor_id TEXT,
+    response_json TEXT,
+    replay_state TEXT NOT NULL DEFAULT 'unavailable' CHECK (replay_state IN ('available', 'unavailable')),
     created_at TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS workflow_automation_run_requests_run
@@ -126,55 +131,295 @@ export const WORKFLOW_AUTOMATION_RUN_SCHEMA_SQL = `
   BEGIN SELECT RAISE(ABORT, 'WORKFLOW_AUTOMATION_RUN_OUTBOX_IMMUTABLE'); END;
 `;
 
+function redactedJson(value) {
+  return canonicalJson(redactAndLimit(value, { limit: Number.POSITIVE_INFINITY }));
+}
+
+function redactedParsedJson(value) {
+  return redactAndLimit(JSON.parse(value), { limit: Number.POSITIVE_INFINITY });
+}
+
+function runResponseFromRow(row, overrides = {}) {
+  return {
+    runId: row.run_id,
+    taskId: row.task_id,
+    transitionEventId: row.transition_event_id,
+    transitionEventHash: row.transition_event_hash,
+    workflowId: row.workflow_id,
+    revisionId: row.revision_id,
+    taskStageId: row.task_stage_id,
+    contractStageId: row.contract_stage_id,
+    agentProfileRevisionId: row.agent_profile_revision_id,
+    mode: row.mode,
+    status: row.status,
+    payload: redactedParsedJson(row.payload_json),
+    result: row.result_json === null ? null : redactedParsedJson(row.result_json),
+    version: row.version,
+    dispatchAttempt: row.dispatch_attempt,
+    leaseExpiresAt: row.lease_expires_at,
+    dispatchedBy: row.dispatched_by_actor_id === null ? null : {
+      type: row.dispatched_by_actor_type,
+      id: row.dispatched_by_actor_id,
+    },
+    dispatchedAt: row.dispatched_at,
+    completedAt: row.completed_at,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    ...overrides,
+  };
+}
+
+function unavailableReplay(reason) {
+  return {
+    leaseToken: null,
+    actorType: null,
+    actorId: null,
+    responseJson: redactedJson({ unavailable: reason }),
+    replayState: "unavailable",
+  };
+}
+
+function normalizedStoredFingerprint(request) {
+  if (/^sha256:[a-f0-9]{64}$/.test(request.request_fingerprint)) {
+    return { fingerprint: request.request_fingerprint, valid: true };
+  }
+  try {
+    const envelope = JSON.parse(request.request_fingerprint);
+    if (
+      envelope === null
+      || typeof envelope !== "object"
+      || Array.isArray(envelope)
+      || typeof envelope.operation !== "string"
+      || typeof envelope.runId !== "string"
+    ) {
+      return { fingerprint: automationRequestFingerprint("legacy", "unavailable", {}), valid: false };
+    }
+    const { operation, runId, ...command } = envelope;
+    const { leaseToken, ...withoutLease } = command;
+    const redactedCommand = redactAndLimit(withoutLease, { limit: Number.POSITIVE_INFINITY });
+    return {
+      fingerprint: automationRequestFingerprint(operation, runId, {
+        ...redactedCommand,
+        ...(typeof leaseToken === "string" ? { leaseToken } : {}),
+      }),
+      valid: true,
+    };
+  } catch {
+    return { fingerprint: automationRequestFingerprint("legacy", "unavailable", {}), valid: false };
+  }
+}
+
+function legacyDispatchResponse(database, request) {
+  const run = database.prepare("SELECT * FROM workflow_automation_runs WHERE run_id = ?").get(request.run_id);
+  if (!run) return unavailableReplay("historical_dispatch_response_missing");
+  const events = database.prepare(`
+    SELECT * FROM workflow_automation_run_events
+    WHERE run_id = ? AND event_type = 'run.dispatched' AND created_at = ?
+    ORDER BY version
+  `).all(request.run_id, request.created_at);
+  if (events.length !== 1) return unavailableReplay("historical_dispatch_response_ambiguous");
+  const event = events[0];
+  let eventPayload;
+  try {
+    eventPayload = redactedParsedJson(event.payload_json);
+  } catch {
+    return unavailableReplay("historical_dispatch_response_invalid");
+  }
+  const attempt = eventPayload.attempt;
+  const hasStableOriginalLease = Number.isSafeInteger(attempt)
+    && attempt > 0
+    && run.dispatch_attempt === attempt
+    && run.lease_token !== null
+    && run.dispatched_by_actor_type === event.actor_type
+    && run.dispatched_by_actor_id === event.actor_id
+    && typeof eventPayload.leaseExpiresAt === "string";
+  const actor = { actorType: event.actor_type, actorId: event.actor_id };
+  if (!hasStableOriginalLease || event.actor_type === null || event.actor_id === null) {
+    return { ...unavailableReplay("historical_dispatch_response_superseded"), ...actor };
+  }
+  try {
+    return {
+      leaseToken: run.lease_token,
+      ...actor,
+      responseJson: redactedJson({
+        run: runResponseFromRow(run, {
+          status: "dispatched",
+          result: null,
+          version: event.version,
+          dispatchAttempt: attempt,
+          leaseExpiresAt: eventPayload.leaseExpiresAt,
+          dispatchedBy: { type: event.actor_type, id: event.actor_id },
+          dispatchedAt: event.created_at,
+          completedAt: null,
+          updatedAt: event.created_at,
+        }),
+      }),
+      replayState: "available",
+    };
+  } catch {
+    return { ...unavailableReplay("historical_dispatch_response_invalid"), ...actor };
+  }
+}
+
+function legacyResultResponse(database, request) {
+  const run = database.prepare("SELECT * FROM workflow_automation_runs WHERE run_id = ?").get(request.run_id);
+  if (!run) return unavailableReplay("historical_result_response_missing");
+  try {
+    return {
+      leaseToken: request.lease_token ?? null,
+      actorType: request.actor_type ?? null,
+      actorId: request.actor_id ?? null,
+      responseJson: redactedJson({ run: runResponseFromRow(run) }),
+      replayState: "available",
+    };
+  } catch {
+    return unavailableReplay("historical_result_response_invalid");
+  }
+}
+
+function immutableRequestUpdateTrigger(database) {
+  database.exec(`
+    CREATE TRIGGER workflow_automation_run_requests_immutable_update
+    BEFORE UPDATE ON workflow_automation_run_requests
+    BEGIN SELECT RAISE(ABORT, 'WORKFLOW_AUTOMATION_RUN_REQUEST_IMMUTABLE'); END
+  `);
+}
+
+function immutableEventUpdateTrigger(database) {
+  database.exec(`
+    CREATE TRIGGER workflow_automation_run_events_immutable_update
+    BEFORE UPDATE ON workflow_automation_run_events
+    BEGIN SELECT RAISE(ABORT, 'WORKFLOW_AUTOMATION_RUN_EVENT_IMMUTABLE'); END
+  `);
+}
+
+function immutableOutboxUpdateTrigger(database) {
+  database.exec(`
+    CREATE TRIGGER workflow_automation_run_outbox_immutable_update
+    BEFORE UPDATE ON workflow_automation_run_outbox
+    BEGIN SELECT RAISE(ABORT, 'WORKFLOW_AUTOMATION_RUN_OUTBOX_IMMUTABLE'); END
+  `);
+}
+
+function sanitizedStoredJson(value) {
+  try {
+    const sanitized = redactedJson(JSON.parse(value));
+    return sanitized === value ? null : sanitized;
+  } catch {
+    return null;
+  }
+}
+
 export function migrateLocalAutomationRuns(database) {
   database.exec("PRAGMA recursive_triggers = ON");
   database.exec("BEGIN IMMEDIATE");
   try {
     database.exec(WORKFLOW_AUTOMATION_RUN_SCHEMA_SQL);
     const requestColumns = new Set(database.prepare("PRAGMA table_info(workflow_automation_run_requests)").all().map((row) => row.name));
-    // A short-lived pre-release 0016 schema did not retain the original
-    // dispatch lease or actor for safe idempotent replay. Upgrade it in place
-    // rather than assuming every local database was created by the final schema.
-    if (!requestColumns.has("lease_token")) {
-      database.exec("ALTER TABLE workflow_automation_run_requests ADD COLUMN lease_token TEXT");
+    if (!requestColumns.has("lease_token")) database.exec("ALTER TABLE workflow_automation_run_requests ADD COLUMN lease_token TEXT");
+    if (!requestColumns.has("actor_type")) database.exec("ALTER TABLE workflow_automation_run_requests ADD COLUMN actor_type TEXT");
+    if (!requestColumns.has("actor_id")) database.exec("ALTER TABLE workflow_automation_run_requests ADD COLUMN actor_id TEXT");
+    if (!requestColumns.has("response_json")) database.exec("ALTER TABLE workflow_automation_run_requests ADD COLUMN response_json TEXT");
+    if (!requestColumns.has("replay_state")) {
+      database.exec("ALTER TABLE workflow_automation_run_requests ADD COLUMN replay_state TEXT NOT NULL DEFAULT 'unavailable'");
     }
-    if (!requestColumns.has("actor_type")) {
-      database.exec("ALTER TABLE workflow_automation_run_requests ADD COLUMN actor_type TEXT");
+
+    const requests = database.prepare("SELECT * FROM workflow_automation_run_requests").all();
+    const updates = [];
+    for (const request of requests) {
+      const fingerprint = normalizedStoredFingerprint(request);
+      const sanitizedResponse = request.response_json === null ? null : sanitizedStoredJson(request.response_json);
+      const alreadySafe = fingerprint.valid
+        && request.replay_state === "available"
+        && request.response_json !== null
+        && sanitizedResponse === null;
+      if (alreadySafe) continue;
+      if (fingerprint.valid && request.replay_state === "available" && request.response_json !== null) {
+        updates.push({
+          request,
+          fingerprint: fingerprint.fingerprint,
+          historical: {
+            leaseToken: request.lease_token,
+            actorType: request.actor_type,
+            actorId: request.actor_id,
+            responseJson: sanitizedResponse ?? request.response_json,
+            replayState: "available",
+          },
+        });
+        continue;
+      }
+      const historical = !fingerprint.valid
+        ? unavailableReplay("historical_request_fingerprint_invalid")
+        : request.operation === "dispatch"
+          ? legacyDispatchResponse(database, request)
+          : legacyResultResponse(database, request);
+      updates.push({ request, fingerprint: fingerprint.fingerprint, historical });
     }
-    if (!requestColumns.has("actor_id")) {
-      database.exec("ALTER TABLE workflow_automation_run_requests ADD COLUMN actor_id TEXT");
-    }
-    const needsDispatchBackfill = database.prepare(`
-      SELECT 1 FROM workflow_automation_run_requests
-      WHERE operation = 'dispatch'
-        AND (lease_token IS NULL OR actor_type IS NULL OR actor_id IS NULL)
-      LIMIT 1
-    `).get();
-    if (needsDispatchBackfill) {
+    if (updates.length > 0) {
       database.exec("DROP TRIGGER IF EXISTS workflow_automation_run_requests_immutable_update");
-      database.exec(`
+      const update = database.prepare(`
         UPDATE workflow_automation_run_requests
-        SET
-          lease_token = COALESCE(lease_token, (
-            SELECT lease_token FROM workflow_automation_runs
-            WHERE workflow_automation_runs.run_id = workflow_automation_run_requests.run_id
-          )),
-          actor_type = COALESCE(actor_type, (
-            SELECT dispatched_by_actor_type FROM workflow_automation_runs
-            WHERE workflow_automation_runs.run_id = workflow_automation_run_requests.run_id
-          )),
-          actor_id = COALESCE(actor_id, (
-            SELECT dispatched_by_actor_id FROM workflow_automation_runs
-            WHERE workflow_automation_runs.run_id = workflow_automation_run_requests.run_id
-          ))
-        WHERE operation = 'dispatch'
-          AND (lease_token IS NULL OR actor_type IS NULL OR actor_id IS NULL)
+        SET request_fingerprint = ?, lease_token = ?, actor_type = ?, actor_id = ?, response_json = ?, replay_state = ?
+        WHERE idempotency_key = ?
       `);
-      database.exec(`
-        CREATE TRIGGER workflow_automation_run_requests_immutable_update
-        BEFORE UPDATE ON workflow_automation_run_requests
-        BEGIN SELECT RAISE(ABORT, 'WORKFLOW_AUTOMATION_RUN_REQUEST_IMMUTABLE'); END
+      for (const { request, fingerprint, historical } of updates) {
+        update.run(
+          fingerprint,
+          historical.leaseToken,
+          historical.actorType,
+          historical.actorId,
+          historical.responseJson,
+          historical.replayState,
+          request.idempotency_key,
+        );
+      }
+      immutableRequestUpdateTrigger(database);
+    }
+
+    // Pre-fix 0016 could have persisted key variants that were later
+    // recognized as sensitive. The migration is the narrowly scoped exception
+    // to append-only JSON records: it removes only redacted values, inside the
+    // same transaction that immediately restores their immutability triggers.
+    const runJsonUpdates = database.prepare(`
+      SELECT run_id, payload_json, result_json FROM workflow_automation_runs
+    `).all().flatMap((row) => {
+      const payload = sanitizedStoredJson(row.payload_json);
+      const result = row.result_json === null ? null : sanitizedStoredJson(row.result_json);
+      return payload === null && result === null ? [] : [{ row, payload, result }];
+    });
+    if (runJsonUpdates.length > 0) {
+      const update = database.prepare(`
+        UPDATE workflow_automation_runs
+        SET payload_json = COALESCE(?, payload_json), result_json = COALESCE(?, result_json)
+        WHERE run_id = ?
       `);
+      for (const { row, payload, result } of runJsonUpdates) update.run(payload, result, row.run_id);
+    }
+
+    const eventJsonUpdates = database.prepare(`
+      SELECT event_id, payload_json FROM workflow_automation_run_events
+    `).all().flatMap((row) => {
+      const payload = sanitizedStoredJson(row.payload_json);
+      return payload === null ? [] : [{ eventId: row.event_id, payload }];
+    });
+    if (eventJsonUpdates.length > 0) {
+      database.exec("DROP TRIGGER IF EXISTS workflow_automation_run_events_immutable_update");
+      const update = database.prepare("UPDATE workflow_automation_run_events SET payload_json = ? WHERE event_id = ?");
+      for (const { eventId, payload } of eventJsonUpdates) update.run(payload, eventId);
+      immutableEventUpdateTrigger(database);
+    }
+
+    const outboxJsonUpdates = database.prepare(`
+      SELECT id, payload_json FROM workflow_automation_run_outbox
+    `).all().flatMap((row) => {
+      const payload = sanitizedStoredJson(row.payload_json);
+      return payload === null ? [] : [{ id: row.id, payload }];
+    });
+    if (outboxJsonUpdates.length > 0) {
+      database.exec("DROP TRIGGER IF EXISTS workflow_automation_run_outbox_immutable_update");
+      const update = database.prepare("UPDATE workflow_automation_run_outbox SET payload_json = ? WHERE id = ?");
+      for (const { id, payload } of outboxJsonUpdates) update.run(payload, id);
+      immutableOutboxUpdateTrigger(database);
     }
     database.exec("COMMIT");
   } catch (error) {

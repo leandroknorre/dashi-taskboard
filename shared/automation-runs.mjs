@@ -5,7 +5,27 @@ import { canonicalJson } from "./workflow-control.mjs";
 const IDENTIFIER = /^[a-z][a-z0-9_-]{0,63}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const REDACTED = "[redacted]";
-const SENSITIVE_KEY = /(?:authorization|api[_-]?key|cookie|credential|password|secret|token)/i;
+const SENSITIVE_KEY_SEGMENTS = new Set([
+  "access",
+  "api",
+  "auth",
+  "authorization",
+  "bearer",
+  "client",
+  "cookie",
+  "credential",
+  "credentials",
+  "encryption",
+  "jwt",
+  "password",
+  "passphrase",
+  "private",
+  "secret",
+  "session",
+  "signing",
+  "ssh",
+  "token",
+]);
 
 export const AUTOMATION_RUN_MODES = Object.freeze(["disabled", "manual", "shadow"]);
 export const AUTOMATION_RUN_STATUSES = Object.freeze([
@@ -22,6 +42,7 @@ export const AUTOMATION_RUN_ERROR_CODES = Object.freeze({
   LEASE_INVALID: "AUTOMATION_RUN_LEASE_INVALID",
   LEASE_EXPIRED: "AUTOMATION_RUN_LEASE_EXPIRED",
   RESULT_NOT_ALLOWED: "AUTOMATION_RUN_RESULT_NOT_ALLOWED",
+  REPLAY_UNAVAILABLE: "AUTOMATION_RUN_REPLAY_UNAVAILABLE",
   PAYLOAD_TOO_LARGE: "AUTOMATION_RUN_PAYLOAD_TOO_LARGE",
 });
 
@@ -99,7 +120,11 @@ export function redactAndLimit(value, { limit = 16 * 1024 } = {}) {
 }
 
 export function automationRequestFingerprint(operation, runId, command) {
-  return canonicalJson({ operation, runId, ...command });
+  // The preimage stays in memory only. It deliberately retains the lease so
+  // two result commands with different capabilities cannot collapse into one
+  // replay key; only the SHA-256 digest is ever persisted.
+  const serialized = canonicalJson({ operation, runId, ...command });
+  return `sha256:${createHash("sha256").update(serialized).digest("hex")}`;
 }
 
 function redact(value, depth) {
@@ -113,9 +138,20 @@ function redact(value, depth) {
     if (entries.length > 100) {
       throw new AutomationRunError(AUTOMATION_RUN_ERROR_CODES.PAYLOAD_TOO_LARGE, "Automation payload objects cannot contain more than 100 keys");
     }
-    return Object.fromEntries(entries.map(([key, item]) => [key, SENSITIVE_KEY.test(key) ? REDACTED : redact(item, depth + 1)]));
+    return Object.fromEntries(entries.map(([key, item]) => [key, sensitiveKey(key) ? REDACTED : redact(item, depth + 1)]));
   }
   throw new AutomationRunError(AUTOMATION_RUN_ERROR_CODES.INVALID_COMMAND, "Automation payload must be JSON data");
+}
+
+function sensitiveKey(key) {
+  const segments = String(key)
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+  if (segments.some((segment) => SENSITIVE_KEY_SEGMENTS.has(segment))) return true;
+  const compact = segments.join("");
+  return ["apikey", "accesskey", "privatekey", "clientkey", "signingkey", "encryptionkey", "sshkey"].includes(compact);
 }
 
 function plainObject(value, label) {

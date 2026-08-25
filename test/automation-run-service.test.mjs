@@ -9,6 +9,7 @@ import { AutomationRunService } from "../server/automation-run-service.mjs";
 import { TaskboardDatabase } from "../server/database.mjs";
 import { migrateLocalAutomationRuns } from "../server/workflow-automation-run-schema.mjs";
 import { TransitionService } from "../server/transition-service.mjs";
+import { canonicalJson } from "../shared/workflow-control.mjs";
 
 const fixtures = [];
 const human = { type: "user", id: "automation-human", name: "Automation Human", avatarUrl: null };
@@ -123,6 +124,29 @@ function publishMode(fixture, mode) {
     bindings,
     rules,
   });
+}
+
+function replaceRequestTableWithLegacyRow(fixture, { runId, command, createdAt }) {
+  fixture.database.database.exec("DROP TABLE workflow_automation_run_requests");
+  fixture.database.database.exec(`
+    CREATE TABLE workflow_automation_run_requests (
+      idempotency_key TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES workflow_automation_runs(run_id) ON DELETE CASCADE,
+      operation TEXT NOT NULL CHECK (operation IN ('dispatch', 'result')),
+      request_fingerprint TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )
+  `);
+  fixture.database.database.prepare(`
+    INSERT INTO workflow_automation_run_requests (
+      idempotency_key, run_id, operation, request_fingerprint, created_at
+    ) VALUES (?, ?, 'dispatch', ?, ?)
+  `).run(
+    command.idempotencyKey,
+    runId,
+    canonicalJson({ operation: "dispatch", runId, ...command }),
+    createdAt,
+  );
 }
 
 test("manual stage entry creates one deterministic pending run and explicit dispatch writes one adapter outbox row", async () => {
@@ -242,7 +266,144 @@ test("result requires the dispatch lease, redacts payloads, and is idempotent", 
   assert.equal(completed.run.version, 3);
   assert.equal(completed.run.result.nested.accessToken, "[redacted]");
   assert.equal(replay.idempotent, true);
+  assert.throws(
+    () => fixture.runs.recordResult(created.automationRun.runId, {
+      expectedVersion: 2,
+      leaseToken: randomUUID(),
+      status: "succeeded",
+      result: { summary: "recorded", nested: { accessToken: "never-store-this" } },
+      idempotencyKey: "automation-result-one",
+    }, { actor: { type: "agent", id: "external-adapter", name: "External adapter", avatarUrl: null } }),
+    (error) => error?.status === 409 && error?.code === "AUTOMATION_RUN_LEASE_INVALID",
+  );
   assert.equal(fixture.runs.get(created.automationRun.runId).events.length, 3);
+});
+
+test("secret key variants are redacted before persistence and every local read path", async () => {
+  const fixture = await createFixture();
+  const task = createTask(fixture, "Redaction variants");
+  const created = transition(fixture, task, "automation-redaction-transition");
+  const dispatched = fixture.runs.dispatch(created.automationRun.runId, {
+    expectedVersion: 1,
+    idempotencyKey: "automation-redaction-dispatch",
+  }, { actor: human });
+  const secrets = {
+    privateKey: "private-camel-secret",
+    private_key: "private-underscore-secret",
+    "private-key": "private-hyphen-secret",
+    accessKey: "access-camel-secret",
+    access_key: "access-underscore-secret",
+    "access-key": "access-hyphen-secret",
+    apiKey: "api-secret",
+    secret: "secret-value",
+    token: "token-value",
+    password: "password-value",
+    authorization: "authorization-value",
+    cookie: "cookie-value",
+    nested: { signingKey: "signing-secret", sessionId: "session-secret" },
+  };
+  const completed = fixture.runs.recordResult(created.automationRun.runId, {
+    expectedVersion: 2,
+    leaseToken: dispatched.leaseToken,
+    status: "succeeded",
+    result: secrets,
+    idempotencyKey: "automation-redaction-result",
+  }, { actor: { type: "agent", id: "redaction-adapter", name: "Redaction Adapter", avatarUrl: null } });
+
+  for (const key of ["privateKey", "private_key", "private-key", "accessKey", "access_key", "access-key", "apiKey", "secret", "token", "password", "authorization", "cookie"]) {
+    assert.equal(completed.run.result[key], "[redacted]");
+  }
+  assert.equal(completed.run.result.nested.signingKey, "[redacted]");
+  assert.equal(completed.run.result.nested.sessionId, "[redacted]");
+
+  const values = Object.values(secrets).filter((value) => typeof value === "string");
+  values.push("signing-secret", "session-secret", dispatched.leaseToken);
+  const stored = [
+    ...fixture.database.database.prepare("SELECT payload_json FROM workflow_automation_runs WHERE run_id = ?").all(created.automationRun.runId).map((row) => row.payload_json),
+    ...fixture.database.database.prepare("SELECT result_json FROM workflow_automation_runs WHERE run_id = ?").all(created.automationRun.runId).map((row) => row.result_json),
+    ...fixture.database.database.prepare("SELECT payload_json FROM workflow_automation_run_events WHERE run_id = ?").all(created.automationRun.runId).map((row) => row.payload_json),
+    ...fixture.database.database.prepare("SELECT payload_json FROM workflow_automation_run_outbox WHERE run_id = ?").all(created.automationRun.runId).map((row) => row.payload_json),
+    ...fixture.database.database.prepare("SELECT request_fingerprint, response_json FROM workflow_automation_run_requests WHERE run_id = ?").all(created.automationRun.runId).flatMap((row) => [row.request_fingerprint, row.response_json]),
+  ].filter((value) => value !== null);
+  for (const serialized of stored) {
+    for (const value of values) assert.equal(serialized.includes(value), false, `stored JSON leaked ${value}`);
+  }
+
+  const listed = fixture.runs.listForTask(task.id)[0];
+  const detail = fixture.runs.get(created.automationRun.runId);
+  assert.equal(listed.result.privateKey, "[redacted]");
+  assert.equal(detail.result.accessKey, "[redacted]");
+  assert.equal(detail.events.at(-1).payload.privateKey, "[redacted]");
+  assert.equal(Object.hasOwn(detail, "leaseToken"), false);
+});
+
+test("a result inside the 16 KiB limit still records its historical response snapshot", async () => {
+  const fixture = await createFixture();
+  const task = createTask(fixture, "Large result snapshot");
+  const created = transition(fixture, task, "automation-large-result-transition");
+  const dispatched = fixture.runs.dispatch(created.automationRun.runId, {
+    expectedVersion: 1,
+    idempotencyKey: "automation-large-result-dispatch",
+  }, { actor: human });
+  const command = {
+    expectedVersion: 2,
+    leaseToken: dispatched.leaseToken,
+    status: "succeeded",
+    result: { detail: "x".repeat(15_800) },
+    idempotencyKey: "automation-large-result-record",
+  };
+  const completed = fixture.runs.recordResult(created.automationRun.runId, command, { actor: human });
+  const replay = fixture.runs.recordResult(created.automationRun.runId, command, { actor: human });
+  assert.equal(completed.run.status, "succeeded");
+  assert.equal(replay.idempotent, true);
+});
+
+test("0016 reentry scrubs pre-fix sensitive JSON from payload, result, events, outbox, and request responses", async () => {
+  const fixture = await createFixture();
+  const task = createTask(fixture, "Legacy redaction migration");
+  const created = transition(fixture, task, "automation-legacy-redaction-transition");
+  const dispatched = fixture.runs.dispatch(created.automationRun.runId, {
+    expectedVersion: 1,
+    idempotencyKey: "automation-legacy-redaction-dispatch",
+  }, { actor: human });
+  const raw = { privateKey: "legacy-private-value", access_key: "legacy-access-value" };
+  const database = fixture.database.database;
+  database.prepare("UPDATE workflow_automation_runs SET payload_json = ?, result_json = ? WHERE run_id = ?").run(
+    canonicalJson(raw), canonicalJson(raw), created.automationRun.runId,
+  );
+  database.exec("DROP TRIGGER workflow_automation_run_events_immutable_update");
+  database.prepare("UPDATE workflow_automation_run_events SET payload_json = ? WHERE run_id = ? AND event_type = 'run.dispatched'").run(
+    canonicalJson(raw), created.automationRun.runId,
+  );
+  database.exec("DROP TRIGGER workflow_automation_run_outbox_immutable_update");
+  database.prepare("UPDATE workflow_automation_run_outbox SET payload_json = ? WHERE run_id = ?").run(
+    canonicalJson(raw), created.automationRun.runId,
+  );
+  database.exec("DROP TRIGGER workflow_automation_run_requests_immutable_update");
+  database.prepare(`
+    UPDATE workflow_automation_run_requests
+    SET request_fingerprint = ?, response_json = ?
+    WHERE idempotency_key = ?
+  `).run(
+    canonicalJson({ operation: "dispatch", runId: created.automationRun.runId, expectedVersion: 1, idempotencyKey: "automation-legacy-redaction-dispatch", privateKey: raw.privateKey }),
+    canonicalJson({ run: { result: raw } }),
+    "automation-legacy-redaction-dispatch",
+  );
+
+  migrateLocalAutomationRuns(database);
+  const serialized = [
+    ...database.prepare("SELECT payload_json, result_json FROM workflow_automation_runs WHERE run_id = ?").all(created.automationRun.runId).flatMap((row) => [row.payload_json, row.result_json]),
+    ...database.prepare("SELECT payload_json FROM workflow_automation_run_events WHERE run_id = ?").all(created.automationRun.runId).map((row) => row.payload_json),
+    ...database.prepare("SELECT payload_json FROM workflow_automation_run_outbox WHERE run_id = ?").all(created.automationRun.runId).map((row) => row.payload_json),
+    ...database.prepare("SELECT request_fingerprint, response_json FROM workflow_automation_run_requests WHERE run_id = ?").all(created.automationRun.runId).flatMap((row) => [row.request_fingerprint, row.response_json]),
+  ];
+  for (const text of serialized) {
+    assert.equal(text.includes(raw.privateKey), false);
+    assert.equal(text.includes(raw.access_key), false);
+  }
+  assert.equal(fixture.runs.listForTask(task.id)[0].payload.privateKey, "[redacted]");
+  assert.equal(fixture.runs.get(created.automationRun.runId).events.find((event) => event.type === "run.dispatched").payload.access_key, "[redacted]");
+  assert.equal(dispatched.leaseToken.length > 0, true);
 });
 
 test("an explicitly reclaimed expired lease creates one new attempt without exposing it to an old idempotency retry", async () => {
@@ -353,6 +514,93 @@ test("0016 reentry upgrades provisional request rows and preserves their dispatc
   const replay = fixture.runs.dispatch(created.automationRun.runId, command, { actor: human });
   assert.equal(replay.idempotent, true);
   assert.equal(replay.leaseToken, dispatched.leaseToken);
+});
+
+test("legacy dispatch migrated before reclaim preserves its historical response and never upgrades its lease", async () => {
+  let instant = "2026-08-26T12:00:00.000Z";
+  const originalActor = { type: "user", id: "legacy-original", name: "Legacy Original", avatarUrl: null };
+  const reclaimingActor = { type: "user", id: "legacy-reclaimer", name: "Legacy Reclaimer", avatarUrl: null };
+  const fixture = await createFixture({ clock: () => instant });
+  const task = createTask(fixture, "Legacy migration before reclaim");
+  const created = transition(fixture, task, "legacy-before-transition");
+  const command = { expectedVersion: 1, leaseSeconds: 30, idempotencyKey: "legacy-before-dispatch" };
+  const original = fixture.runs.dispatch(created.automationRun.runId, command, { actor: originalActor });
+  const request = fixture.database.database.prepare(`
+    SELECT created_at FROM workflow_automation_run_requests WHERE idempotency_key = ?
+  `).get(command.idempotencyKey);
+  replaceRequestTableWithLegacyRow(fixture, { runId: created.automationRun.runId, command, createdAt: request.created_at });
+
+  migrateLocalAutomationRuns(fixture.database.database);
+  const recovered = fixture.database.database.prepare(`
+    SELECT lease_token, actor_id, response_json, replay_state
+    FROM workflow_automation_run_requests WHERE idempotency_key = ?
+  `).get(command.idempotencyKey);
+  assert.equal(recovered.lease_token, original.leaseToken);
+  assert.equal(recovered.actor_id, originalActor.id);
+  assert.equal(recovered.replay_state, "available");
+  assert.doesNotMatch(recovered.response_json, new RegExp(original.leaseToken, "i"));
+
+  instant = "2026-08-26T12:00:31.000Z";
+  const reclaimed = fixture.runs.dispatch(created.automationRun.runId, {
+    expectedVersion: 2,
+    leaseSeconds: 30,
+    idempotencyKey: "legacy-before-reclaim",
+  }, { actor: reclaimingActor });
+  assert.notEqual(reclaimed.leaseToken, original.leaseToken);
+
+  const oldReplay = fixture.runs.dispatch(created.automationRun.runId, command, { actor: originalActor });
+  assert.equal(oldReplay.idempotent, true);
+  assert.equal(oldReplay.leaseToken, original.leaseToken);
+  assert.equal(oldReplay.run.version, 2);
+  assert.equal(oldReplay.run.dispatchAttempt, 1);
+  assert.throws(
+    () => fixture.runs.dispatch(created.automationRun.runId, command, { actor: reclaimingActor }),
+    (error) => error?.status === 409 && error?.code === "AUTOMATION_RUN_IDEMPOTENCY_CONFLICT",
+  );
+});
+
+test("legacy dispatch reclaimed before migration fails closed instead of receiving the active replacement lease", async () => {
+  let instant = "2026-08-27T12:00:00.000Z";
+  const originalActor = { type: "user", id: "legacy-old", name: "Legacy Old", avatarUrl: null };
+  const reclaimingActor = { type: "user", id: "legacy-new", name: "Legacy New", avatarUrl: null };
+  const fixture = await createFixture({ clock: () => instant });
+  const task = createTask(fixture, "Legacy migration after reclaim");
+  const created = transition(fixture, task, "legacy-after-transition");
+  const command = { expectedVersion: 1, leaseSeconds: 30, idempotencyKey: "legacy-after-dispatch" };
+  const original = fixture.runs.dispatch(created.automationRun.runId, command, { actor: originalActor });
+  const request = fixture.database.database.prepare(`
+    SELECT created_at FROM workflow_automation_run_requests WHERE idempotency_key = ?
+  `).get(command.idempotencyKey);
+
+  instant = "2026-08-27T12:00:31.000Z";
+  const reclaimed = fixture.runs.dispatch(created.automationRun.runId, {
+    expectedVersion: 2,
+    leaseSeconds: 30,
+    idempotencyKey: "legacy-after-reclaim",
+  }, { actor: reclaimingActor });
+  replaceRequestTableWithLegacyRow(fixture, { runId: created.automationRun.runId, command, createdAt: request.created_at });
+  migrateLocalAutomationRuns(fixture.database.database);
+
+  const unavailable = fixture.database.database.prepare(`
+    SELECT lease_token, actor_id, response_json, replay_state, request_fingerprint
+    FROM workflow_automation_run_requests WHERE idempotency_key = ?
+  `).get(command.idempotencyKey);
+  assert.equal(unavailable.lease_token, null);
+  assert.equal(unavailable.actor_id, originalActor.id);
+  assert.equal(unavailable.replay_state, "unavailable");
+  assert.doesNotMatch(unavailable.response_json, new RegExp(reclaimed.leaseToken, "i"));
+  assert.doesNotMatch(unavailable.request_fingerprint, new RegExp(original.leaseToken, "i"));
+  assert.doesNotMatch(unavailable.request_fingerprint, new RegExp(reclaimed.leaseToken, "i"));
+
+  assert.throws(
+    () => fixture.runs.dispatch(created.automationRun.runId, command, { actor: originalActor }),
+    (error) => error?.status === 409 && error?.code === "AUTOMATION_RUN_REPLAY_UNAVAILABLE",
+  );
+  assert.throws(
+    () => fixture.runs.dispatch(created.automationRun.runId, command, { actor: reclaimingActor }),
+    (error) => error?.status === 409 && error?.code === "AUTOMATION_RUN_IDEMPOTENCY_CONFLICT",
+  );
+  assert.notEqual(reclaimed.leaseToken, original.leaseToken);
 });
 
 test("shadow and disabled policies record stage entry without a dispatchable effect", async () => {
