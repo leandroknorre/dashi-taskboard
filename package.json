@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=22.5"
+    "node": ">=22.6"
   },
   "bin": {
     "taskctl": "./cli/taskctl.mjs"
@@ -34,7 +34,7 @@
     "taskctl": "node cli/taskctl.mjs",
     "test": "npm run test:node && npm run test:vitest",
     "test:node": "node scripts/run-node-tests.mjs",
-    "test:vitest": "vitest run web/src/components/MarkdownDocument.test.tsx web/src/components/GanttView.test.tsx --environment jsdom",
+    "test:vitest": "vitest run --config web/vite.config.ts",
     "test:components": "npm run test:vitest",
     "test:gantt-workflow": "npm run build:web && node --test test/gantt-workflow-async.e2e.test.mjs",
     "test:cloud": "node --test test/cloud-shared-worker.test.mjs",
