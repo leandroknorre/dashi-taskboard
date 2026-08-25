@@ -1,4 +1,4 @@
-import type { CSSProperties } from "react";
+import { useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type PointerEvent, type WheelEvent } from "react";
 import type { NestedWorkspace, NestedWorkspaceItem, TaskRollup } from "../types";
 import type { WorkspaceView } from "../issueRoute";
 import { useTaskboardI18n } from "../i18n";
@@ -121,6 +121,165 @@ function WorkspaceTree({ items, onOpenTask }: { items: NestedWorkspaceItem[]; on
   );
 }
 
+type MindMapNode = Pick<NestedWorkspaceItem, "id" | "identifier" | "projectId" | "title" | "status" | "macroBucket" | "parentId" | "depth" | "path">;
+
+function WorkspaceMindMap({
+  workspace,
+  items,
+  onOpenTask,
+  onOpenWorkspace,
+}: Pick<NestedWorkspaceViewProps, "workspace" | "onOpenTask" | "onOpenWorkspace"> & { items: NestedWorkspaceItem[] }) {
+  const { text } = useTaskboardI18n();
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 24, y: 24 });
+  const drag = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
+  const root: MindMapNode = useMemo(() => ({
+    id: workspace.overview.id,
+    identifier: workspace.overview.identifier,
+    projectId: workspace.overview.projectId,
+    title: workspace.overview.title,
+    status: workspace.overview.status,
+    macroBucket: workspace.overview.macroBucket,
+    parentId: null,
+    depth: 0,
+    path: [workspace.overview.id],
+  }), [workspace.overview]);
+  const nodes = useMemo(() => [root, ...items.filter((item) => item.id !== root.id)], [items, root]);
+  const layout = useMemo(() => {
+    const positions = new Map<string, { x: number; y: number }>();
+    nodes.forEach((node, index) => positions.set(node.id, { x: node.depth * 236, y: index * 100 }));
+    return positions;
+  }, [nodes]);
+  const canvasWidth = Math.max(640, ...nodes.map((node) => (layout.get(node.id)?.x ?? 0) + 220));
+  const canvasHeight = Math.max(220, nodes.length * 100);
+  const setClampedZoom = (value: number) => setZoom(Math.min(2, Math.max(0.5, Number(value.toFixed(2)))));
+  const onPointerDown = (event: PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    drag.current = { x: event.clientX, y: event.clientY, panX: pan.x, panY: pan.y };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+  const onPointerMove = (event: PointerEvent<HTMLDivElement>) => {
+    if (!drag.current) return;
+    setPan({ x: drag.current.panX + event.clientX - drag.current.x, y: drag.current.panY + event.clientY - drag.current.y });
+  };
+  const endPointer = () => { drag.current = null; };
+  const onWheel = (event: WheelEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setClampedZoom(zoom + (event.deltaY < 0 ? 0.1 : -0.1));
+  };
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    const step = 36;
+    if (event.key === "+" || event.key === "=") { event.preventDefault(); setClampedZoom(zoom + 0.1); }
+    else if (event.key === "-") { event.preventDefault(); setClampedZoom(zoom - 0.1); }
+    else if (event.key === "ArrowLeft") { event.preventDefault(); setPan((current) => ({ ...current, x: current.x + step })); }
+    else if (event.key === "ArrowRight") { event.preventDefault(); setPan((current) => ({ ...current, x: current.x - step })); }
+    else if (event.key === "ArrowUp") { event.preventDefault(); setPan((current) => ({ ...current, y: current.y + step })); }
+    else if (event.key === "ArrowDown") { event.preventDefault(); setPan((current) => ({ ...current, y: current.y - step })); }
+  };
+  return (
+    <section className="workspace-mindmap" aria-label={text("工作区思维导图", "Workspace mind map")}>
+      <div className="workspace-projection-controls" aria-label={text("思维导图控制", "Mind map controls")}>
+        <button type="button" onClick={() => setClampedZoom(zoom - 0.1)}>{text("缩小", "Zoom out")}</button>
+        <output aria-live="polite">{Math.round(zoom * 100)}%</output>
+        <button type="button" onClick={() => setClampedZoom(zoom + 0.1)}>{text("放大", "Zoom in")}</button>
+        <button type="button" onClick={() => { setZoom(1); setPan({ x: 24, y: 24 }); }}>{text("重置", "Reset view")}</button>
+      </div>
+      <div
+        className="workspace-mindmap-viewport"
+        tabIndex={0}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={endPointer}
+        onPointerCancel={endPointer}
+        onWheel={onWheel}
+        onKeyDown={onKeyDown}
+        aria-label={text("思维导图。使用箭头键平移，加号和减号缩放。", "Mind map. Use arrow keys to pan and plus or minus to zoom.")}
+      >
+        <div className="workspace-mindmap-canvas" style={{ width: canvasWidth, height: canvasHeight, transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}>
+          <svg className="workspace-mindmap-edges" width={canvasWidth} height={canvasHeight} aria-hidden="true">
+            {nodes.filter((node) => node.id !== root.id).map((node) => {
+              const child = layout.get(node.id)!;
+              const parent = layout.get(nodes.some((candidate) => candidate.id === node.parentId) ? node.parentId! : root.id)!;
+              return <path key={node.id} d={`M ${parent.x + 198} ${parent.y + 31} C ${parent.x + 216} ${parent.y + 31}, ${child.x - 18} ${child.y + 31}, ${child.x} ${child.y + 31}`} />;
+            })}
+          </svg>
+          {nodes.map((node) => {
+            const position = layout.get(node.id)!;
+            const isRoot = node.id === root.id;
+            return (
+              <button
+                className={`workspace-mindmap-node${isRoot ? " is-root" : ""}`}
+                type="button"
+                key={node.id}
+                style={{ left: position.x, top: position.y }}
+                onClick={() => isRoot ? onOpenWorkspace(node.identifier) : onOpenTask(node)}
+              >
+                <small>{node.identifier}</small>
+                <strong>{node.title}</strong>
+                <span>{node.status.replace(/_/g, " ")} · {MACRO_BUCKET_LABELS[node.macroBucket]}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+type TimelineItem = NestedWorkspaceItem;
+const TIMELINE_DATES: Array<[keyof Pick<TimelineItem, "startDate" | "dueDate" | "createdAt" | "updatedAt">, string]> = [
+  ["startDate", "Start"], ["dueDate", "Due"], ["createdAt", "Created"], ["updatedAt", "Updated"],
+];
+
+function timelineDate(item: TimelineItem) {
+  for (const [key, label] of TIMELINE_DATES) {
+    const value = item[key];
+    const date = value && /^\d{4}-\d{2}-\d{2}$/.test(value)
+      ? new Date(`${value}T00:00:00`)
+      : value ? new Date(value) : null;
+    if (date && !Number.isNaN(date.getTime())) return { value, label, date, time: date.getTime() };
+  }
+  return null;
+}
+
+function WorkspaceTimeline({ items, onOpenTask }: { items: NestedWorkspaceItem[]; onOpenTask: NestedWorkspaceViewProps["onOpenTask"] }) {
+  const { locale, text } = useTaskboardI18n();
+  const ordered = useMemo(() => [...items].sort((left, right) => {
+    const leftDate = timelineDate(left);
+    const rightDate = timelineDate(right);
+    if (leftDate && rightDate && leftDate.time !== rightDate.time) return leftDate.time - rightDate.time;
+    if (leftDate && !rightDate) return -1;
+    if (!leftDate && rightDate) return 1;
+    return left.identifier.localeCompare(right.identifier);
+  }), [items]);
+  const formatDate = (date: Date) => new Intl.DateTimeFormat(locale, { dateStyle: "medium" }).format(date);
+  return (
+    <section className="workspace-timeline" aria-label={text("工作区时间线", "Workspace timeline")}>
+      <p className="workspace-projection-note">{text("按开始、截止、创建、更新时间排序；未提供日期的项目仍会显示。", "Sorted by start, due, creation, then update time; undated items remain visible.")}</p>
+      <ol>
+        {ordered.map((item) => {
+          const date = timelineDate(item);
+          const scheduled = Boolean(item.startDate || item.dueDate);
+          return (
+            <li className={scheduled ? "" : "is-undated"} key={item.id}>
+              <span className="workspace-timeline-marker" aria-hidden="true" />
+              <button type="button" onClick={() => onOpenTask(item)}>
+                <time dateTime={date?.value ?? undefined}>
+                  {date ? `${date.label}: ${formatDate(date.date)}` : text("无日期", "No date")}
+                  {!scheduled && ` · ${text("未安排日期", "No scheduled date")}`}
+                </time>
+                <span className="workspace-timeline-copy"><small>{item.identifier}</small><strong>{item.title}</strong></span>
+                <StatusChip item={item} />
+                <span className="workspace-timeline-bucket">{MACRO_BUCKET_LABELS[item.macroBucket]}</span>
+              </button>
+            </li>
+          );
+        })}
+      </ol>
+    </section>
+  );
+}
+
 export function NestedWorkspaceView({
   workspace,
   rollup,
@@ -160,7 +319,7 @@ export function NestedWorkspaceView({
 
       <div className="nested-workspace-toolbar">
         <div className="view-tabs" role="tablist" aria-label={text("工作区视图", "Workspace views")}>
-          {(["overview", "board", "list", "tree"] as const).map((candidate) => (
+          {(["overview", "board", "list", "tree", "mindmap", "timeline"] as const).map((candidate) => (
             <button
               className={`view-tab${view === candidate ? " active" : ""}`}
               type="button"
@@ -171,7 +330,7 @@ export function NestedWorkspaceView({
               key={candidate}
               onClick={() => onViewChange(candidate)}
             >
-              {candidate[0].toUpperCase() + candidate.slice(1)}
+              {candidate === "mindmap" ? "Mind Map" : candidate[0].toUpperCase() + candidate.slice(1)}
             </button>
           ))}
         </div>
@@ -189,10 +348,12 @@ export function NestedWorkspaceView({
         aria-labelledby={`nested-workspace-tab-${view}`}
       >
         {view === "overview" ? <WorkspaceOverview workspace={workspace} rollup={rollup} />
+          : view === "mindmap" ? <WorkspaceMindMap workspace={workspace} items={items} onOpenTask={onOpenTask} onOpenWorkspace={onOpenWorkspace} />
           : items.length === 0 ? <p className="nested-workspace-empty">{text("没有可显示的子项。", "No child items to show.")}</p>
           : view === "board" ? <WorkspaceBoard items={items} onOpenTask={onOpenTask} />
           : view === "list" ? <WorkspaceList items={items} onOpenTask={onOpenTask} />
-          : <WorkspaceTree items={items} onOpenTask={onOpenTask} />}
+          : view === "tree" ? <WorkspaceTree items={items} onOpenTask={onOpenTask} />
+          : <WorkspaceTimeline items={items} onOpenTask={onOpenTask} />}
       </div>
 
       {view !== "overview" && page.nextCursor && (

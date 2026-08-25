@@ -1223,6 +1223,10 @@ test("nested workspace keeps the local read-model contract in cloud", async () =
   assert.equal(direct.body.workspace.overview.status, "todo");
   assert.equal(direct.body.workspace.overview.macroBucket, "ready");
   assert.equal(Object.hasOwn(direct.body.workspace.overview, "relations"), false);
+  assert.deepEqual(
+    Object.keys(direct.body.workspace.children.items[0]).filter((key) => ["startDate", "dueDate", "createdAt", "updatedAt"].includes(key)).sort(),
+    ["createdAt", "dueDate", "startDate", "updatedAt"],
+  );
   assert.equal(Object.hasOwn(direct.body.workspace, "descendants"), false);
   assert.equal(Object.hasOwn(direct.body.workspace, "rollup"), false);
   const nextChild = await cloud.request(

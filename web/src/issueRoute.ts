@@ -1,7 +1,7 @@
 const ISSUE_QUERY_PARAM = "issue";
 const WORKSPACE_QUERY_PARAM = "workspace";
 
-export const WORKSPACE_VIEWS = ["overview", "board", "list", "tree"] as const;
+export const WORKSPACE_VIEWS = ["overview", "board", "list", "tree", "mindmap", "timeline"] as const;
 export type WorkspaceView = (typeof WORKSPACE_VIEWS)[number];
 
 export function readIssueIdentifier(search: string): string | null {

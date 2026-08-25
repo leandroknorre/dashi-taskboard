@@ -22,6 +22,12 @@ export function workspaceItemFromRow(row, { parentId = null, depth = 0, path = [
     macroBucket: macroBucketForStatus(row.status),
     priority: row.priority,
     archivedAt: row.archived_at,
+    // Temporal fields are persisted task facts, included so read-only timeline projections
+    // never need to fetch a second task collection.
+    startDate: row.start_date,
+    dueDate: row.due_date,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
     // Parent-edge metadata stays on the relation API. Including it here would couple this
     // read model to optional rollups before rollup semantics are part of the contract.
     parentId,

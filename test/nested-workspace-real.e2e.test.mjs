@@ -126,9 +126,9 @@ async function startReadOnlyProxy(targetOrigin) {
 
 function seedWorkspace(directory) {
   const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
-  const create = (title, status, stageId, description = "") => database.createTask({
+  const create = (title, status, stageId, description = "", dates = {}) => database.createTask({
     projectId: "alpha", title, description, status, stageId, priority: "none", labels: [], actor,
-    assignee: actor, developmentContext: null, startDate: null, dueDate: null, recurrence: null,
+    assignee: actor, developmentContext: null, startDate: dates.startDate ?? null, dueDate: dates.dueDate ?? null, recurrence: null,
   });
   const relate = (child, parent, metadata = undefined) => database.addTaskRelation(
     child.id, child.version, "parent", parent.id, null, null, actor, "manual", metadata,
@@ -153,7 +153,8 @@ function seedWorkspace(directory) {
     for (let index = 0; index < 62; index += 1) {
       const status = ["todo", "in_progress", "in_review", "blocked", "done"][index % 5];
       const stageId = status === "todo" ? (index % 2 ? todoA.stageId : todoB.stageId) : stageFor(status).stageId;
-      direct.push(relate(create(`Direct child ${String(index + 1).padStart(2, "0")}`, status, stageId), root));
+      const dates = index % 2 === 0 ? { startDate: `2026-08-${String((index % 28) + 1).padStart(2, "0")}` } : {};
+      direct.push(relate(create(`Direct child ${String(index + 1).padStart(2, "0")}`, status, stageId, "", dates), root));
     }
     const deepOne = relate(create("Deep descendant one", "in_progress", stageFor("in_progress").stageId), direct[0]);
     const deepTwo = relate(create("Deep descendant two", "todo", todoA.stageId), deepOne);
@@ -216,10 +217,35 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     await cdp.evaluate(`history.back(); true`);
     await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-super-card")?.textContent?.includes("Release workspace")`), "History back did not return to root after forward");
 
-    for (const view of ["Board", "List", "Tree"]) {
+    for (const view of ["Board", "List", "Tree", "Mind Map", "Timeline"]) {
       await cdp.evaluate(`(() => { const button = [...document.querySelectorAll(".view-tab")].find((node) => node.textContent?.trim() === ${JSON.stringify(view)}); if (!(button instanceof HTMLButtonElement)) return false; button.click(); return true; })()`);
-      await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-${view.toLowerCase()}")?.textContent?.includes("Direct child")`), `${view} tab did not render direct children`);
+      const panel = view === "Mind Map" ? "mindmap" : view.toLowerCase();
+      await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-${panel}")?.textContent?.includes("Direct child")`), `${view} tab did not render direct children`);
     }
+    await cdp.evaluate(`document.querySelector("#nested-workspace-tab-mindmap")?.click(); true`);
+    const mapNodes = await cdp.evaluate(`document.querySelectorAll(".workspace-mindmap-node").length`);
+    assert.ok(mapNodes > 1, "Mind Map must render the root and loaded workspace items");
+    await cdp.evaluate(`document.querySelector("#nested-workspace-tab-timeline")?.click(); true`);
+    const projectionDesktop = await cdp.evaluate(`(() => ({
+      timelineRows: document.querySelectorAll(".workspace-timeline li").length,
+      undated: document.querySelectorAll(".workspace-timeline .is-undated").length,
+    }))()`);
+    assert.ok(
+      projectionDesktop.timelineRows > 0
+        && projectionDesktop.undated > 0
+        && projectionDesktop.undated < projectionDesktop.timelineRows,
+      `Timeline must render both persisted scheduled and unscheduled items: ${JSON.stringify(projectionDesktop)}`,
+    );
+    await cdp.send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: false });
+    const projectionNarrow = await cdp.evaluate(`(() => ({
+      timelineExists: Boolean(document.querySelector(".workspace-timeline")),
+      timelineOverflow: document.querySelector(".workspace-timeline")?.scrollWidth > innerWidth,
+    }))()`);
+    assert.equal(projectionNarrow.timelineExists, true, "Timeline must remain visible at narrow width");
+    assert.equal(projectionNarrow.timelineOverflow, false, "Timeline must fit a narrow desktop viewport");
+    await cdp.evaluate(`document.querySelector("#nested-workspace-tab-mindmap")?.click(); true`);
+    assert.equal(await cdp.evaluate(`document.querySelector(".workspace-mindmap-viewport")?.getAttribute("tabindex")`), "0", "Mind Map pan/zoom surface must remain keyboard focusable at narrow width");
+    await cdp.send("Emulation.setDeviceMetricsOverride", { width: 1366, height: 768, deviceScaleFactor: 1, mobile: false });
     await cdp.evaluate(`document.querySelector(".nested-workspace-super-card")?.click(); true`);
     await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-overview")?.textContent?.includes("Manual purpose")`), "Super-card did not return the current workspace to Overview");
     await cdp.evaluate(`document.querySelector("#nested-workspace-tab-tree")?.click(); true`);

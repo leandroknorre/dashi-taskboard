@@ -39,7 +39,7 @@ test("closing issue detail removes only the issue route", () => {
   assert.deepEqual(url.searchParams.getAll("label"), ["缺陷"]);
 });
 
-test("nested workspace route preserves issue context and accepts only public v1 views", () => {
+test("nested workspace route preserves issue context and accepts public projection views", () => {
   const url = buildWorkspaceUrl(
     "http://127.0.0.1:47823/?host=codex&project=local&issue=LOCAL-72&filter=mine",
     "LOCAL-73",
@@ -51,7 +51,9 @@ test("nested workspace route preserves issue context and accepts only public v1 
   assert.equal(readIssueIdentifier(url.search), "LOCAL-72");
   assert.equal(url.searchParams.get("host"), "codex");
   assert.equal(url.searchParams.get("filter"), "mine");
-  assert.equal(readWorkspaceView("?workspace=LOCAL-73&view=timeline"), "overview");
+  assert.equal(readWorkspaceView("?workspace=LOCAL-73&view=timeline"), "timeline");
+  assert.equal(readWorkspaceView("?workspace=LOCAL-73&view=mindmap"), "mindmap");
+  assert.equal(readWorkspaceView("?workspace=LOCAL-73&view=unknown"), "overview");
 });
 
 test("the app restores issue detail from the URL and follows browser history", () => {

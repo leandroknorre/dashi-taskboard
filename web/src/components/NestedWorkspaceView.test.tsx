@@ -45,7 +45,7 @@ const rollup: TaskRollup = {
   provenance: { kind: "structural-parent", relationType: "parent", sourceTaskIds: ["child", "grandchild"] },
 };
 
-function renderWorkspace(view: "overview" | "board" | "list" | "tree" = "overview") {
+function renderWorkspace(view: "overview" | "board" | "list" | "tree" | "mindmap" | "timeline" = "overview", descendants = false) {
   const onViewChange = vi.fn();
   const onDescendantsChange = vi.fn();
   const onLoadMore = vi.fn();
@@ -57,7 +57,7 @@ function renderWorkspace(view: "overview" | "board" | "list" | "tree" = "overvie
         workspace={workspace}
         rollup={rollup}
         view={view}
-        descendants={false}
+        descendants={descendants}
         loadingMore={false}
         onViewChange={onViewChange}
         onDescendantsChange={onDescendantsChange}
@@ -103,5 +103,44 @@ describe("NestedWorkspaceView", () => {
     expect(screen.getByRole("tablist", { name: "Workspace views" })).toBeTruthy();
     expect(screen.getByRole("tab", { name: "List" }).getAttribute("aria-selected")).toBe("true");
     expect(screen.getByRole("tabpanel").getAttribute("aria-labelledby")).toBe("nested-workspace-tab-list");
+  });
+
+  it("renders a keyboard-operable mind map from the workspace hierarchy", () => {
+    const { onOpenTask, onOpenWorkspace } = renderWorkspace("mindmap", true);
+    const map = screen.getByLabelText(/Mind map\. Use arrow keys/);
+    expect(screen.getByRole("button", { name: /TASK-1.*Release workspace/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /TASK-3.*Verify list/i })).toBeTruthy();
+    fireEvent.keyDown(map, { key: "+" });
+    expect(screen.getByText("110%")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /TASK-3.*Verify list/i }));
+    expect(onOpenTask).toHaveBeenCalledWith(expect.objectContaining({ identifier: "TASK-3" }));
+    fireEvent.click(screen.getByRole("button", { name: /TASK-1.*Release workspace/i }));
+    expect(onOpenWorkspace).toHaveBeenCalledWith("TASK-1");
+  });
+
+  it("keeps the workspace root visible in a mind map with no loaded children", () => {
+    const originalChildren = workspace.children.items;
+    workspace.children.items = [];
+    renderWorkspace("mindmap");
+    expect(screen.getByRole("button", { name: /TASK-1.*Release workspace/i })).toBeTruthy();
+    workspace.children.items = originalChildren;
+  });
+
+  it("orders the timeline deterministically and preserves real stage and macro bucket", () => {
+    const originalItems = workspace.descendants!.items;
+    workspace.descendants!.items = [
+      { ...originalItems[0], createdAt: "2026-08-30T12:00:00.000Z" },
+      { ...originalItems[1], startDate: "2026-08-25" },
+    ];
+    const { onOpenTask } = renderWorkspace("timeline", true);
+    const timelineItems = screen.getAllByRole("listitem");
+    expect(timelineItems[0].textContent).toContain("Verify list");
+    expect(timelineItems[1].textContent).toContain("Build board");
+    expect(screen.getByText("in review")).toBeTruthy();
+    expect(screen.getByText("Review")).toBeTruthy();
+    expect(screen.getByText(/No scheduled date/)).toBeTruthy();
+    fireEvent.click(screen.getByText("Verify list"));
+    expect(onOpenTask).toHaveBeenCalledWith(expect.objectContaining({ identifier: "TASK-3" }));
+    workspace.descendants!.items = originalItems;
   });
 });

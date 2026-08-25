@@ -451,6 +451,11 @@ export interface NestedWorkspaceItem {
   parentId: string | null;
   depth: number;
   path: string[];
+  /** Persisted task facts included by the read-only workspace projection. */
+  startDate: string | null;
+  dueDate: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface NestedWorkspaceOverview extends Omit<Task, "relations" | "conversationRefs" | "participants" | "previewImage" | "activityKey" | "activityUpdatedAt"> {

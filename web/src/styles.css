@@ -342,10 +342,41 @@ kbd {
 .nested-workspace-empty { color: var(--text-secondary); }
 .nested-workspace-load-more { margin-top: 16px; }
 
+.workspace-projection-controls { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; }
+.workspace-projection-controls button { min-height: 28px; padding: 0 9px; border: var(--border-hairline) solid var(--border); border-radius: 5px; background: var(--surface-raised); color: var(--text-secondary); cursor: pointer; font-size: 12px; }
+.workspace-projection-controls button:hover { border-color: var(--accent); color: var(--text-primary); }
+.workspace-projection-controls output { min-width: 42px; color: var(--text-tertiary); font-size: 12px; text-align: center; }
+.workspace-mindmap-viewport { min-height: 360px; overflow: hidden; border: var(--border-hairline) solid var(--border); border-radius: 8px; background: var(--surface-hover); cursor: grab; outline-offset: 2px; }
+.workspace-mindmap-viewport:active { cursor: grabbing; }
+.workspace-mindmap-canvas { position: relative; transform-origin: top left; transition: transform 100ms ease-out; }
+.workspace-mindmap-edges { position: absolute; inset: 0; overflow: visible; }
+.workspace-mindmap-edges path { fill: none; stroke: var(--border-strong); stroke-width: 2; }
+.workspace-mindmap-node { position: absolute; display: grid; width: 198px; min-height: 62px; gap: 3px; padding: 9px 10px; border: var(--border-hairline) solid var(--border); border-radius: 7px; background: var(--surface-raised); color: var(--text-primary); cursor: pointer; text-align: left; box-shadow: 0 2px 5px rgba(0, 0, 0, 0.05); }
+.workspace-mindmap-node:hover, .workspace-mindmap-node:focus-visible { border-color: var(--accent); }
+.workspace-mindmap-node.is-root { border-color: var(--accent); background: var(--surface); }
+.workspace-mindmap-node small, .workspace-timeline-copy small { color: var(--text-tertiary); font-size: 10px; }
+.workspace-mindmap-node strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-mindmap-node span { overflow: hidden; color: var(--text-secondary); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-projection-note { margin: 0 0 12px; color: var(--text-secondary); font-size: 12px; }
+.workspace-timeline ol { position: relative; display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.workspace-timeline ol::before { position: absolute; top: 10px; bottom: 10px; left: 8px; width: 2px; background: var(--border); content: ""; }
+.workspace-timeline li { position: relative; padding-left: 24px; }
+.workspace-timeline-marker { position: absolute; z-index: 1; top: 14px; left: 3px; width: 12px; height: 12px; border: 2px solid var(--accent); border-radius: 50%; background: var(--surface-raised); }
+.workspace-timeline li.is-undated .workspace-timeline-marker { border-color: var(--text-tertiary); }
+.workspace-timeline li > button { display: grid; grid-template-columns: minmax(112px, max-content) minmax(0, 1fr) max-content max-content; width: 100%; align-items: center; gap: 10px; padding: 10px 12px; border: var(--border-hairline) solid var(--border); border-radius: 7px; background: var(--surface-raised); color: var(--text-primary); cursor: pointer; text-align: left; }
+.workspace-timeline li > button:hover { border-color: var(--accent); }
+.workspace-timeline time { color: var(--text-secondary); font-size: 11px; white-space: nowrap; }
+.workspace-timeline-copy { display: grid; min-width: 0; gap: 2px; }
+.workspace-timeline-copy strong { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-timeline-bucket { color: var(--text-tertiary); font-size: 11px; }
+
 @media (max-width: 760px) {
   .nested-workspace-view { padding: 16px; }
   .nested-workspace-overview { grid-template-columns: 1fr; }
   .nested-workspace-toolbar { align-items: flex-start; flex-direction: column; }
+  .workspace-timeline li > button { grid-template-columns: minmax(0, 1fr) max-content; }
+  .workspace-timeline time { grid-column: 1 / -1; }
+  .workspace-timeline-bucket { display: none; }
 }
 
 .app-shell {
