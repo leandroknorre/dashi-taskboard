@@ -3587,6 +3587,24 @@ export function createTaskboardServer(options = {}) {
 
   const cloudRealtimeServer = new WebSocketServer({ noServer: true });
   const cloudRealtimeSockets = new Set();
+  let lifecycle = "open";
+  let listening = false;
+  let listenPromise = null;
+  let closePromise = null;
+
+  function appClosedError() {
+    const error = new Error("APP_CLOSED: Taskboard server cannot listen after shutdown begins");
+    error.code = "APP_CLOSED";
+    return error;
+  }
+
+  function isClosing() {
+    return lifecycle === "closing" || lifecycle === "closed";
+  }
+
+  function terminateUpgradeSocket(socket) {
+    if (!socket.destroyed) socket.destroy();
+  }
 
   function rejectWebSocketUpgrade(socket, status, message) {
     const body = `${message}\n`;
@@ -3615,6 +3633,10 @@ export function createTaskboardServer(options = {}) {
   server.on("upgrade", async (request, socket, head) => {
     let remoteSocket;
     try {
+      if (isClosing()) {
+        terminateUpgradeSocket(socket);
+        return;
+      }
       const incomingUrl = new URL(request.url, "http://127.0.0.1");
       if (resolved.instanceToken) {
         if (!incomingUrl.pathname.startsWith(`${routePrefix}/`)) {
@@ -3635,6 +3657,10 @@ export function createTaskboardServer(options = {}) {
       }
       assertLoopbackRequest(request);
       const target = await cloudProxy.webSocketTarget("/api/events");
+      if (isClosing()) {
+        terminateUpgradeSocket(socket);
+        return;
+      }
       remoteSocket = new WebSocketClient(target.url, { headers: target.headers });
       const pendingMessages = [];
       const queueMessage = (data, isBinary) => pendingMessages.push({ data, isBinary });
@@ -3661,7 +3687,17 @@ export function createTaskboardServer(options = {}) {
         remoteSocket.once("error", onError);
         remoteSocket.once("close", onClose);
       });
+      if (isClosing()) {
+        remoteSocket.terminate();
+        terminateUpgradeSocket(socket);
+        return;
+      }
       cloudRealtimeServer.handleUpgrade(request, socket, head, (localSocket) => {
+        if (isClosing()) {
+          localSocket.terminate();
+          remoteSocket.terminate();
+          return;
+        }
         const pair = { localSocket, remoteSocket };
         cloudRealtimeSockets.add(pair);
         const removePair = () => cloudRealtimeSockets.delete(pair);
@@ -3696,17 +3732,21 @@ export function createTaskboardServer(options = {}) {
       });
     } catch (error) {
       remoteSocket?.terminate();
-      rejectWebSocketUpgrade(socket, error?.status ?? 502, "WebSocket connection failed");
+      if (isClosing()) terminateUpgradeSocket(socket);
+      else rejectWebSocketUpgrade(socket, error?.status ?? 502, "WebSocket connection failed");
     }
   });
 
-  let listening = false;
-  let closePromise = null;
-
-  function closeHttpServer() {
-    if (!listening) return Promise.resolve();
+  async function closeHttpServer() {
+    await listenPromise?.catch(() => {});
+    if (!listening && !server.listening) return;
     return new Promise((resolve, reject) => {
-      server.close((error) => error ? reject(error) : resolve());
+      try {
+        server.close((error) => error ? reject(error) : resolve());
+      } catch (error) {
+        reject(error);
+        return;
+      }
       // server.close() deliberately waits for active requests.  That is the
       // right default for ordinary shutdown, but a taskboard process must be
       // able to stop while a browser holds an SSE or keep-alive connection.
@@ -3721,19 +3761,6 @@ export function createTaskboardServer(options = {}) {
     // Stop realtime producers before closing HTTP connections.  In
     // particular, EventHub and the AI stream both own timers and responses
     // that otherwise keep server.close() pending indefinitely.
-    for (const { localSocket, remoteSocket } of cloudRealtimeSockets) {
-      localSocket.terminate();
-      remoteSocket.terminate();
-    }
-    cloudRealtimeSockets.clear();
-    cloudRealtimeServer.close();
-    events.close();
-    for (const response of aiEventResponses) response.end();
-    aiEventResponses.clear();
-
-    // Start the listener shutdown before awaiting the longer-lived services,
-    // then force any remaining keep-alive sockets closed.
-    const serverClosed = closeHttpServer();
     let firstError = null;
     const closeStep = async (operation) => {
       try {
@@ -3742,10 +3769,23 @@ export function createTaskboardServer(options = {}) {
         firstError ??= error;
       }
     };
+    for (const { localSocket, remoteSocket } of cloudRealtimeSockets) {
+      await closeStep(() => localSocket.terminate());
+      await closeStep(() => remoteSocket.terminate());
+    }
+    cloudRealtimeSockets.clear();
+    await closeStep(() => cloudRealtimeServer.close());
+    await closeStep(() => events.close());
+    for (const response of aiEventResponses) await closeStep(() => response.end());
+    aiEventResponses.clear();
+
+    // Start the listener shutdown before awaiting the longer-lived services,
+    // then force any remaining keep-alive sockets closed.
+    const serverClosed = closeStep(() => closeHttpServer());
     try {
       await closeStep(() => aiChat.close());
       await closeStep(() => projectSummary.close());
-      await closeStep(() => serverClosed);
+      await serverClosed;
     } finally {
       listening = false;
     }
@@ -3759,13 +3799,14 @@ export function createTaskboardServer(options = {}) {
     server,
     options: resolved,
     async listen({ host = "127.0.0.1", port = resolvePort(), fd = null } = {}) {
+      if (isClosing()) throw appClosedError();
       if (host !== "127.0.0.1" && host !== "0.0.0.0") {
         throw new Error("Taskboard server must bind to 127.0.0.1 or 0.0.0.0");
       }
       if (fd !== null && (!Number.isInteger(fd) || fd < 3 || fd > 255)) {
         throw new Error("Taskboard server listen fd must be an inherited file descriptor");
       }
-      await new Promise((resolve, reject) => {
+      listenPromise = new Promise((resolve, reject) => {
         const onError = (error) => {
           server.off("listening", onListening);
           reject(error);
@@ -3779,11 +3820,20 @@ export function createTaskboardServer(options = {}) {
         if (fd === null) server.listen(port, host);
         else server.listen({ fd });
       });
+      try {
+        await listenPromise;
+      } finally {
+        listenPromise = null;
+      }
       listening = true;
+      if (isClosing()) throw appClosedError();
       return server.address();
     },
     close() {
-      if (!closePromise) closePromise = closeOnce();
+      if (!closePromise) {
+        lifecycle = "closing";
+        closePromise = closeOnce().finally(() => { lifecycle = "closed"; });
+      }
       return closePromise;
     },
   };

@@ -173,6 +173,80 @@ test("close is concurrent-safe and terminates persistent SSE connections", async
     request.end();
   }), { code: "ECONNREFUSED" });
   assert.throws(() => app.database.database.prepare("SELECT 1").get());
+  assert.strictEqual(app.close(), firstClose);
+});
+
+test("close before listen permanently seals the app", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-close-before-listen-"));
+  const app = createTaskboardServer({ dataDirectory: directory });
+  runningApps.push({ app, directory });
+
+  const firstClose = app.close();
+  const secondClose = app.close();
+  assert.strictEqual(firstClose, secondClose);
+  await completeWithin(firstClose, 1_000, "close before listen");
+  assert.strictEqual(app.close(), firstClose);
+  await assert.rejects(
+    () => app.listen({ host: "127.0.0.1", port: 0 }),
+    { code: "APP_CLOSED" },
+  );
+  assert.equal(app.server.listening, false);
+});
+
+test("shutdown terminates an upgrade delayed before its cloud target opens", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-upgrade-shutdown-"));
+  const upstream = createServer();
+  let upstreamConnections = 0;
+  upstream.on("connection", () => { upstreamConnections += 1; });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const upstreamAddress = upstream.address();
+  let releaseConfig;
+  let configRequestedResolve;
+  const configRequested = new Promise((resolve) => { configRequestedResolve = resolve; });
+  const configRelease = new Promise((resolve) => { releaseConfig = resolve; });
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    cloudConfigStore: {
+      async read() {
+        configRequestedResolve();
+        return configRelease;
+      },
+    },
+  });
+  runningApps.push({ app, directory });
+  const address = await app.listen({ host: "127.0.0.1", port: 0 });
+  const client = new WebSocket(`ws://127.0.0.1:${address.port}/api/events`);
+  const clientClosed = new Promise((resolve) => {
+    client.once("close", resolve);
+    client.once("error", () => {});
+  });
+
+  try {
+    await completeWithin(configRequested, 1_000, "cloud configuration read");
+    const closing = app.close();
+    releaseConfig({
+      remoteUrl: `http://127.0.0.1:${upstreamAddress.port}`,
+      actorName: "test-actor",
+      sharedKey: "test-shared-key",
+      projectMappings: {},
+      threadBindings: {},
+    });
+    await completeWithin(Promise.all([closing, clientClosed]), 1_000, "upgrade shutdown");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(upstreamConnections, 0);
+    assert.equal(app.server.listening, false);
+  } finally {
+    releaseConfig?.({
+      remoteUrl: `http://127.0.0.1:${upstreamAddress.port}`,
+      actorName: "test-actor",
+      sharedKey: "test-shared-key",
+      projectMappings: {},
+      threadBindings: {},
+    });
+    client.terminate();
+    await app.close();
+    await new Promise((resolve) => upstream.close(resolve));
+  }
 });
 
 test("launcher mode proves service identity and hides every route behind its instance token", async () => {
