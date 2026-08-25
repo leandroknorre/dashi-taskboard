@@ -16,6 +16,8 @@ import { TaskboardDatabase } from "../server/database.mjs";
 
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
 const actor = { type: "user", id: "workspace-e2e", name: "Workspace E2E", avatarUrl: null };
+const cdpTimeoutMs = 10_000;
+const teardownTimeoutMs = 5_000;
 
 function chromeExecutable() {
   return [process.env.CHROME_BIN, "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser"]
@@ -23,6 +25,20 @@ function chromeExecutable() {
 }
 
 function wait(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+async function withTimeout(promise, timeoutMs, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 async function eventually(action, message, timeoutMs = 12_000) {
   const deadline = Date.now() + timeoutMs;
@@ -48,26 +64,85 @@ async function chromeDebugPort(profile) {
 
 async function connectCdp(port) {
   const target = await eventually(async () => {
-    const response = await fetch(`http://127.0.0.1:${port}/json/list`);
+    const response = await fetch(`http://127.0.0.1:${port}/json/list`, {
+      signal: AbortSignal.timeout(cdpTimeoutMs),
+    });
     if (!response.ok) return null;
     return (await response.json()).find((entry) => entry.type === "page") ?? null;
   }, "Chrome page target did not become available");
   const socket = new WebSocket(target.webSocketDebuggerUrl);
-  await once(socket, "open");
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      socket.terminate();
+      reject(new Error("Chrome DevTools WebSocket did not open"));
+    }, cdpTimeoutMs);
+    const cleanup = () => {
+      clearTimeout(timeout);
+      socket.off("open", onOpen);
+      socket.off("error", onError);
+    };
+    const onOpen = () => { cleanup(); resolve(); };
+    const onError = (error) => { cleanup(); reject(error); };
+    socket.once("open", onOpen);
+    socket.once("error", onError);
+  });
   let sequence = 0;
   const pending = new Map();
+  let disposed = false;
+  let disposePromise;
+  let resolveClosed;
+  const closed = new Promise((resolve) => { resolveClosed = resolve; });
+  const rejectPending = (error) => {
+    for (const { reject, timer } of pending.values()) {
+      clearTimeout(timer);
+      reject(error);
+    }
+    pending.clear();
+  };
+  const onError = (error) => rejectPending(error);
+  const onClose = () => {
+    rejectPending(new Error("Chrome DevTools WebSocket closed"));
+    resolveClosed();
+  };
   socket.on("message", (raw) => {
-    const message = JSON.parse(raw);
+    let message;
+    try {
+      message = JSON.parse(raw);
+    } catch {
+      return;
+    }
     const request = pending.get(message.id);
     if (!request) return;
     pending.delete(message.id);
+    clearTimeout(request.timer);
     if (message.error) request.reject(new Error(message.error.message));
     else request.resolve(message.result);
   });
+  socket.on("error", onError);
+  socket.once("close", onClose);
   const send = (method, params = {}) => new Promise((resolve, reject) => {
+    if (disposed || socket.readyState !== WebSocket.OPEN) {
+      reject(new Error(`Chrome DevTools WebSocket is unavailable for ${method}`));
+      return;
+    }
     const id = ++sequence;
-    pending.set(id, { resolve, reject });
-    socket.send(JSON.stringify({ id, method, params }));
+    const fail = (error) => {
+      const request = pending.get(id);
+      if (!request) return;
+      pending.delete(id);
+      clearTimeout(request.timer);
+      request.reject(error);
+    };
+    const timer = setTimeout(() => fail(new Error(`Chrome DevTools command timed out: ${method}`)), cdpTimeoutMs);
+    pending.set(id, { resolve, reject, timer });
+    try {
+      socket.send(JSON.stringify({ id, method, params }), (error) => {
+        if (error) fail(error);
+      });
+    } catch (error) {
+      fail(error);
+    }
   });
   return {
     send,
@@ -76,18 +151,36 @@ async function connectCdp(port) {
       if (result.exceptionDetails) throw new Error(result.exceptionDetails.text);
       return result.result.value;
     },
-    close: () => socket.close(),
+    async close() {
+      if (disposePromise) return disposePromise;
+      disposed = true;
+      rejectPending(new Error("Chrome DevTools client disposed"));
+      disposePromise = (async () => {
+        if (socket.readyState !== WebSocket.CLOSED) socket.close();
+        try {
+          await withTimeout(closed, teardownTimeoutMs, "Chrome DevTools WebSocket did not close");
+        } catch {
+          socket.terminate();
+          await withTimeout(closed, teardownTimeoutMs, "Chrome DevTools WebSocket did not terminate").catch(() => {});
+        } finally {
+          socket.off("error", onError);
+          socket.off("close", onClose);
+        }
+      })();
+      return disposePromise;
+    },
   };
 }
 
 async function stop(child) {
   if (!child || child.exitCode !== null) return;
-  child.kill("SIGTERM");
   const exited = once(child, "exit");
-  await Promise.race([exited, wait(5_000)]);
-  if (child.exitCode === null) {
-    child.kill("SIGKILL");
-    await exited;
+  child.kill("SIGTERM");
+  try {
+    await withTimeout(exited, teardownTimeoutMs, "Chrome did not stop after SIGTERM");
+  } catch {
+    if (child.exitCode === null) child.kill("SIGKILL");
+    await withTimeout(exited, teardownTimeoutMs, "Chrome did not stop after SIGKILL").catch(() => {});
   }
 }
 
@@ -116,7 +209,16 @@ async function startReadOnlyProxy(targetOrigin) {
       upstreamResponse.pipe(response);
     });
     clientRequests.add(upstream);
-    upstream.once("close", () => clientRequests.delete(upstream));
+    const abortUpstream = () => {
+      if (!upstream.destroyed) upstream.destroy();
+    };
+    request.once("aborted", abortUpstream);
+    response.once("close", abortUpstream);
+    upstream.once("close", () => {
+      clientRequests.delete(upstream);
+      request.off("aborted", abortUpstream);
+      response.off("close", abortUpstream);
+    });
     upstream.on("socket", trackSocket);
     upstream.on("error", () => response.destroy());
     request.pipe(upstream);
@@ -197,6 +299,21 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
   }
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-nested-workspace-"));
   let app; let proxy; let child; let cdp;
+  let cleanupPromise;
+  const cleanup = () => {
+    if (cleanupPromise) return cleanupPromise;
+    cleanupPromise = (async () => {
+      await cdp?.close();
+      await stop(child);
+      await proxy?.close();
+      app?.server.closeAllConnections?.();
+      await app?.close();
+      await rm(directory, { recursive: true, force: true });
+    })();
+    return cleanupPromise;
+  };
+  const onAbort = () => { void cleanup(); };
+  t.signal.addEventListener("abort", onAbort, { once: true });
   try {
     const fixture = seedWorkspace(directory);
     app = createTaskboardServer({ dataDirectory: directory });
@@ -310,10 +427,7 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
       assert.deepEqual(database.database.prepare("SELECT * FROM task_relations ORDER BY relation_type, source_task_id, target_task_id").all(), fixture.snapshot.relations, "Read projection must not mutate relations");
     } finally { database.close(); }
   } finally {
-    cdp?.close();
-    await stop(child);
-    await proxy?.close();
-    await app?.close();
-    await rm(directory, { recursive: true, force: true });
+    t.signal.removeEventListener("abort", onAbort);
+    await cleanup();
   }
 });

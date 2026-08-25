@@ -16,6 +16,8 @@ import { TaskboardDatabase } from "../server/database.mjs";
 
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
 const delayMs = 1_800;
+const cdpTimeoutMs = 10_000;
+const teardownTimeoutMs = 5_000;
 
 function chromeExecutable() {
   return [
@@ -30,6 +32,20 @@ function chromeExecutable() {
 
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withTimeout(promise, timeoutMs, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function eventually(action, message, timeoutMs = 10_000) {
@@ -185,7 +201,16 @@ async function startDelayedProxy(targetOrigin) {
       }
     });
     clientRequests.add(upstream);
-    upstream.once("close", () => clientRequests.delete(upstream));
+    const abortUpstream = () => {
+      if (!upstream.destroyed) upstream.destroy();
+    };
+    request.once("aborted", abortUpstream);
+    response.once("close", abortUpstream);
+    upstream.once("close", () => {
+      clientRequests.delete(upstream);
+      request.off("aborted", abortUpstream);
+      response.off("close", abortUpstream);
+    });
     upstream.on("socket", trackSocket);
     upstream.on("error", () => {
       if (!response.headersSent && !response.destroyed) response.writeHead(502).end();
@@ -230,27 +255,86 @@ async function chromeDebugPort(profile) {
 
 async function connectCdp(port) {
   const targets = await eventually(async () => {
-    const response = await fetch(`http://127.0.0.1:${port}/json/list`);
+    const response = await fetch(`http://127.0.0.1:${port}/json/list`, {
+      signal: AbortSignal.timeout(cdpTimeoutMs),
+    });
     if (!response.ok) return null;
     const pages = await response.json();
     return pages.find((candidate) => candidate.type === "page") ?? null;
   }, "Chrome page target did not become available");
   const socket = new WebSocket(targets.webSocketDebuggerUrl);
-  await once(socket, "open");
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      socket.terminate();
+      reject(new Error("Chrome DevTools WebSocket did not open"));
+    }, cdpTimeoutMs);
+    const cleanup = () => {
+      clearTimeout(timeout);
+      socket.off("open", onOpen);
+      socket.off("error", onError);
+    };
+    const onOpen = () => { cleanup(); resolve(); };
+    const onError = (error) => { cleanup(); reject(error); };
+    socket.once("open", onOpen);
+    socket.once("error", onError);
+  });
   let sequence = 0;
   const pending = new Map();
+  let disposed = false;
+  let disposePromise;
+  let resolveClosed;
+  const closed = new Promise((resolve) => { resolveClosed = resolve; });
+  const rejectPending = (error) => {
+    for (const { reject, timer } of pending.values()) {
+      clearTimeout(timer);
+      reject(error);
+    }
+    pending.clear();
+  };
+  const onError = (error) => rejectPending(error);
+  const onClose = () => {
+    rejectPending(new Error("Chrome DevTools WebSocket closed"));
+    resolveClosed();
+  };
   socket.on("message", (raw) => {
-    const message = JSON.parse(raw);
+    let message;
+    try {
+      message = JSON.parse(raw);
+    } catch {
+      return;
+    }
     if (!message.id || !pending.has(message.id)) return;
-    const { resolve, reject } = pending.get(message.id);
+    const { resolve, reject, timer } = pending.get(message.id);
     pending.delete(message.id);
+    clearTimeout(timer);
     if (message.error) reject(new Error(message.error.message));
     else resolve(message.result);
   });
+  socket.on("error", onError);
+  socket.once("close", onClose);
   const send = (method, params = {}) => new Promise((resolve, reject) => {
+    if (disposed || socket.readyState !== WebSocket.OPEN) {
+      reject(new Error(`Chrome DevTools WebSocket is unavailable for ${method}`));
+      return;
+    }
     const id = ++sequence;
-    pending.set(id, { resolve, reject });
-    socket.send(JSON.stringify({ id, method, params }));
+    const fail = (error) => {
+      const request = pending.get(id);
+      if (!request) return;
+      pending.delete(id);
+      clearTimeout(request.timer);
+      request.reject(error);
+    };
+    const timer = setTimeout(() => fail(new Error(`Chrome DevTools command timed out: ${method}`)), cdpTimeoutMs);
+    pending.set(id, { resolve, reject, timer });
+    try {
+      socket.send(JSON.stringify({ id, method, params }), (error) => {
+        if (error) fail(error);
+      });
+    } catch (error) {
+      fail(error);
+    }
   });
   return {
     async evaluate(expression) {
@@ -259,22 +343,36 @@ async function connectCdp(port) {
       return result.result.value;
     },
     send,
-    close() {
-      socket.close();
+    async close() {
+      if (disposePromise) return disposePromise;
+      disposed = true;
+      rejectPending(new Error("Chrome DevTools client disposed"));
+      disposePromise = (async () => {
+        if (socket.readyState !== WebSocket.CLOSED) socket.close();
+        try {
+          await withTimeout(closed, teardownTimeoutMs, "Chrome DevTools WebSocket did not close");
+        } catch {
+          socket.terminate();
+          await withTimeout(closed, teardownTimeoutMs, "Chrome DevTools WebSocket did not terminate").catch(() => {});
+        } finally {
+          socket.off("error", onError);
+          socket.off("close", onClose);
+        }
+      })();
+      return disposePromise;
     },
   };
 }
 
 async function stop(child) {
   if (!child || child.exitCode !== null) return;
-  child.kill("SIGTERM");
   const exited = once(child, "exit");
-  let timeout;
-  await Promise.race([exited, new Promise((resolve) => { timeout = setTimeout(resolve, 5_000); })]);
-  clearTimeout(timeout);
-  if (child.exitCode === null) {
-    child.kill("SIGKILL");
-    await exited;
+  child.kill("SIGTERM");
+  try {
+    await withTimeout(exited, teardownTimeoutMs, "Chrome did not stop after SIGTERM");
+  } catch {
+    if (child.exitCode === null) child.kill("SIGKILL");
+    await withTimeout(exited, teardownTimeoutMs, "Chrome did not stop after SIGKILL").catch(() => {});
   }
 }
 
@@ -291,6 +389,21 @@ test("App repaints real DHTMLX Gantt when the project workflow arrives late", { 
   let proxy;
   let child;
   let cdp;
+  let cleanupPromise;
+  const cleanup = () => {
+    if (cleanupPromise) return cleanupPromise;
+    cleanupPromise = (async () => {
+      await cdp?.close();
+      await stop(child);
+      await proxy?.close();
+      app?.server.closeAllConnections?.();
+      await app?.close();
+      await rm(directory, { recursive: true, force: true });
+    })();
+    return cleanupPromise;
+  };
+  const onAbort = () => { void cleanup(); };
+  t.signal.addEventListener("abort", onAbort, { once: true });
   try {
     seedWorkflowFixture(directory);
     app = createTaskboardServer({ dataDirectory: directory });
@@ -358,11 +471,8 @@ test("App repaints real DHTMLX Gantt when the project workflow arrives late", { 
     assert.match(bottom.text, /Stage 14/);
     assert.match(bottom.text, /Card 14/);
   } finally {
-    cdp?.close();
-    await stop(child);
-    await proxy?.close();
-    await app?.close();
-    await rm(directory, { recursive: true, force: true });
+    t.signal.removeEventListener("abort", onAbort);
+    await cleanup();
   }
 });
 
@@ -378,6 +488,20 @@ test("Board restores each custom stage rail independently when stages share a ca
   let app;
   let child;
   let cdp;
+  let cleanupPromise;
+  const cleanup = () => {
+    if (cleanupPromise) return cleanupPromise;
+    cleanupPromise = (async () => {
+      await cdp?.close();
+      await stop(child);
+      app?.server.closeAllConnections?.();
+      await app?.close();
+      await rm(directory, { recursive: true, force: true });
+    })();
+    return cleanupPromise;
+  };
+  const onAbort = () => { void cleanup(); };
+  t.signal.addEventListener("abort", onAbort, { once: true });
   try {
     seedBoardScrollFixture(directory);
     app = createTaskboardServer({ dataDirectory: directory });
@@ -461,9 +585,7 @@ test("Board restores each custom stage rail independently when stages share a ca
     const secondSaved = await saveScrollAndOpen("Second todo rail", 260);
     assert.notEqual(firstSaved, secondSaved, "the fixture must distinguish the two rail positions");
   } finally {
-    cdp?.close();
-    await stop(child);
-    await app?.close();
-    await rm(directory, { recursive: true, force: true });
+    t.signal.removeEventListener("abort", onAbort);
+    await cleanup();
   }
 });

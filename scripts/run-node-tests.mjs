@@ -35,9 +35,24 @@ assertNodeVersion();
 const files = await nodeTestFiles(testDirectory);
 if (files.length === 0) throw new Error("No Node test files were found");
 
-const result = spawnSync(process.execPath, ["--experimental-strip-types", "--test", ...files], {
-  stdio: "inherit",
-});
+const serializedE2eFiles = new Set([
+  "gantt-workflow-async.e2e.test.mjs",
+  "nested-workspace-real.e2e.test.mjs",
+]);
+const serialFiles = files.filter((filename) => serializedE2eFiles.has(path.basename(filename)));
+const concurrentFiles = files.filter((filename) => !serializedE2eFiles.has(path.basename(filename)));
 
-if (result.error) throw result.error;
-process.exitCode = result.status ?? 1;
+function run(filesToRun, args = []) {
+  if (filesToRun.length === 0) return 0;
+  const result = spawnSync(process.execPath, ["--experimental-strip-types", ...args, "--test", ...filesToRun], {
+    stdio: "inherit",
+  });
+  if (result.error) throw result.error;
+  return result.status ?? 1;
+}
+
+const concurrentStatus = run(concurrentFiles);
+const serialStatus = concurrentStatus === 0
+  ? run(serialFiles, ["--test-concurrency=1"])
+  : 1;
+process.exitCode = concurrentStatus || serialStatus;
