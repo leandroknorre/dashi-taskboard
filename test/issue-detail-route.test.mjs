@@ -72,11 +72,13 @@ test("the app restores issue detail from the URL and follows browser history", (
     appSource.indexOf("function closeTaskDetail"),
   );
   assert.match(openTaskSource, /buildIssueUrl\(window\.location\.href, selectedProjectId, null\)/);
+  assert.match(openTaskSource, /detailWorkspaceOriginScrollRef\.current = !workspaceIdentifier && !currentIssue[\s\S]*?captureWorkspaceOriginScroll\(\)/);
   assert.match(openTaskSource, /window\.history\.replaceState/);
   assert.match(openTaskSource, /window\.history\.pushState/);
   assert.match(appSource, /function closeTaskDetail\(\)[\s\S]*?window\.history\.replaceState/);
   assert.match(appSource, /onEdit=\{openTaskDetail\}/);
   assert.match(appSource, /function openNestedWorkspaceFromDetail[\s\S]*?setDetailTaskIdentifier\(null\)/);
+  assert.match(appSource, /function openNestedWorkspaceFromDetail[\s\S]*?detailOriginScroll \?\? captureWorkspaceOriginScroll\(\)/);
   assert.match(appSource, /onOpenWorkspace=\{openNestedWorkspaceFromDetail\}/);
 });
 

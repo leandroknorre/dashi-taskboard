@@ -860,6 +860,7 @@ export function App() {
   const [ganttViewportVersion, setGanttViewportVersion] = useState(0);
   const detailSourceProjectIdRef = useRef<string | null>(null);
   const pendingDetailSourceScrollRef = useRef<DetailSourceScroll | null>(null);
+  const detailWorkspaceOriginScrollRef = useRef<WorkspaceOriginScroll | null>(null);
   const pendingWorkspaceOriginScrollRef = useRef<WorkspaceOriginScroll | null>(null);
   const nestedWorkspaceRequestRef = useRef(0);
   const nestedWorkspacePageRequestRef = useRef(0);
@@ -1540,6 +1541,9 @@ export function App() {
     const fullTask = tasksRef.current.find((candidate) => candidate.identifier === task.identifier);
     if (fullTask) markTaskRead(fullTask);
     const currentIssue = readIssueIdentifier(window.location.search);
+    detailWorkspaceOriginScrollRef.current = !workspaceIdentifier && !currentIssue
+      ? captureWorkspaceOriginScroll()
+      : null;
     if (!currentIssue) detailSourceProjectIdRef.current = selectedProjectId;
     if (isAllProjects) setSelectedProjectId(task.projectId);
     if (boardView === "list" && issueListRef.current) {
@@ -1578,6 +1582,7 @@ export function App() {
   function closeTaskDetail() {
     const sourceProjectId = detailSourceProjectIdRef.current ?? selectedProjectId;
     detailSourceProjectIdRef.current = null;
+    detailWorkspaceOriginScrollRef.current = null;
     setDetailTaskIdentifier(null);
     if (sourceProjectId !== selectedProjectId) {
       setSelectedProjectId(sourceProjectId);
@@ -1605,6 +1610,7 @@ export function App() {
 
   useEffect(() => {
     function syncRouteFromLocation() {
+      detailWorkspaceOriginScrollRef.current = null;
       const url = new URL(window.location.href);
       const routeProjectId = url.searchParams.get("project") ?? GLOBAL_PROJECT_ID;
       const routeIssueIdentifier = readIssueIdentifier(url.search);
@@ -2519,6 +2525,7 @@ export function App() {
       return;
     }
     if (!workspaceIdentifier) saveWorkspaceOriginScroll(captureWorkspaceOriginScroll());
+    detailWorkspaceOriginScrollRef.current = null;
     setWorkspaceDescendants(false);
     setWorkspaceIdentifier(identifier);
     setWorkspaceView("overview");
@@ -2530,13 +2537,15 @@ export function App() {
     const task = tasksRef.current.find((candidate) => candidate.identifier === identifier);
     const projectId = task?.projectId ?? selectedProjectId;
     const sourceProjectId = detailSourceProjectIdRef.current ?? projectId;
+    const detailOriginScroll = detailWorkspaceOriginScrollRef.current;
     detailSourceProjectIdRef.current = null;
+    detailWorkspaceOriginScrollRef.current = null;
     setDetailTaskIdentifier(null);
     if (sourceProjectId !== selectedProjectId) {
       setSelectedProjectId(sourceProjectId);
       setBoardView(sourceProjectId === ALL_PROJECTS_ID ? "issues" : readProjectBoardView(sourceProjectId));
     }
-    if (!workspaceIdentifier) saveWorkspaceOriginScroll(captureWorkspaceOriginScroll());
+    if (!workspaceIdentifier) saveWorkspaceOriginScroll(detailOriginScroll ?? captureWorkspaceOriginScroll());
     setWorkspaceDescendants(false);
     setWorkspaceIdentifier(identifier);
     setWorkspaceView("overview");
@@ -3363,6 +3372,7 @@ export function App() {
     setProjectContextMenu(null);
     setProjectMenuOpen(false);
     detailSourceProjectIdRef.current = null;
+    detailWorkspaceOriginScrollRef.current = null;
     setDetailTaskIdentifier(null);
     setBoardView(projectId === ALL_PROJECTS_ID ? "issues" : readProjectBoardView(projectId));
     if (projectId !== ALL_PROJECTS_ID) rememberProjectOpen(projectId);

@@ -450,7 +450,10 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     const boardScroll = await cdp.evaluate(`(() => { const rails = [...document.querySelectorAll(".board-column")].filter((column) => /Workspace todo [AB]/.test(column.textContent ?? "")).map((column) => column.querySelector(".column-list")).filter((node) => node instanceof HTMLElement); if (rails.length !== 2) return false; rails.forEach((rail, index) => { rail.scrollTop = 120 + index * 80; rail.dispatchEvent(new Event("scroll", { bubbles: true })); }); return rails.map((rail) => rail.scrollTop); })()`);
     assert.ok(Array.isArray(boardScroll) && boardScroll.every((value) => value > 0), "Board fixture must scroll both same-status rails");
     await enterWorkspace(); await goBackToSource();
-    const restoredBoard = await cdp.evaluate(`(() => [...document.querySelectorAll(".board-column")].filter((column) => /Workspace todo [AB]/.test(column.textContent ?? "")).map((column) => column.querySelector(".column-list")?.scrollTop))()`);
+    const restoredBoard = await eventually(async () => {
+      const values = await cdp.evaluate(`(() => [...document.querySelectorAll(".board-column")].filter((column) => /Workspace todo [AB]/.test(column.textContent ?? "")).map((column) => column.querySelector(".column-list")?.scrollTop))()`);
+      return JSON.stringify(values) === JSON.stringify(boardScroll) ? values : null;
+    }, "Board history restoration must retain distinct stage rails");
     assert.deepEqual(restoredBoard, boardScroll, "Board history restoration must retain distinct stage rails");
 
     for (const [label, selector] of [["List", ".issue-list-view"], ["Gantt", ".gantt_ver_scroll"]]) {
