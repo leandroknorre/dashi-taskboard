@@ -52,7 +52,5 @@ function run(filesToRun, args = []) {
 }
 
 const concurrentStatus = run(concurrentFiles);
-const serialStatus = concurrentStatus === 0
-  ? run(serialFiles, ["--test-concurrency=1"])
-  : 1;
+const serialStatus = run(serialFiles, ["--test-concurrency=1"]);
 process.exitCode = concurrentStatus || serialStatus;
