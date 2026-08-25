@@ -1,4 +1,4 @@
-import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Gantt, type GanttStatic, type Task as GanttTask } from "dhtmlx-gantt";
 import "../vendor/dhtmlxgantt.css";
 import type { Task, TaskDraft, WorkflowStage } from "../types";
@@ -391,7 +391,10 @@ export const GanttView = forwardRef<GanttViewport, GanttViewProps>(function Gant
     instance.scrollTo(scroll.x, scroll.y);
   }, [ganttGroups, language, locale, text]);
 
-  useEffect(() => {
+  // DHTMLX owns this DOM outside React. A passive effect from an older commit can otherwise
+  // run after a newly arrived workflow and restore the canonical status groups. Parsing in the
+  // layout phase makes the latest React commit the last imperative projection before paint.
+  useLayoutEffect(() => {
     const instance = ganttRef.current;
     if (!instance || !ganttReady) return;
     const data: TaskboardGanttTask[] = [];
