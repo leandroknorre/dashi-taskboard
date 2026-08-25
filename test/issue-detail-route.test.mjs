@@ -39,7 +39,7 @@ test("closing issue detail removes only the issue route", () => {
   assert.deepEqual(url.searchParams.getAll("label"), ["缺陷"]);
 });
 
-test("nested workspace route preserves issue context and accepts public projection views", () => {
+test("nested workspace route clears issue context and accepts public projection views", () => {
   const url = buildWorkspaceUrl(
     "http://127.0.0.1:47823/?host=codex&project=local&issue=LOCAL-72&filter=mine",
     "LOCAL-73",
@@ -48,7 +48,8 @@ test("nested workspace route preserves issue context and accepts public projecti
 
   assert.equal(readWorkspaceIdentifier(url.search), "LOCAL-73");
   assert.equal(readWorkspaceView(url.search), "tree");
-  assert.equal(readIssueIdentifier(url.search), "LOCAL-72");
+  assert.equal(readIssueIdentifier(url.search), null);
+  assert.equal(url.searchParams.has("issue"), false);
   assert.equal(url.searchParams.get("host"), "codex");
   assert.equal(url.searchParams.get("filter"), "mine");
   assert.equal(readWorkspaceView("?workspace=LOCAL-73&view=timeline"), "timeline");
@@ -75,6 +76,15 @@ test("the app restores issue detail from the URL and follows browser history", (
   assert.match(openTaskSource, /window\.history\.pushState/);
   assert.match(appSource, /function closeTaskDetail\(\)[\s\S]*?window\.history\.replaceState/);
   assert.match(appSource, /onEdit=\{openTaskDetail\}/);
+  assert.match(appSource, /function openNestedWorkspaceFromDetail[\s\S]*?setDetailTaskIdentifier\(null\)/);
+  assert.match(appSource, /onOpenWorkspace=\{openNestedWorkspaceFromDetail\}/);
+});
+
+test("only supra-items expose the nested-workspace entry point", async () => {
+  const detailSource = await readFile(new URL("../web/src/components/TaskDetail.tsx", import.meta.url), "utf8");
+  assert.match(detailSource, /currentTask\.relations\.subIssues\.length > 0/);
+  assert.match(detailSource, /Abrir fluxo aninhado/);
+  assert.match(detailSource, /onOpenWorkspace\(currentTask\.identifier\)/);
 });
 
 test("workspace changes replace the read record atomically and scope pagination cursors", () => {

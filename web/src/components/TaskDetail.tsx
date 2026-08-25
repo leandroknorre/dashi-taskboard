@@ -117,6 +117,7 @@ interface TaskDetailProps {
   onDeleteLabel: (label: string) => Promise<void>;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
   onOpenTask: (task: TaskRelationSummary) => void;
+  onOpenWorkspace: (identifier: string) => void;
   onAddRelation: (
     task: Task,
     type: IssueRelationType,
@@ -395,6 +396,7 @@ export function TaskDetail({
   onDeleteLabel,
   onUpdate,
   onOpenTask,
+  onOpenWorkspace,
   onAddRelation,
   onRemoveRelation,
   onOpenThread,
@@ -1220,6 +1222,18 @@ export function TaskDetail({
                 </div>
               )}
             </article>
+
+            {currentTask.relations.subIssues.length > 0 && (
+              <div className="issue-nested-workspace-action">
+                <button
+                  type="button"
+                  onClick={() => onOpenWorkspace(currentTask.identifier)}
+                  aria-label={text("打开嵌套流程", "Abrir fluxo aninhado")}
+                >
+                  {text("打开嵌套流程", "Abrir fluxo aninhado")}
+                </button>
+              </div>
+            )}
 
             <IssueSubIssues
               task={currentTask}

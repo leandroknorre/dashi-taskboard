@@ -18,7 +18,12 @@ export function readWorkspaceView(search: string): WorkspaceView {
   return WORKSPACE_VIEWS.includes(value as WorkspaceView) ? value as WorkspaceView : "overview";
 }
 
-/** Changes only nested-workspace route state, preserving project, issue and host context. */
+/** Changes nested-workspace route state, preserving project and host context.
+ *
+ * A task detail and a nested workspace are mutually exclusive screens.  In
+ * particular, entering a workspace from its detail must not leave a stale
+ * `issue` query parameter behind for history/navigation to interpret.
+ */
 export function buildWorkspaceUrl(
   href: string,
   workspaceIdentifier: string | null,
@@ -26,6 +31,7 @@ export function buildWorkspaceUrl(
 ): URL {
   const url = new URL(href);
   if (workspaceIdentifier) {
+    url.searchParams.delete(ISSUE_QUERY_PARAM);
     url.searchParams.set(WORKSPACE_QUERY_PARAM, workspaceIdentifier);
     url.searchParams.set("view", view);
   } else {

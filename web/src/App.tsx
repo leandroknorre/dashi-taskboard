@@ -2526,6 +2526,26 @@ export function App() {
     window.history.pushState(window.history.state, "", url);
   }
 
+  function openNestedWorkspaceFromDetail(identifier: string) {
+    const task = tasksRef.current.find((candidate) => candidate.identifier === identifier);
+    const projectId = task?.projectId ?? selectedProjectId;
+    const sourceProjectId = detailSourceProjectIdRef.current ?? projectId;
+    detailSourceProjectIdRef.current = null;
+    setDetailTaskIdentifier(null);
+    if (sourceProjectId !== selectedProjectId) {
+      setSelectedProjectId(sourceProjectId);
+      setBoardView(sourceProjectId === ALL_PROJECTS_ID ? "issues" : readProjectBoardView(sourceProjectId));
+    }
+    if (!workspaceIdentifier) saveWorkspaceOriginScroll(captureWorkspaceOriginScroll());
+    setWorkspaceDescendants(false);
+    setWorkspaceIdentifier(identifier);
+    setWorkspaceView("overview");
+    const boardUrl = buildIssueUrl(window.location.href, sourceProjectId, null);
+    window.history.replaceState(window.history.state, "", boardUrl);
+    const workspaceUrl = buildWorkspaceUrl(boardUrl.href, identifier, "overview");
+    window.history.pushState(window.history.state, "", workspaceUrl);
+  }
+
   function loadMoreNestedWorkspace() {
     const requestKey = nestedWorkspaceCurrentKey;
     const current = activeNestedWorkspaceLoad;
@@ -3897,6 +3917,7 @@ export function App() {
             onDeleteLabel={removeProjectLabel}
             onUpdate={(current, changes) => updateTaskProperties(current, changes)}
             onOpenTask={openTaskDetail}
+            onOpenWorkspace={openNestedWorkspaceFromDetail}
             onAddRelation={(current, type, relatedTaskId, origin) => (
               mutateTaskRelation("add", current, type, relatedTaskId, origin)
             )}

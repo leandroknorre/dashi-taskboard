@@ -347,10 +347,26 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     await cdp.send("Page.navigate", { url: `${proxy.origin}/?project=alpha` });
     await eventually(() => cdp.evaluate(`document.querySelectorAll(".task-card").length >= 50`), "Board did not render seeded direct children");
 
-    const workspaceUrl = `${proxy.origin}/?project=alpha&workspace=${encodeURIComponent(fixture.root.identifier)}&view=overview`;
     async function enterWorkspace() {
-      await cdp.evaluate(`history.pushState(history.state, "", ${JSON.stringify(workspaceUrl)}); dispatchEvent(new PopStateEvent("popstate")); true`);
+      const openedDetail = await cdp.evaluate(`(() => {
+        const card = [...document.querySelectorAll(".task-card")].find((node) => node.textContent?.includes("Release workspace"));
+        const button = card?.querySelector(".task-card-open");
+        if (!(button instanceof HTMLButtonElement)) return false;
+        button.click();
+        return true;
+      })()`);
+      assert.equal(openedDetail, true, "Fixture root card must open its detail");
+      await eventually(() => cdp.evaluate(`document.querySelector("button[aria-label='Abrir fluxo aninhado']") instanceof HTMLButtonElement`), "Supra-item detail did not expose the nested-workspace entry point");
+      const openedWorkspace = await cdp.evaluate(`(() => {
+        const button = document.querySelector("button[aria-label='Abrir fluxo aninhado']");
+        if (!(button instanceof HTMLButtonElement)) return false;
+        button.click();
+        return true;
+      })()`);
+      assert.equal(openedWorkspace, true, "Nested-workspace entry point must be clickable");
       await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-view")?.textContent?.includes("Manual purpose: ship without moving the parent.")`), "Workspace overview did not load");
+      const route = await cdp.evaluate(`({ issue: new URL(location.href).searchParams.get("issue"), workspace: new URL(location.href).searchParams.get("workspace"), view: new URL(location.href).searchParams.get("view") })`);
+      assert.deepEqual(route, { issue: null, workspace: fixture.root.identifier, view: "overview" });
     }
     async function goBackToSource() {
       await cdp.evaluate(`history.back(); true`);
@@ -373,10 +389,11 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     await cdp.evaluate(`history.back(); true`);
     await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-super-card")?.textContent?.includes("Release workspace")`), "History back did not return to root after forward");
 
-    for (const view of ["Board", "List", "Tree", "Mind Map", "Timeline"]) {
+    for (const view of ["Overview", "Board", "List", "Tree", "Mind Map", "Timeline"]) {
       await cdp.evaluate(`(() => { const button = [...document.querySelectorAll(".view-tab")].find((node) => node.textContent?.trim() === ${JSON.stringify(view)}); if (!(button instanceof HTMLButtonElement)) return false; button.click(); return true; })()`);
       const panel = view === "Mind Map" ? "mindmap" : view.toLowerCase();
-      await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-${panel}")?.textContent?.includes("Direct child")`), `${view} tab did not render direct children`);
+      const expectedText = view === "Overview" ? "Manual purpose" : "Direct child";
+      await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-${panel}")?.textContent?.includes(${JSON.stringify(expectedText)})`), `${view} tab did not render its expected projection`);
     }
     await cdp.evaluate(`document.querySelector("#nested-workspace-tab-mindmap")?.click(); true`);
     const mapNodes = await cdp.evaluate(`document.querySelectorAll(".workspace-mindmap-node").length`);
