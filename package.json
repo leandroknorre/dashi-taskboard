@@ -29,7 +29,7 @@
     "dev:cloud": "npm run build:web && wrangler dev --local",
     "build": "vite build --config web/vite.config.ts && node scripts/codex-injector.mjs --refresh-if-running",
     "build:web": "vite build --config web/vite.config.ts",
-    "typecheck": "tsc -p web/tsconfig.json --noEmit",
+    "typecheck": "node scripts/typecheck.mjs -p web/tsconfig.json --noEmit",
     "start": "node server/index.mjs",
     "taskctl": "node cli/taskctl.mjs",
     "test": "npm run test:node && npm run test:vitest",
