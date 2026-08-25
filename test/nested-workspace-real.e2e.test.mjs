@@ -12,7 +12,8 @@ import WebSocket from "ws";
 
 import { createTaskboardServer } from "../server/index.mjs";
 import { TaskboardDatabase } from "../server/database.mjs";
-import { stopChild } from "./helpers/stop-child.mjs";
+import { captureStderrTail, chromeStartupDiagnostic } from "./helpers/chrome-diagnostics.mjs";
+import { hasExited, stopChild } from "./helpers/stop-child.mjs";
 
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
 const actor = { type: "user", id: "workspace-e2e", name: "Workspace E2E", avatarUrl: null };
@@ -53,13 +54,37 @@ async function eventually(action, message, timeoutMs = 12_000) {
   throw new Error(`${message}${lastError ? `: ${lastError.message}` : ""}`);
 }
 
-async function chromeDebugPort(profile) {
-  return eventually(async () => {
+function chromeDebugPortError(profile, child, stderrTail, startupError) {
+  const diagnostic = chromeStartupDiagnostic({
+    child,
+    stderrTail,
+    startupError,
+    paths: {
+      profile,
+      tempDirectory: path.dirname(profile),
+      tempRoot: os.tmpdir(),
+      homeDirectory: process.env.HOME,
+    },
+  });
+  return new Error(`Chrome did not publish its DevTools port (${diagnostic})`);
+}
+
+async function chromeDebugPort(profile, child, stderrTail, getStartupError) {
+  const deadline = Date.now() + 12_000;
+  while (Date.now() < deadline) {
+    if (hasExited(child) || getStartupError()) {
+      throw chromeDebugPortError(profile, child, stderrTail, getStartupError());
+    }
     try {
       const lines = (await readFile(path.join(profile, "DevToolsActivePort"), "utf8")).trim().split("\n");
-      return Number(lines[0]) || null;
-    } catch { return null; }
-  }, "Chrome did not publish a DevTools port");
+      const port = Number(lines[0]);
+      if (port) return port;
+    } catch {
+      // Chrome creates the file asynchronously.
+    }
+    await wait(100);
+  }
+  throw chromeDebugPortError(profile, child, stderrTail, getStartupError());
 }
 
 async function connectCdp(port) {
@@ -323,8 +348,11 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     const address = await app.listen({ host: "127.0.0.1", port: 0 });
     proxy = await startReadOnlyProxy(`http://127.0.0.1:${address.port}`);
     const profile = path.join(directory, "chrome");
-    child = spawn(chrome, ["--headless=new", "--disable-background-networking", "--disable-gpu", "--no-first-run", "--no-sandbox", "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "about:blank"], { stdio: "ignore" });
-    cdp = await connectCdp(await chromeDebugPort(profile));
+    child = spawn(chrome, ["--headless=new", "--disable-background-networking", "--disable-gpu", "--no-first-run", "--no-sandbox", "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
+    const stderrTail = captureStderrTail(child.stderr);
+    let chromeStartupError;
+    child.once("error", (error) => { chromeStartupError = error; });
+    cdp = await connectCdp(await chromeDebugPort(profile, child, stderrTail, () => chromeStartupError));
     await cdp.send("Page.enable");
     await cdp.send("Runtime.enable");
     await cdp.send("Emulation.setDeviceMetricsOverride", { width: 1366, height: 768, deviceScaleFactor: 1, mobile: false });
