@@ -1,4 +1,5 @@
 import { access, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { createHmac, randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,6 +27,7 @@ async function requireCloudImplementation() {
 
 export async function createCloudWorkerHarness({
   sharedSecret = "two-person-shared-secret",
+  humanAcceptanceSecret = "trusted-human-acceptance-signer",
 } = {}) {
   await requireCloudImplementation();
   const persistenceRoot = await mkdtemp(path.join(os.tmpdir(), "taskboard-cloud-worker-"));
@@ -37,6 +39,7 @@ export async function createCloudWorkerHarness({
     bindings: {
       TASKBOARD_ENVIRONMENT: "production",
       TASKBOARD_SHARED_SECRET: sharedSecret,
+      TASKBOARD_HUMAN_ACCEPTANCE_SECRET: humanAcceptanceSecret,
     },
     d1Databases: { DB: "taskboard-test" },
     r2Buckets: { ATTACHMENTS: "taskboard-test-attachments" },
@@ -76,6 +79,65 @@ export async function createCloudWorkerHarness({
       await db.exec(statements.join("\n"));
     }
     const attachments = await miniflare.getR2Bucket("ATTACHMENTS");
+
+    function signHumanAcceptancePayload(payload) {
+      const encodedPayload = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+      const signature = createHmac("sha256", humanAcceptanceSecret)
+        .update(`v1.${encodedPayload}`)
+        .digest("base64url");
+      return `v1.${encodedPayload}.${signature}`;
+    }
+
+    function createHumanAcceptanceAssertion({
+      version = 1,
+      purpose = "human_acceptance_evidence",
+      route,
+      method = "POST",
+      subject = "trusted_human_test",
+      taskId,
+      expectedStateVersion,
+      actionKey,
+      gateId = "human-acceptance",
+      idempotencyKey,
+      evidenceId,
+      taskVersion,
+      workflowId,
+      revisionId,
+      transitionId,
+      reason,
+      issuedAt = Date.now(),
+      expiresAt = issuedAt + 60_000,
+      nonce = randomUUID(),
+    }) {
+      const common = {
+        version,
+        purpose,
+        route: route ?? (purpose === "human_acceptance_evidence"
+          ? "/api/tasks/:id/evidence"
+          : "/api/tasks/:id/evidence/:evidenceId/revoke"),
+        method,
+        subject,
+        taskId,
+        idempotencyKey,
+        issuedAt,
+        expiresAt,
+        nonce,
+      };
+      const payload = purpose === "human_acceptance_evidence"
+        ? { ...common, expectedStateVersion, actionKey, gateId }
+        : {
+          ...common,
+          evidenceId,
+          taskVersion,
+          workflowId,
+          revisionId,
+          transitionId,
+          actionKey,
+          gateId,
+          reason,
+        };
+      return signHumanAcceptancePayload(payload);
+    }
 
     async function request(pathname, {
       actorName,
@@ -135,9 +197,11 @@ export async function createCloudWorkerHarness({
       attachments,
       db,
       connectWebSocket,
+      createHumanAcceptanceAssertion,
       miniflare,
       request,
       sharedSecret,
+      signHumanAcceptancePayload,
       async listAttachmentKeys() {
         return (await attachments.list()).objects.map((object) => object.key).sort();
       },

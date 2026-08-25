@@ -260,7 +260,7 @@ test("stage workflow saves rename, reorder, hide, and reject stale versions", as
   });
 });
 
-test("stage ownership rejects foreign stages and failed removals roll back before project remap", async () => {
+test("stage ownership rejects foreign stages and failed removals leave cross-project transfer unavailable", async () => {
   await createProject("stage-transfer-source");
   await createProject("stage-transfer-target");
   const [source, target] = await Promise.all([
@@ -338,7 +338,7 @@ test("stage ownership rejects foreign stages and failed removals roll back befor
   const afterFailure = await cloud.request(`/api/tasks/${task.body.task.id}`, { actorName: alice });
   assert.equal(afterFailure.body.task.stageId, ready.stageId);
 
-  const transferred = await cloud.request(`/api/tasks/${task.body.task.id}`, {
+  const transferRejected = await cloud.request(`/api/tasks/${task.body.task.id}`, {
     method: "PATCH",
     actorName: alice,
     json: {
@@ -346,10 +346,13 @@ test("stage ownership rejects foreign stages and failed removals roll back befor
       projectId: "stage-transfer-target",
     },
   });
-  assert.equal(transferred.response.status, 200, JSON.stringify(transferred.body));
-  assert.equal(transferred.body.task.stageId, targetTodo.stageId);
-  assert.equal(transferred.body.task.status, "todo");
-  assert.notEqual(transferred.body.task.stageId, sourceTodo.stageId);
+  assert.equal(transferRejected.response.status, 409, JSON.stringify(transferRejected.body));
+  assert.equal(transferRejected.body.error.code, "PROJECT_MOVE_UNAVAILABLE");
+  const unchanged = await cloud.request(`/api/tasks/${task.body.task.id}`, { actorName: alice });
+  assert.equal(unchanged.body.task.projectId, "stage-transfer-source");
+  assert.equal(unchanged.body.task.stageId, ready.stageId);
+  assert.equal(unchanged.body.task.status, "todo");
+  assert.equal(unchanged.body.task.version, afterFailure.body.task.version);
 });
 
 test("projects, tasks, comments, and relations preserve the current API contract", async () => {
@@ -416,18 +419,12 @@ test("concurrent issue creation has unique identifiers and stale writes return 4
   });
 });
 
-test("PATCH moves an issue to an existing project and records the change", async () => {
+test("PATCH rejects a cross-project move that cannot preserve the task workflow pin", async () => {
   await createProject("move-source");
   await createProject("move-target");
-  const targetTask = await createTask("move-target", "Target issue", alice, {
-    status: "todo",
-    sortOrder: 5000,
-  });
-  assert.equal(targetTask.response.status, 201);
   const sourceTask = await createTask("move-source", "Issue to move", alice, {
     status: "todo",
     sortOrder: 5000,
-    threadId: "thread-to-preserve",
   });
   assert.equal(sourceTask.response.status, 201);
   await cloud.db.prepare(`
@@ -435,23 +432,58 @@ test("PATCH moves an issue to an existing project and records the change", async
     WHERE id IN ('move-source', 'move-target')
   `).run();
 
-  const moved = await cloud.request(`/api/tasks/${sourceTask.body.task.id}`, {
+  const before = await cloud.db.prepare(`
+    SELECT
+      tasks.project_id AS task_project_id,
+      tasks.status AS task_status,
+      tasks.stage_id AS task_stage_id,
+      tasks.sort_order AS task_sort_order,
+      tasks.version AS task_version,
+      pins.workflow_id AS pin_workflow_id,
+      pins.revision_id AS pin_revision_id,
+      work_items.project_id AS projection_project_id,
+      work_items.status AS projection_status,
+      work_items.stage_id AS projection_stage_id,
+      work_items.task_version AS projection_version,
+      work_items.last_event_sequence AS projection_sequence,
+      (SELECT count(*) FROM task_activities WHERE task_id = tasks.id) AS activities
+    FROM tasks
+    JOIN workflow_task_pins AS pins ON pins.task_id = tasks.id
+    JOIN workflow_work_item_projections AS work_items ON work_items.work_item_id = tasks.id
+    WHERE tasks.id = ?
+  `).bind(sourceTask.body.task.id).first();
+  const rejected = await cloud.request(`/api/tasks/${sourceTask.body.task.id}`, {
     method: "PATCH",
     actorName: bob,
-    headers: { "x-taskboard-client": "taskctl" },
     json: {
       version: sourceTask.body.task.version,
       projectId: "move-target",
-      threadId: "thread-from-move",
     },
   });
 
-  assert.equal(moved.response.status, 200, JSON.stringify(moved.body));
-  assert.equal(moved.body.task.projectId, "move-target");
-  assert.equal(moved.body.task.status, "todo");
-  assert.equal(moved.body.task.sortOrder, sourceTask.body.task.sortOrder);
-  assert.equal(moved.body.task.threadId, "thread-to-preserve");
-  assert.equal(moved.body.task.version, sourceTask.body.task.version + 1);
+  assert.equal(rejected.response.status, 409, JSON.stringify(rejected.body));
+  assert.equal(rejected.body.error.code, "PROJECT_MOVE_UNAVAILABLE");
+  const after = await cloud.db.prepare(`
+    SELECT
+      tasks.project_id AS task_project_id,
+      tasks.status AS task_status,
+      tasks.stage_id AS task_stage_id,
+      tasks.sort_order AS task_sort_order,
+      tasks.version AS task_version,
+      pins.workflow_id AS pin_workflow_id,
+      pins.revision_id AS pin_revision_id,
+      work_items.project_id AS projection_project_id,
+      work_items.status AS projection_status,
+      work_items.stage_id AS projection_stage_id,
+      work_items.task_version AS projection_version,
+      work_items.last_event_sequence AS projection_sequence,
+      (SELECT count(*) FROM task_activities WHERE task_id = tasks.id) AS activities
+    FROM tasks
+    JOIN workflow_task_pins AS pins ON pins.task_id = tasks.id
+    JOIN workflow_work_item_projections AS work_items ON work_items.work_item_id = tasks.id
+    WHERE tasks.id = ?
+  `).bind(sourceTask.body.task.id).first();
+  assert.deepEqual(after, before);
   const projects = await cloud.db.prepare(`
     SELECT id, updated_at FROM projects
     WHERE id IN ('move-source', 'move-target')
@@ -459,33 +491,8 @@ test("PATCH moves an issue to an existing project and records the change", async
   `).all();
   assert.deepEqual(
     projects.results.map((project) => project.updated_at),
-    [moved.body.task.updatedAt, moved.body.task.updatedAt],
+    ["2000-01-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z"],
   );
-
-  const activity = await cloud.request(
-    `/api/tasks/${sourceTask.body.task.id}/activities`,
-    { actorName: alice },
-  );
-  assert.equal(activity.response.status, 200);
-  assert.equal(activity.body.activities.at(-1).actorType, "agent");
-  assert.match(activity.body.activities.at(-1).actorName, /Bob/);
-  assert.deepEqual(activity.body.activities.at(-1).changes, [{
-    field: "projectId",
-    before: "move-source",
-    after: "move-target",
-  }]);
-
-  const stale = await cloud.request(`/api/tasks/${sourceTask.body.task.id}`, {
-    method: "PATCH",
-    actorName: alice,
-    json: {
-      version: sourceTask.body.task.version,
-      projectId: "move-source",
-      threadId: "stale-thread",
-    },
-  });
-  assert.equal(stale.response.status, 409);
-  assert.equal(stale.body.error.code, "VERSION_CONFLICT");
 });
 
 test("remote thread identity survives controller moves and clears after create failure", async () => {
@@ -555,7 +562,7 @@ test("remote thread identity survives controller moves and clears after create f
   assert.deepEqual(todo.body.task.conversationRefs.map((ref) => ref.threadId), ["controller-thread"]);
 });
 
-test("PATCH rejects moving an issue that still has relations", async () => {
+test("PATCH keeps a related issue unchanged when cross-project transfer is unavailable", async () => {
   await createProject("move-related-cloud-source");
   await createProject("move-related-cloud-target");
   const sourceTask = await createTask(
@@ -586,7 +593,7 @@ test("PATCH rejects moving an issue that still has relations", async () => {
   });
 
   assert.equal(rejected.response.status, 409);
-  assert.equal(rejected.body.error.code, "CROSS_PROJECT_RELATION");
+  assert.equal(rejected.body.error.code, "PROJECT_MOVE_UNAVAILABLE");
   const unchanged = await cloud.request(`/api/tasks/${sourceTask.body.task.id}`, {
     actorName: alice,
   });
@@ -598,7 +605,7 @@ test("PATCH rejects moving an issue that still has relations", async () => {
   );
 });
 
-test("PATCH project and status updates use the target status ordering", async () => {
+test("PATCH rejects a cross-project completion before it can bypass TransitionService", async () => {
   await createProject("move-sort-source-cloud");
   await createProject("move-sort-target-cloud");
   await createTask("move-sort-target-cloud", "Cloud target first", alice, {
@@ -616,7 +623,7 @@ test("PATCH project and status updates use the target status ordering", async ()
     { status: "todo", sortOrder: 9000 },
   );
 
-  const moved = await cloud.request(`/api/tasks/${sourceTask.body.task.id}`, {
+  const rejected = await cloud.request(`/api/tasks/${sourceTask.body.task.id}`, {
     method: "PATCH",
     actorName: alice,
     json: {
@@ -626,10 +633,26 @@ test("PATCH project and status updates use the target status ordering", async ()
     },
   });
 
-  assert.equal(moved.response.status, 200, JSON.stringify(moved.body));
-  assert.equal(moved.body.task.projectId, "move-sort-target-cloud");
-  assert.equal(moved.body.task.status, "done");
-  assert.equal(moved.body.task.sortOrder, 4000);
+  assert.equal(rejected.response.status, 409, JSON.stringify(rejected.body));
+  assert.equal(rejected.body.error.code, "TRANSITION_REQUIRED");
+  const unchanged = await cloud.request(`/api/tasks/${sourceTask.body.task.id}`, { actorName: alice });
+  assert.equal(unchanged.body.task.projectId, "move-sort-source-cloud");
+  assert.equal(unchanged.body.task.status, "todo");
+  const records = await cloud.db.prepare(`
+    SELECT
+      (SELECT count(*) FROM workflow_transition_requests WHERE task_id = ?) AS requests,
+      (SELECT count(*) FROM workflow_ledger_events WHERE aggregate_id = ?) AS events,
+      (SELECT count(*) FROM workflow_outbox AS outbox
+       JOIN workflow_ledger_events AS events ON events.event_id = outbox.event_id
+       WHERE events.aggregate_id = ?) AS outbox,
+      (SELECT count(*) FROM workflow_aggregate_projections
+       WHERE aggregate_type = 'task' AND aggregate_id = ?) AS aggregate_projections,
+      (SELECT last_event_sequence FROM workflow_work_item_projections
+       WHERE work_item_id = ?) AS work_item_sequence
+  `).bind(sourceTask.body.task.id, sourceTask.body.task.id, sourceTask.body.task.id, sourceTask.body.task.id, sourceTask.body.task.id).first();
+  assert.deepEqual(records, {
+    requests: 0, events: 0, outbox: 0, aggregate_projections: 0, work_item_sequence: null,
+  });
 });
 
 test("PATCH rejects moving an issue to a project that does not exist", async () => {
@@ -1106,6 +1129,21 @@ test("cloud task rollup matches the deterministic local parent-only contract", a
   )).body.rollup;
 
   const latestBlocker = await latest(blocker.body.task.id);
+  const acceptance = await cloud.request(`/api/tasks/${blocker.body.task.id}/evidence`, {
+    method: "POST",
+    actorName: alice,
+    headers: {
+      "idempotency-key": "rollup_blocker_acceptance_1",
+      "x-taskboard-human-acceptance": cloud.createHumanAcceptanceAssertion({
+        taskId: blocker.body.task.id,
+        expectedStateVersion: latestBlocker.version,
+        actionKey: "legacy_move_3_6",
+        idempotencyKey: "rollup_blocker_acceptance_1",
+      }),
+    },
+    json: { expectedStateVersion: latestBlocker.version, actionKey: "legacy_move_3_6" },
+  });
+  assert.equal(acceptance.response.status, 201, JSON.stringify(acceptance.body));
   assert.equal((await cloud.request(`/api/tasks/${blocker.body.task.id}/transitions`, {
     method: "POST",
     actorName: alice,
@@ -1113,19 +1151,7 @@ test("cloud task rollup matches the deterministic local parent-only contract", a
     json: {
       expectedStateVersion: latestBlocker.version,
       actionKey: "legacy_move_3_6",
-      gateEvidence: [{
-        evidenceId: "11111111-1111-4111-8111-111111111111",
-        gateId: "human-acceptance",
-        type: "human_acceptance",
-        capturedAt: "2026-08-24T12:00:00.000Z",
-        actor: { actorId: "reviewer", kind: "human" },
-        status: "valid",
-        record: {
-          evidenceEventId: "22222222-2222-4222-8222-222222222222",
-          eventHash: "a".repeat(64),
-        },
-        revocation: null,
-      }],
+      gateEvidence: [acceptance.body.evidence],
     },
   })).response.status, 200);
   const recalculated = await cloud.request(`/api/tasks/${root.body.task.id}/rollup`, { actorName: alice });

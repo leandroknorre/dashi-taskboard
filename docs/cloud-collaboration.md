@@ -18,7 +18,15 @@ The production resource names are:
 | R2 bucket | `codex-taskboard-attachments` |
 | Durable Object class | `RealtimeHub` |
 
-This is intentionally a shared-password trust model. The Basic username is only the actor name displayed in task and comment attribution, not a verified identity. Anyone who knows the shared password has full read and write access and can choose any actor name. Use it only with the other trusted collaborator.
+This is intentionally a shared-password trust model. The Basic username is only
+the actor name displayed in ordinary task and comment attribution, not a
+verified identity. Anyone who knows the shared password has full ordinary read
+and write access and can choose any actor name. Human acceptance evidence is
+the exception: mint/revocation requires a separately signed, short-lived human
+operator assertion. Its opaque signed subject—not the Basic username—is hashed
+into the evidence and ledger audit trail. `TASKBOARD_HUMAN_ACCEPTANCE_SECRET`
+stays only with the Worker and a trusted server-side assertion issuer; it is
+not given to taskctl, the local companion, or the frontend.
 
 ## What stays local
 
@@ -37,7 +45,9 @@ npm ci
 npm run build:web
 ```
 
-Create an ignored `.dev.vars` file containing a local-only value for `TASKBOARD_SHARED_SECRET`, apply the D1 migration to Wrangler's local state, and start the Worker:
+Create an ignored `.dev.vars` file containing local-only values for
+`TASKBOARD_SHARED_SECRET` and `TASKBOARD_HUMAN_ACCEPTANCE_SECRET`, apply the
+D1 migration to Wrangler's local state, and start the Worker:
 
 ```bash
 npm run cloud:migrate:local
@@ -73,16 +83,27 @@ npm run cloud:migrate
 npm run cloud:deploy:dry-run
 ```
 
-Set the shared password through Wrangler's private interactive prompt after the database schema is ready. Do not put the value in `wrangler.jsonc`, a shell command, a log, or a committed file. Then deploy the production Worker:
+Set the shared password and the separate human-acceptance signing secret through
+Wrangler's private interactive prompt after the database schema is ready. Do not
+put either value in `wrangler.jsonc`, a shell command, a log, or a committed
+file. Then deploy the production Worker:
 
 ```bash
 npx wrangler secret put TASKBOARD_SHARED_SECRET
+npx wrangler secret put TASKBOARD_HUMAN_ACCEPTANCE_SECRET
 npm run cloud:deploy
 ```
 
 These commands create or update Cloudflare resources. This repository contains the production D1 database ID for the binding, but it does not contain the shared password or any API or OAuth token. Keep those credentials out of Git; cloning the repository does not grant access or mean the Worker has already been deployed.
 
-Give the other collaborator the deployed Worker HTTPS origin and shared password through a trusted channel. Never publish the password in the repository, an issue, or logs.
+Give the other collaborator the deployed Worker HTTPS origin and shared password
+through a trusted channel. Do not give the human-acceptance signing secret to
+taskctl, the local companion, the frontend, or a browser. A trusted server-side
+operator issuer creates the `v1.<payload>.<hmac>` assertions for the evidence
+endpoints; it must authenticate the human and never persist or relay the raw
+secret. This is a temporary operator-trust boundary, designed to be replaced by
+a verified Cloudflare Access assertion. Never publish either secret or an
+assertion in the repository, an issue, or logs.
 
 Current Cloudflare references:
 

@@ -1949,7 +1949,14 @@ async function resolveStageForTask(env, projectId, { stageId, status }) {
 
 const TRANSITION_IDENTIFIER = /^[a-z][a-z0-9_-]{0,63}$/;
 const TRANSITION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const TRANSITION_HASH = /^[0-9a-f]{64}$/;
+const HUMAN_ACCEPTANCE_SIGNER_HEADER = "x-taskboard-human-acceptance";
+const HUMAN_ACCEPTANCE_ASSERTION_VERSION = "v1";
+const HUMAN_ACCEPTANCE_ASSERTION_TTL_MS = 5 * 60 * 1_000;
+const HUMAN_ACCEPTANCE_ASSERTION_FUTURE_SKEW_MS = 30 * 1_000;
+const HUMAN_ACCEPTANCE_ASSERTION_BASE64URL = /^[A-Za-z0-9_-]+$/;
+const HUMAN_ACCEPTANCE_ASSERTION_SUBJECT = /^[a-z][a-z0-9_-]{2,63}$/;
+const HUMAN_ACCEPTANCE_ASSERTION_NONCE = /^[A-Za-z0-9_-]{16,96}$/;
+const LEDGER_RETRY_LIMIT = 3;
 
 function transitionError(code, message, details) {
   const status = code === "ACTION_NOT_FOUND" || code === "INVALID_CONTRACT" ? 400 : 409;
@@ -2032,12 +2039,17 @@ async function transitionContext(env, taskId) {
   return { task, pin, revision, definition: JSON.parse(revision.definition_json) };
 }
 
-function parseTransition(body, idempotencyKey) {
-  assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["expectedStateVersion", "actionKey", "gateEvidence", "authorizationId"]));
+function parseIdempotencyKey(idempotencyKey) {
   if (idempotencyKey === null) throw new ApiError(400, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key header is required");
   const key = stringField(idempotencyKey, "Idempotency-Key", { required: true, maxLength: 64 });
   if (!TRANSITION_IDENTIFIER.test(key)) throw new ApiError(400, "INVALID_FIELD", "Idempotency-Key must be a stable identifier");
+  return key;
+}
+
+function parseTransition(body, idempotencyKey) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["expectedStateVersion", "actionKey", "gateEvidence", "authorizationId"]));
+  const key = parseIdempotencyKey(idempotencyKey);
   if (!Number.isSafeInteger(body.expectedStateVersion) || body.expectedStateVersion < 1) throw new ApiError(400, "INVALID_FIELD", "'expectedStateVersion' must be a positive integer");
   const actionKey = stringField(body.actionKey, "actionKey", { required: true, maxLength: 64 });
   if (!TRANSITION_IDENTIFIER.test(actionKey)) throw new ApiError(400, "INVALID_FIELD", "actionKey must be a stable identifier");
@@ -2045,7 +2057,216 @@ function parseTransition(body, idempotencyKey) {
   return { expectedStateVersion: body.expectedStateVersion, actionKey, gateEvidence: body.gateEvidence ?? [], authorizationId: body.authorizationId === undefined ? null : stringField(body.authorizationId, "authorizationId", { nullable: true, maxLength: 96 }), idempotencyKey: key };
 }
 
-function assertTransitionPolicy(context, rule, command, authorization, descendants, occurredAt) {
+function parseHumanEvidenceRegistration(body, idempotencyKey) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["expectedStateVersion", "actionKey", "gateId"]));
+  if (!Number.isSafeInteger(body.expectedStateVersion) || body.expectedStateVersion < 1) throw new ApiError(400, "INVALID_FIELD", "'expectedStateVersion' must be a positive integer");
+  const actionKey = stringField(body.actionKey, "actionKey", { required: true, maxLength: 64 });
+  if (!TRANSITION_IDENTIFIER.test(actionKey)) throw new ApiError(400, "INVALID_FIELD", "actionKey must be a stable identifier");
+  const gateId = body.gateId === undefined ? null : stringField(body.gateId, "gateId", { required: true, maxLength: 64 });
+  if (gateId !== null && !TRANSITION_IDENTIFIER.test(gateId)) throw new ApiError(400, "INVALID_FIELD", "gateId must be a stable identifier");
+  return { expectedStateVersion: body.expectedStateVersion, actionKey, gateId, idempotencyKey: parseIdempotencyKey(idempotencyKey) };
+}
+
+function parseHumanEvidenceRevocation(body, idempotencyKey) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["reason"]));
+  const reason = stringField(body.reason, "reason", { required: true, maxLength: 64 });
+  if (!TRANSITION_IDENTIFIER.test(reason)) throw new ApiError(400, "INVALID_FIELD", "reason must be a non-PII stable identifier");
+  return { reason, idempotencyKey: parseIdempotencyKey(idempotencyKey) };
+}
+
+function humanAcceptanceSignerRequired() {
+  return new ApiError(403, "HUMAN_ACCEPTANCE_SIGNER_REQUIRED", "A trusted human acceptance signer assertion is required");
+}
+
+function humanAcceptanceSigningKey(secret, usage) {
+  return crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    usage,
+  );
+}
+
+function parseHumanAcceptanceAssertion(header) {
+  if (typeof header !== "string" || header.length === 0 || header.length > 4_096) {
+    throw humanAcceptanceSignerRequired();
+  }
+  const parts = header.split(".");
+  if (
+    parts.length !== 3
+    || parts[0] !== HUMAN_ACCEPTANCE_ASSERTION_VERSION
+    || !HUMAN_ACCEPTANCE_ASSERTION_BASE64URL.test(parts[1])
+    || !HUMAN_ACCEPTANCE_ASSERTION_BASE64URL.test(parts[2])
+  ) {
+    throw humanAcceptanceSignerRequired();
+  }
+  let signature;
+  try {
+    signature = decodeBase64Url(parts[2]);
+  } catch {
+    throw humanAcceptanceSignerRequired();
+  }
+  return { encodedPayload: parts[1], signature };
+}
+
+function parseSignedHumanAcceptancePayload(encodedPayload) {
+  try {
+    const payload = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(
+      decodeBase64Url(encodedPayload),
+    ));
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+      throw new Error("Human acceptance assertion payload is not an object");
+    }
+    return payload;
+  } catch {
+    throw humanAcceptanceSignerRequired();
+  }
+}
+
+function assertHumanAcceptanceAssertionScope(payload, expected, requiredKeys) {
+  const allowedKeys = new Set([
+    "version", "subject", "issuedAt", "expiresAt", "nonce",
+    ...Object.keys(expected), ...requiredKeys,
+  ]);
+  const keys = Object.keys(payload);
+  if (
+    keys.length !== allowedKeys.size
+    || keys.some((key) => !allowedKeys.has(key))
+    || payload.version !== 1
+    || typeof payload.subject !== "string"
+    || !HUMAN_ACCEPTANCE_ASSERTION_SUBJECT.test(payload.subject)
+    || !Number.isSafeInteger(payload.issuedAt)
+    || !Number.isSafeInteger(payload.expiresAt)
+    || typeof payload.nonce !== "string"
+    || !HUMAN_ACCEPTANCE_ASSERTION_NONCE.test(payload.nonce)
+  ) {
+    throw humanAcceptanceSignerRequired();
+  }
+  const timestamp = Date.now();
+  if (
+    payload.issuedAt > timestamp + HUMAN_ACCEPTANCE_ASSERTION_FUTURE_SKEW_MS
+    || payload.expiresAt < timestamp
+    || payload.expiresAt <= payload.issuedAt
+    || payload.expiresAt - payload.issuedAt > HUMAN_ACCEPTANCE_ASSERTION_TTL_MS
+  ) {
+    throw humanAcceptanceSignerRequired();
+  }
+  for (const [key, value] of Object.entries(expected)) {
+    if (payload[key] !== value) throw humanAcceptanceSignerRequired();
+  }
+  for (const key of requiredKeys) {
+    if (!Object.hasOwn(payload, key)) throw humanAcceptanceSignerRequired();
+  }
+}
+
+async function verifiedHumanAcceptanceActor(request, env, actor, expected, requiredKeys = []) {
+  if (typeof env.TASKBOARD_HUMAN_ACCEPTANCE_SECRET !== "string" || env.TASKBOARD_HUMAN_ACCEPTANCE_SECRET === "") {
+    throw new ApiError(500, "SERVER_MISCONFIGURED", "TASKBOARD_HUMAN_ACCEPTANCE_SECRET is not configured");
+  }
+  if (actor?.type !== "user") {
+    throw new ApiError(403, "HUMAN_ACTOR_REQUIRED", "Only an authenticated human can record acceptance evidence");
+  }
+  const { encodedPayload, signature } = parseHumanAcceptanceAssertion(
+    request.headers.get(HUMAN_ACCEPTANCE_SIGNER_HEADER),
+  );
+  const expectedSignature = new Uint8Array(await crypto.subtle.sign(
+    "HMAC",
+    await humanAcceptanceSigningKey(env.TASKBOARD_HUMAN_ACCEPTANCE_SECRET, ["sign"]),
+    new TextEncoder().encode(`${HUMAN_ACCEPTANCE_ASSERTION_VERSION}.${encodedPayload}`),
+  ));
+  if (
+    signature.byteLength !== expectedSignature.byteLength
+    || !crypto.subtle.timingSafeEqual(signature, expectedSignature)
+  ) {
+    throw humanAcceptanceSignerRequired();
+  }
+  const assertion = parseSignedHumanAcceptancePayload(encodedPayload);
+  assertHumanAcceptanceAssertionScope(assertion, expected, requiredKeys);
+  const actorKey = `human_${(await sha256(assertion.subject)).slice(0, 24)}`;
+  return {
+    actorKey,
+    actor: {
+      type: "user",
+      id: actorKey,
+      name: "Trusted human acceptance operator",
+      avatarUrl: null,
+    },
+    assertion,
+  };
+}
+
+function evidenceResponse(row) {
+  return {
+    evidenceId: row.evidence_id,
+    gateId: row.gate_id,
+    type: row.evidence_type,
+    capturedAt: row.captured_at,
+    scope: {
+      taskId: row.task_id,
+      taskVersion: row.task_version,
+      workflowId: row.workflow_id,
+      revisionId: row.revision_id,
+      transitionId: row.transition_id,
+      actionKey: row.action_key,
+      gateId: row.gate_id,
+    },
+    actor: { actorId: row.actor_key, kind: "human" },
+    status: row.status,
+    record: { evidenceEventId: row.evidence_event_id, eventHash: row.evidence_hash },
+    revocation: row.status === "revoked" ? {
+      revokedEventId: row.revoked_event_id,
+      eventHash: row.revocation_hash,
+      revokedAt: row.revoked_at,
+      reason: row.revocation_reason,
+    } : null,
+  };
+}
+
+function isLedgerWriteConflict(error) {
+  return /WORKFLOW_LEDGER_APPEND_ONLY|workflow_ledger_(events|head)|workflow_aggregate_projections.*last_sequence|workflow_outbox.*sequence|SQLITE_BUSY/i.test(String(error));
+}
+
+function matchingEvidencePayload(value, row) {
+  return value
+    && value.evidenceId === row.evidence_id
+    && value.gateId === row.gate_id
+    && value.type === row.evidence_type
+    && value.capturedAt === row.captured_at
+    && value.status === row.status
+    && value.actor?.kind === "human"
+    && value.actor?.actorId === row.actor_key
+    && value.record?.evidenceEventId === row.evidence_event_id
+    && value.record?.eventHash === row.evidence_hash
+    && value.revocation === null;
+}
+
+async function resolveHumanAcceptanceEvidence(env, context, rule, command, gateId) {
+  const candidates = command.gateEvidence.filter((item) => item?.gateId === gateId && item?.type === "human_acceptance");
+  if (candidates.length !== 1 || !TRANSITION_UUID.test(candidates[0]?.evidenceId ?? "")) return null;
+  const row = await env.DB.prepare(`
+    SELECT evidence.*
+    FROM workflow_human_evidence AS evidence
+    LEFT JOIN workflow_transition_evidence_consumptions AS consumed ON consumed.evidence_id = evidence.evidence_id
+    WHERE evidence.evidence_id = ?
+      AND evidence.status = 'valid'
+      AND evidence.task_id = ?
+      AND evidence.task_version = ?
+      AND evidence.workflow_id = ?
+      AND evidence.revision_id = ?
+      AND evidence.transition_id = ?
+      AND evidence.gate_id = ?
+      AND consumed.evidence_id IS NULL
+  `).bind(
+    candidates[0].evidenceId, context.task.id, command.expectedStateVersion,
+    context.pin.workflow_id, context.pin.revision_id, rule.transition_id, gateId,
+  ).first();
+  return row && matchingEvidencePayload(candidates[0], row) ? row : null;
+}
+
+function assertTransitionPolicy(context, rule, command, authorization, descendants, occurredAt, acceptanceEvidenceByGate) {
   if (context.task.version !== command.expectedStateVersion) throw transitionError("EXPECTED_STATE_CONFLICT", "Task changed since the requested transition state", { expectedStateVersion: command.expectedStateVersion, actualStateVersion: context.task.version });
   if (context.task.archived_at !== null) throw transitionError("TASK_ARCHIVED", "Archived tasks cannot transition");
   if (!rule || rule.from_task_stage_id !== context.task.stage_id) throw transitionError("ACTION_NOT_FOUND", "actionKey is not available from the task's pinned workflow state");
@@ -2053,10 +2274,13 @@ function assertTransitionPolicy(context, rule, command, authorization, descendan
   if (!transition) throw transitionError("ACTION_NOT_FOUND", "Transition is not defined by the pinned workflow");
   for (const gateId of transition.gateIds) {
     const gate = context.definition.gates.find((item) => item.gateId === gateId);
-    const evidence = command.gateEvidence.filter((item) => item?.gateId === gateId && item.status === "valid");
-    const validHumanAcceptance = evidence.some((item) => item.type === "human_acceptance" && item.actor?.kind === "human" && TRANSITION_UUID.test(item.evidenceId ?? "") && TRANSITION_UUID.test(item.record?.evidenceEventId ?? "") && TRANSITION_HASH.test(item.record?.eventHash ?? ""));
-    if (gate?.kind === "acceptance" && !validHumanAcceptance) throw transitionError("ACCEPTANCE_EVIDENCE_REQUIRED", "Transition requires valid human acceptance evidence", { gateId });
-    if (!gate?.requiredEvidenceTypes?.every((type) => evidence.some((item) => item.type === type))) throw transitionError("GATE_UNSATISFIED", `Gate ${gateId} is missing required evidence`, { gateId });
+    if (gate?.kind === "acceptance") {
+      if (!acceptanceEvidenceByGate?.get(gateId)) {
+        throw transitionError("ACCEPTANCE_EVIDENCE_REQUIRED", "Transition requires persisted valid human acceptance evidence", { gateId });
+      }
+      continue;
+    }
+    throw transitionError("GATE_UNSATISFIED", `Gate ${gateId} requires persisted evidence that is not available in this phase`, { gateId });
   }
   if (transition.authorization?.required) {
     if (!authorization) throw transitionError("HUMAN_AUTH_REQUIRED", "This transition requires an exact human authorization");
@@ -2071,7 +2295,7 @@ function assertTransitionPolicy(context, rule, command, authorization, descendan
   }
 }
 
-async function transitionTask(env, taskId, command, actor, { sortOrder, threadId, threadBinding } = {}) {
+async function transitionTask(env, taskId, command, actor, { sortOrder, threadId, threadBinding, retryCount = 0 } = {}) {
   const fingerprint = canonicalJson({ taskId, expectedStateVersion: command.expectedStateVersion, actionKey: command.actionKey, gateEvidence: command.gateEvidence, authorizationId: command.authorizationId, sortOrder: sortOrder ?? null, threadId: threadId ?? null, threadBinding: threadBinding ?? null });
   const existing = await env.DB.prepare("SELECT * FROM workflow_transition_requests WHERE idempotency_key = ?").bind(command.idempotencyKey).first();
   if (existing) {
@@ -2080,6 +2304,8 @@ async function transitionTask(env, taskId, command, actor, { sortOrder, threadId
     if (!event) throw transitionError("LEDGER_HASH_INVALID", "Transition request points to a missing ledger event");
     return { task: await getTask(env, taskId), transition: requestFromRow(existing), event: JSON.parse(event.envelope_json), idempotent: true };
   }
+  const existingLedgerKey = await env.DB.prepare("SELECT event_id FROM workflow_ledger_events WHERE idempotency_key = ?").bind(command.idempotencyKey).first();
+  if (existingLedgerKey) throw transitionError("IDEMPOTENCY_CONFLICT", "Idempotency-Key was already used for a different workflow request");
   const context = await transitionContext(env, taskId);
   const rule = await env.DB.prepare("SELECT * FROM workflow_transition_rules WHERE revision_id = ? AND action_key = ?").bind(context.pin.revision_id, command.actionKey).first();
   let authorization = null;
@@ -2093,7 +2319,15 @@ async function transitionTask(env, taskId, command, actor, { sortOrder, threadId
     UNION ALL SELECT relations.target_task_id, CASE WHEN descendants.required_path = 1 AND json_extract(relations.metadata, '$.required') = 1 THEN 1 ELSE 0 END FROM task_relations AS relations JOIN descendants ON descendants.task_id = relations.source_task_id WHERE relations.relation_type = 'parent'
   ) SELECT descendants.task_id, descendants.required_path AS required, tasks.status FROM descendants JOIN tasks ON tasks.id = descendants.task_id`).bind(context.task.id));
   const timestamp = now();
-  assertTransitionPolicy(context, rule, command, authorization, descendants, timestamp);
+  const transition = rule && context.definition.transitions.find((item) => item.transitionId === rule.transition_id && item.fromStageId === rule.from_contract_stage_id && item.toStageId === rule.to_contract_stage_id);
+  const acceptanceEvidenceByGate = new Map();
+  for (const gateId of transition?.gateIds ?? []) {
+    const gate = context.definition.gates.find((item) => item.gateId === gateId);
+    if (gate?.kind === "acceptance") {
+      acceptanceEvidenceByGate.set(gateId, await resolveHumanAcceptanceEvidence(env, context, rule, command, gateId));
+    }
+  }
+  assertTransitionPolicy(context, rule, command, authorization, descendants, timestamp, acceptanceEvidenceByGate);
   const destination = await env.DB.prepare("SELECT * FROM workflow_revision_stage_bindings WHERE revision_id = ? AND task_stage_id = ?").bind(context.pin.revision_id, rule.to_task_stage_id).first();
   if (!destination) throw transitionError("ACTION_NOT_FOUND", "Transition destination binding is unavailable");
   if (sortOrder === undefined) {
@@ -2109,12 +2343,16 @@ async function transitionTask(env, taskId, command, actor, { sortOrder, threadId
   const requestId = uuid();
   const state = { lastEventType: event.eventType, payload: event.payload, task: { id: context.task.id, stageId: destination.task_stage_id, status: destination.canonical_status, version: context.task.version + 1 } };
   const requestInsert = env.DB.prepare(`INSERT INTO workflow_transition_requests (request_id, task_id, idempotency_key, request_fingerprint, expected_state_version, action_key, workflow_id, revision_id, transition_id, from_stage_id, to_stage_id, event_id, event_hash, created_at)
-    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ? AND version = ?)`)
-    .bind(requestId, context.task.id, command.idempotencyKey, fingerprint, command.expectedStateVersion, rule.action_key, context.pin.workflow_id, context.pin.revision_id, rule.transition_id, rule.from_task_stage_id, rule.to_task_stage_id, event.eventId, event.eventHash, timestamp, context.task.id, context.task.version);
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(requestId, context.task.id, command.idempotencyKey, fingerprint, command.expectedStateVersion, rule.action_key, context.pin.workflow_id, context.pin.revision_id, rule.transition_id, rule.from_task_stage_id, rule.to_task_stage_id, event.eventId, event.eventHash, timestamp);
   const eventInsert = env.DB.prepare(`INSERT INTO workflow_ledger_events (sequence,event_id,event_type,workflow_id,revision_id,aggregate_type,aggregate_id,correlation_id,causation_id,idempotency_key,idempotency_fingerprint,prev_hash,event_hash,envelope_json,occurred_at,created_at)
-    SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ? AND version = ?)`)
-    .bind(sequence,event.eventId,event.eventType,event.workflowId,event.revisionId,event.aggregateType,event.aggregateId,event.correlationId,null,event.idempotencyKey,fingerprint,event.prevHash,event.eventHash,JSON.stringify(event),timestamp,timestamp,context.task.id,context.task.version);
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .bind(sequence,event.eventId,event.eventType,event.workflowId,event.revisionId,event.aggregateType,event.aggregateId,event.correlationId,null,event.idempotencyKey,fingerprint,event.prevHash,event.eventHash,JSON.stringify(event),timestamp,timestamp);
   const statements = [eventInsert, requestInsert,
+    ...[...acceptanceEvidenceByGate.values()].filter(Boolean).map((evidence) => env.DB.prepare(`
+      INSERT INTO workflow_transition_evidence_consumptions (request_id, evidence_id, consumed_at)
+      VALUES (?, ?, ?)
+    `).bind(requestId, evidence.evidence_id, timestamp)),
     head ? env.DB.prepare("UPDATE workflow_ledger_head SET last_sequence = ?, last_event_hash = ?, updated_at = ? WHERE singleton = 1").bind(sequence, event.eventHash, timestamp) : env.DB.prepare("INSERT INTO workflow_ledger_head (singleton, last_sequence, last_event_hash, updated_at) VALUES (1, ?, ?, ?)").bind(sequence, event.eventHash, timestamp),
     env.DB.prepare(`UPDATE tasks SET status = ?, stage_id = ?, sort_order = ?, ${threadAssignment} version = version + 1, updated_at = ? WHERE id = ? AND version = ?`).bind(destination.canonical_status, destination.task_stage_id, sortOrder, ...(storedBinding ?? []), timestamp, context.task.id, context.task.version),
     taskActivityStatement(env, context.task.id, actor, taskFieldChanges(taskFromRow(context.task), { status: destination.canonical_status, stageId: destination.task_stage_id, ...(storedBinding && context.task.thread_id !== storedBinding[0] ? { threadId: storedBinding[0] } : {}) }), timestamp, context.task.version + 1),
@@ -2124,7 +2362,19 @@ async function transitionTask(env, taskId, command, actor, { sortOrder, threadId
   ];
   try { await env.DB.batch(statements); } catch (error) {
     const raced = await env.DB.prepare("SELECT * FROM workflow_transition_requests WHERE idempotency_key = ?").bind(command.idempotencyKey).first();
-    if (raced && raced.request_fingerprint === fingerprint) return transitionTask(env, taskId, command, actor, { sortOrder, threadId, threadBinding });
+    if (raced && raced.request_fingerprint === fingerprint) return transitionTask(env, taskId, command, actor, { sortOrder, threadId, threadBinding, retryCount });
+    if (String(error).includes("INVALID_HUMAN_ACCEPTANCE_EVIDENCE")) {
+      throw transitionError("ACCEPTANCE_EVIDENCE_REQUIRED", "Human acceptance evidence is no longer valid for this transition");
+    }
+    if (String(error).includes("STALE_WORKFLOW_TRANSITION_REQUEST")) {
+      throw transitionError("EXPECTED_STATE_CONFLICT", "Task changed during transition application", { expectedStateVersion: command.expectedStateVersion });
+    }
+    const ledgerCollision = await env.DB.prepare("SELECT event_id FROM workflow_ledger_events WHERE idempotency_key = ?").bind(command.idempotencyKey).first();
+    if (ledgerCollision) throw transitionError("IDEMPOTENCY_CONFLICT", "Idempotency-Key was already used for a different workflow request");
+    if (isLedgerWriteConflict(error)) {
+      if (retryCount < LEDGER_RETRY_LIMIT) return transitionTask(env, taskId, command, actor, { sortOrder, threadId, threadBinding, retryCount: retryCount + 1 });
+      throw transitionError("LEDGER_CONTENTION", "Workflow ledger was busy; retry the same idempotency key");
+    }
     const latest = await requireTaskRow(env, taskId);
     if (latest.version !== command.expectedStateVersion) throw transitionError("EXPECTED_STATE_CONFLICT", "Task changed during transition application", { expectedStateVersion: command.expectedStateVersion, actualStateVersion: latest.version });
     throw error;
@@ -2135,6 +2385,223 @@ async function transitionTask(env, taskId, command, actor, { sortOrder, threadId
 
 function requestFromRow(row) {
   return { requestId: row.request_id, taskId: row.task_id, idempotencyKey: row.idempotency_key, expectedStateVersion: row.expected_state_version, actionKey: row.action_key, workflowId: row.workflow_id, revisionId: row.revision_id, transitionId: row.transition_id, fromStageId: row.from_stage_id, toStageId: row.to_stage_id, eventId: row.event_id, eventHash: row.event_hash, createdAt: row.created_at };
+}
+
+async function registerHumanAcceptanceEvidence(request, env, taskId, command, actor, { retryCount = 0 } = {}) {
+  const attested = await verifiedHumanAcceptanceActor(request, env, actor, {
+    purpose: "human_acceptance_evidence",
+    route: "/api/tasks/:id/evidence",
+    method: "POST",
+    taskId,
+    expectedStateVersion: command.expectedStateVersion,
+    actionKey: command.actionKey,
+    idempotencyKey: command.idempotencyKey,
+  }, ["gateId"]);
+  if (
+    typeof attested.assertion.gateId !== "string"
+    || !TRANSITION_IDENTIFIER.test(attested.assertion.gateId)
+    || (command.gateId !== null && command.gateId !== attested.assertion.gateId)
+  ) {
+    throw humanAcceptanceSignerRequired();
+  }
+  const { actorKey, actor: humanActor } = attested;
+  const attestedGateId = attested.assertion.gateId;
+  const fingerprint = canonicalJson({ taskId, expectedStateVersion: command.expectedStateVersion, actionKey: command.actionKey, gateId: attestedGateId, actorKey, type: "human_acceptance" });
+  const existing = await env.DB.prepare("SELECT * FROM workflow_human_evidence WHERE idempotency_key = ?").bind(command.idempotencyKey).first();
+  if (existing) {
+    if (existing.request_fingerprint !== fingerprint || existing.gate_id !== attestedGateId) throw transitionError("IDEMPOTENCY_CONFLICT", "Idempotency-Key was already used for a different acceptance evidence request");
+    const event = await env.DB.prepare("SELECT envelope_json FROM workflow_ledger_events WHERE event_id = ?").bind(existing.ledger_event_id).first();
+    if (!event) throw transitionError("LEDGER_HASH_INVALID", "Acceptance evidence points to a missing ledger event");
+    return { evidence: evidenceResponse(existing), event: JSON.parse(event.envelope_json), idempotent: true };
+  }
+  const existingLedgerKey = await env.DB.prepare("SELECT event_id FROM workflow_ledger_events WHERE idempotency_key = ?").bind(command.idempotencyKey).first();
+  if (existingLedgerKey) throw transitionError("IDEMPOTENCY_CONFLICT", "Idempotency-Key was already used for a different workflow request");
+  const context = await transitionContext(env, taskId);
+  if (context.task.version !== command.expectedStateVersion) {
+    throw transitionError("EXPECTED_STATE_CONFLICT", "Task changed since the requested acceptance state", {
+      expectedStateVersion: command.expectedStateVersion, actualStateVersion: context.task.version,
+    });
+  }
+  if (context.task.archived_at !== null) throw transitionError("TASK_ARCHIVED", "Archived tasks cannot record acceptance evidence");
+  const rule = await env.DB.prepare("SELECT * FROM workflow_transition_rules WHERE revision_id = ? AND action_key = ?").bind(context.pin.revision_id, command.actionKey).first();
+  if (!rule || rule.from_task_stage_id !== context.task.stage_id) throw transitionError("ACTION_NOT_FOUND", "actionKey is not available from the task's pinned workflow state");
+  const transition = context.definition.transitions.find((item) => item.transitionId === rule.transition_id && item.fromStageId === rule.from_contract_stage_id && item.toStageId === rule.to_contract_stage_id);
+  const acceptanceGates = (transition?.gateIds ?? [])
+    .map((gateId) => context.definition.gates.find((item) => item.gateId === gateId))
+    .filter((gate) => gate?.kind === "acceptance");
+  if (acceptanceGates.length === 0) throw transitionError("ACTION_NOT_FOUND", "This transition does not accept human acceptance evidence");
+  if (acceptanceGates.length > 1 && command.gateId === null) {
+    throw new ApiError(400, "GATE_ID_REQUIRED", "gateId is required when a transition has multiple human acceptance gates");
+  }
+  const gate = acceptanceGates.find((item) => item.gateId === (command.gateId ?? acceptanceGates[0].gateId));
+  if (!gate) throw transitionError("ACTION_NOT_FOUND", "gateId is not an acceptance gate for this transition");
+  if (gate.gateId !== attestedGateId) throw humanAcceptanceSignerRequired();
+  const timestamp = now();
+  const evidenceId = uuid();
+  const evidenceEventId = uuid();
+  const evidenceHash = await sha256(canonicalJson({
+    schemaVersion: 1, evidenceId, evidenceEventId, taskId: context.task.id,
+    taskVersion: context.task.version, workflowId: context.pin.workflow_id,
+    revisionId: context.pin.revision_id, transitionId: rule.transition_id,
+    gateId: gate.gateId, type: "human_acceptance", actorKey, capturedAt: timestamp,
+  }));
+  const head = await env.DB.prepare("SELECT * FROM workflow_ledger_head WHERE singleton = 1").first();
+  const sequence = (head?.last_sequence ?? 0) + 1;
+  const event = {
+    schemaVersion: 1, eventId: uuid(), eventType: "gate.satisfied", occurredAt: timestamp,
+    workflowId: context.pin.workflow_id, revisionId: context.pin.revision_id,
+    aggregateType: "task", aggregateId: context.task.id, correlationId: uuid(), causationId: null,
+    idempotencyKey: command.idempotencyKey, prevHash: head?.last_event_hash ?? null,
+    payload: { gateId: gate.gateId, evidence: { evidenceId, evidenceEventId, eventHash: evidenceHash, actorKey } },
+  };
+  event.eventHash = await sha256(canonicalJson(event));
+  const priorProjection = await env.DB.prepare("SELECT state_json, created_at FROM workflow_aggregate_projections WHERE aggregate_type = 'task' AND aggregate_id = ?").bind(context.task.id).first();
+  let previousState = {};
+  try { previousState = priorProjection ? JSON.parse(priorProjection.state_json) : {}; } catch { throw transitionError("LEDGER_HASH_INVALID", "Task aggregate projection is malformed"); }
+  const state = {
+    ...previousState,
+    lastEventType: event.eventType,
+    payload: event.payload,
+    task: previousState.task ?? { id: context.task.id, stageId: context.task.stage_id, status: context.task.status, version: context.task.version },
+  };
+  const evidenceRow = {
+    evidence_id: evidenceId, task_id: context.task.id, task_version: context.task.version,
+    workflow_id: context.pin.workflow_id, revision_id: context.pin.revision_id,
+    transition_id: rule.transition_id, action_key: command.actionKey, gate_id: gate.gateId,
+    evidence_type: "human_acceptance", captured_at: timestamp,
+    actor_key: actorKey, status: "valid", evidence_event_id: evidenceEventId, evidence_hash: evidenceHash, revoked_at: null,
+    revoked_event_id: null, revocation_hash: null, revocation_reason: null, revocation_idempotency_key: null,
+    revocation_request_fingerprint: null, revocation_ledger_event_id: null,
+  };
+  const statements = [
+    env.DB.prepare(`INSERT INTO workflow_ledger_events (sequence,event_id,event_type,workflow_id,revision_id,aggregate_type,aggregate_id,correlation_id,causation_id,idempotency_key,idempotency_fingerprint,prev_hash,event_hash,envelope_json,occurred_at,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(sequence, event.eventId, event.eventType, event.workflowId, event.revisionId, event.aggregateType, event.aggregateId, event.correlationId, null, event.idempotencyKey, fingerprint, event.prevHash, event.eventHash, JSON.stringify(event), timestamp, timestamp),
+    env.DB.prepare(`INSERT INTO workflow_human_evidence (evidence_id,idempotency_key,request_fingerprint,task_id,task_version,workflow_id,revision_id,transition_id,action_key,gate_id,evidence_type,actor_key,captured_at,evidence_event_id,evidence_hash,ledger_event_id,status,revoked_at,revoked_event_id,revocation_hash,revocation_reason,revocation_idempotency_key,revocation_request_fingerprint,revocation_ledger_event_id,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(evidenceId, command.idempotencyKey, fingerprint, context.task.id, context.task.version, context.pin.workflow_id, context.pin.revision_id, rule.transition_id, command.actionKey, gate.gateId, "human_acceptance", actorKey, timestamp, evidenceEventId, evidenceHash, event.eventId, "valid", null, null, null, null, null, null, null, timestamp),
+    head ? env.DB.prepare("UPDATE workflow_ledger_head SET last_sequence = ?, last_event_hash = ?, updated_at = ? WHERE singleton = 1").bind(sequence, event.eventHash, timestamp) : env.DB.prepare("INSERT INTO workflow_ledger_head (singleton, last_sequence, last_event_hash, updated_at) VALUES (1, ?, ?, ?)").bind(sequence, event.eventHash, timestamp),
+    env.DB.prepare(`INSERT INTO workflow_aggregate_projections (aggregate_type,aggregate_id,workflow_id,revision_id,last_sequence,last_event_id,last_event_type,last_event_hash,state_json,created_at,updated_at)
+      VALUES ('task',?,?,?,?,?,?,?,?,?,?) ON CONFLICT(aggregate_type,aggregate_id) DO UPDATE SET workflow_id=excluded.workflow_id,revision_id=excluded.revision_id,last_sequence=excluded.last_sequence,last_event_id=excluded.last_event_id,last_event_type=excluded.last_event_type,last_event_hash=excluded.last_event_hash,state_json=excluded.state_json,updated_at=excluded.updated_at`).bind(context.task.id, event.workflowId, event.revisionId, sequence, event.eventId, event.eventType, event.eventHash, JSON.stringify(state), priorProjection?.created_at ?? timestamp, timestamp),
+    env.DB.prepare("INSERT INTO workflow_outbox (event_id, sequence, topic, payload_json, created_at) VALUES (?, ?, 'workflow.gate.satisfied', ?, ?)").bind(event.eventId, sequence, JSON.stringify(event), timestamp),
+    env.DB.prepare(`INSERT INTO task_activities (
+      id, task_id, actor_type, actor_id, actor_name, actor_avatar_url, changes, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(uuid(), context.task.id, humanActor.type, humanActor.id, humanActor.name, humanActor.avatarUrl,
+        JSON.stringify([{ field: "acceptanceEvidence", before: null, after: evidenceId }]), timestamp),
+  ];
+  try { await env.DB.batch(statements); } catch (error) {
+    const raced = await env.DB.prepare("SELECT * FROM workflow_human_evidence WHERE idempotency_key = ?").bind(command.idempotencyKey).first();
+    if (raced && raced.request_fingerprint === fingerprint) return registerHumanAcceptanceEvidence(request, env, taskId, command, actor, { retryCount });
+    if (String(error).includes("STALE_HUMAN_ACCEPTANCE_EVIDENCE")) {
+      throw transitionError("EXPECTED_STATE_CONFLICT", "Task changed while acceptance evidence was being recorded");
+    }
+    const ledgerCollision = await env.DB.prepare("SELECT event_id FROM workflow_ledger_events WHERE idempotency_key = ?").bind(command.idempotencyKey).first();
+    if (ledgerCollision) throw transitionError("IDEMPOTENCY_CONFLICT", "Idempotency-Key was already used for a different workflow request");
+    if (isLedgerWriteConflict(error)) {
+      if (retryCount < LEDGER_RETRY_LIMIT) return registerHumanAcceptanceEvidence(request, env, taskId, command, actor, { retryCount: retryCount + 1 });
+      throw transitionError("LEDGER_CONTENTION", "Workflow ledger was busy; retry the same idempotency key");
+    }
+    throw error;
+  }
+  return { evidence: evidenceResponse(evidenceRow), event, idempotent: false };
+}
+
+async function revokeHumanAcceptanceEvidence(request, env, taskId, evidenceId, command, actor, { retryCount = 0 } = {}) {
+  const evidence = await env.DB.prepare("SELECT * FROM workflow_human_evidence WHERE evidence_id = ? AND task_id = ?").bind(evidenceId, taskId).first();
+  if (!evidence) throw new ApiError(404, "EVIDENCE_NOT_FOUND", "Human acceptance evidence was not found for this task");
+  const { actorKey, actor: humanActor } = await verifiedHumanAcceptanceActor(request, env, actor, {
+    purpose: "human_acceptance_revocation",
+    route: "/api/tasks/:id/evidence/:evidenceId/revoke",
+    method: "POST",
+    taskId,
+    evidenceId,
+    taskVersion: evidence.task_version,
+    workflowId: evidence.workflow_id,
+    revisionId: evidence.revision_id,
+    transitionId: evidence.transition_id,
+    actionKey: evidence.action_key,
+    gateId: evidence.gate_id,
+    reason: command.reason,
+    idempotencyKey: command.idempotencyKey,
+  });
+  const fingerprint = canonicalJson({ taskId, evidenceId, reason: command.reason, actorKey, type: "human_acceptance_revocation" });
+  if (evidence.actor_key !== actorKey) {
+    throw new ApiError(403, "HUMAN_EVIDENCE_ACTOR_REQUIRED", "Only the recorded human can revoke this acceptance evidence");
+  }
+  if (evidence.status === "revoked") {
+    if (evidence.revocation_idempotency_key !== command.idempotencyKey || evidence.revocation_request_fingerprint !== fingerprint) {
+      throw transitionError("EVIDENCE_REVOKED", "Human acceptance evidence has already been revoked");
+    }
+    const replay = await env.DB.prepare("SELECT envelope_json FROM workflow_ledger_events WHERE event_id = ?").bind(evidence.revocation_ledger_event_id).first();
+    if (!replay) throw transitionError("LEDGER_HASH_INVALID", "Acceptance evidence revocation points to a missing ledger event");
+    return { evidence: evidenceResponse(evidence), event: JSON.parse(replay.envelope_json), idempotent: true };
+  }
+  const existingLedgerKey = await env.DB.prepare("SELECT event_id FROM workflow_ledger_events WHERE idempotency_key = ?").bind(command.idempotencyKey).first();
+  if (existingLedgerKey) throw transitionError("IDEMPOTENCY_CONFLICT", "Idempotency-Key was already used for a different workflow request");
+  const timestamp = now();
+  const revokedEventId = uuid();
+  const revocationHash = await sha256(canonicalJson({
+    schemaVersion: 1, evidenceId: evidence.evidence_id, evidenceEventId: evidence.evidence_event_id,
+    revokedEventId, taskId: evidence.task_id, taskVersion: evidence.task_version,
+    workflowId: evidence.workflow_id, revisionId: evidence.revision_id,
+    transitionId: evidence.transition_id, gateId: evidence.gate_id, actorKey,
+    revokedAt: timestamp, reason: command.reason,
+  }));
+  const head = await env.DB.prepare("SELECT * FROM workflow_ledger_head WHERE singleton = 1").first();
+  const sequence = (head?.last_sequence ?? 0) + 1;
+  const event = {
+    schemaVersion: 1, eventId: uuid(), eventType: "gate.revoked", occurredAt: timestamp,
+    workflowId: evidence.workflow_id, revisionId: evidence.revision_id,
+    aggregateType: "task", aggregateId: evidence.task_id, correlationId: uuid(), causationId: null,
+    idempotencyKey: command.idempotencyKey, prevHash: head?.last_event_hash ?? null,
+    payload: {
+      gateId: evidence.gate_id,
+      evidence: { evidenceId: evidence.evidence_id, evidenceEventId: evidence.evidence_event_id, eventHash: evidence.evidence_hash, actorKey },
+      revocation: { revokedEventId, eventHash: revocationHash, revokedAt: timestamp, reason: command.reason, actorKey },
+    },
+  };
+  event.eventHash = await sha256(canonicalJson(event));
+  const priorProjection = await env.DB.prepare("SELECT state_json, created_at FROM workflow_aggregate_projections WHERE aggregate_type = 'task' AND aggregate_id = ?").bind(evidence.task_id).first();
+  let previousState = {};
+  try { previousState = priorProjection ? JSON.parse(priorProjection.state_json) : {}; } catch { throw transitionError("LEDGER_HASH_INVALID", "Task aggregate projection is malformed"); }
+  const state = {
+    ...previousState,
+    lastEventType: event.eventType,
+    payload: event.payload,
+    task: previousState.task ?? { id: evidence.task_id, stageId: null, status: null, version: evidence.task_version },
+  };
+  const statements = [
+    env.DB.prepare(`INSERT INTO workflow_ledger_events (sequence,event_id,event_type,workflow_id,revision_id,aggregate_type,aggregate_id,correlation_id,causation_id,idempotency_key,idempotency_fingerprint,prev_hash,event_hash,envelope_json,occurred_at,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(sequence, event.eventId, event.eventType, event.workflowId, event.revisionId, event.aggregateType, event.aggregateId, event.correlationId, null, event.idempotencyKey, fingerprint, event.prevHash, event.eventHash, JSON.stringify(event), timestamp, timestamp),
+    env.DB.prepare(`UPDATE workflow_human_evidence
+      SET status = 'revoked', revoked_at = ?, revoked_event_id = ?, revocation_hash = ?, revocation_reason = ?,
+        revocation_idempotency_key = ?, revocation_request_fingerprint = ?, revocation_ledger_event_id = ?
+      WHERE evidence_id = ?`).bind(timestamp, revokedEventId, revocationHash, command.reason, command.idempotencyKey, fingerprint, event.eventId, evidence.evidence_id),
+    head ? env.DB.prepare("UPDATE workflow_ledger_head SET last_sequence = ?, last_event_hash = ?, updated_at = ? WHERE singleton = 1").bind(sequence, event.eventHash, timestamp) : env.DB.prepare("INSERT INTO workflow_ledger_head (singleton, last_sequence, last_event_hash, updated_at) VALUES (1, ?, ?, ?)").bind(sequence, event.eventHash, timestamp),
+    env.DB.prepare(`INSERT INTO workflow_aggregate_projections (aggregate_type,aggregate_id,workflow_id,revision_id,last_sequence,last_event_id,last_event_type,last_event_hash,state_json,created_at,updated_at)
+      VALUES ('task',?,?,?,?,?,?,?,?,?,?) ON CONFLICT(aggregate_type,aggregate_id) DO UPDATE SET workflow_id=excluded.workflow_id,revision_id=excluded.revision_id,last_sequence=excluded.last_sequence,last_event_id=excluded.last_event_id,last_event_type=excluded.last_event_type,last_event_hash=excluded.last_event_hash,state_json=excluded.state_json,updated_at=excluded.updated_at`).bind(evidence.task_id, event.workflowId, event.revisionId, sequence, event.eventId, event.eventType, event.eventHash, JSON.stringify(state), priorProjection?.created_at ?? timestamp, timestamp),
+    env.DB.prepare("INSERT INTO workflow_outbox (event_id, sequence, topic, payload_json, created_at) VALUES (?, ?, 'workflow.gate.revoked', ?, ?)").bind(event.eventId, sequence, JSON.stringify(event), timestamp),
+    env.DB.prepare(`INSERT INTO task_activities (
+      id, task_id, actor_type, actor_id, actor_name, actor_avatar_url, changes, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(uuid(), evidence.task_id, humanActor.type, humanActor.id, humanActor.name, humanActor.avatarUrl,
+        JSON.stringify([{ field: "acceptanceEvidence", before: evidence.evidence_id, after: "revoked" }]), timestamp),
+  ];
+  try { await env.DB.batch(statements); } catch (error) {
+    const raced = await env.DB.prepare("SELECT * FROM workflow_human_evidence WHERE evidence_id = ? AND task_id = ?").bind(evidenceId, taskId).first();
+    if (raced?.status === "revoked" && raced.revocation_idempotency_key === command.idempotencyKey && raced.revocation_request_fingerprint === fingerprint) {
+      return revokeHumanAcceptanceEvidence(request, env, taskId, evidenceId, command, actor, { retryCount });
+    }
+    if (raced?.status === "revoked") throw transitionError("EVIDENCE_REVOKED", "Human acceptance evidence has already been revoked");
+    const ledgerCollision = await env.DB.prepare("SELECT event_id FROM workflow_ledger_events WHERE idempotency_key = ?").bind(command.idempotencyKey).first();
+    if (ledgerCollision) throw transitionError("IDEMPOTENCY_CONFLICT", "Idempotency-Key was already used for a different workflow request");
+    if (isLedgerWriteConflict(error)) {
+      if (retryCount < LEDGER_RETRY_LIMIT) return revokeHumanAcceptanceEvidence(request, env, taskId, evidenceId, command, actor, { retryCount: retryCount + 1 });
+      throw transitionError("LEDGER_CONTENTION", "Workflow ledger was busy; retry the same idempotency key");
+    }
+    throw error;
+  }
+  const revoked = await env.DB.prepare("SELECT * FROM workflow_human_evidence WHERE evidence_id = ?").bind(evidenceId).first();
+  return { evidence: evidenceResponse(revoked), event, idempotent: false };
 }
 
 async function createTask(env, input, actor) {
@@ -3881,6 +4348,32 @@ async function routeApi(request, env, actor, url) {
     return json(200, await transitionTask(env, taskId, command, actor));
   }
 
+  const taskEvidenceMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/evidence$/);
+  if (taskEvidenceMatch) {
+    requireNoQuery(url, "Human evidence routes");
+    if (request.method !== "POST") methodNotAllowed(["POST"]);
+    const taskId = decodePathPart(taskEvidenceMatch[1], "Task id");
+    const command = parseHumanEvidenceRegistration(
+      await readJson(request),
+      request.headers.get("idempotency-key"),
+    );
+    return json(201, await registerHumanAcceptanceEvidence(request, env, taskId, command, actor));
+  }
+
+  const taskEvidenceRevocationMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/evidence\/([^/]+)\/revoke$/);
+  if (taskEvidenceRevocationMatch) {
+    requireNoQuery(url, "Human evidence revocation routes");
+    if (request.method !== "POST") methodNotAllowed(["POST"]);
+    const taskId = decodePathPart(taskEvidenceRevocationMatch[1], "Task id");
+    const evidenceId = decodePathPart(taskEvidenceRevocationMatch[2], "Evidence id");
+    if (!TRANSITION_UUID.test(evidenceId)) throw new ApiError(400, "INVALID_FIELD", "Evidence id must be a UUID");
+    const command = parseHumanEvidenceRevocation(
+      await readJson(request),
+      request.headers.get("idempotency-key"),
+    );
+    return json(200, await revokeHumanAcceptanceEvidence(request, env, taskId, evidenceId, command, actor));
+  }
+
   const relationMatch = pathname.match(
     /^\/api\/tasks\/([^/]+)\/relations\/([^/]+)\/([^/]+)$/,
   );
@@ -4035,10 +4528,20 @@ async function routeApi(request, env, actor, url) {
     if (!action && request.method === "PATCH") {
       const input = parseTaskPatch(await readJson(request));
       const changesWorkflowState = Object.hasOwn(input.changes, "status") || Object.hasOwn(input.changes, "stageId");
-      // A cross-project PATCH changes the task's owning workflow, so it stays
-      // on the existing project-move path. Same-project state changes are
-      // always recorded through TransitionService below.
-      if (changesWorkflowState && !Object.hasOwn(input.changes, "projectId")) {
+      if (Object.hasOwn(input.changes, "projectId")) {
+        const targetProject = await requireProject(env, input.changes.projectId);
+        const current = await requireTaskRow(env, taskId);
+        if (targetProject.id !== current.project_id) {
+          if (changesWorkflowState) {
+            throw new ApiError(409, "TRANSITION_REQUIRED", "Project moves cannot be combined with status or stage changes; record the transition separately");
+          }
+          throw new ApiError(409, "PROJECT_MOVE_UNAVAILABLE", "Cross-project moves are unavailable while a task is pinned to its project workflow");
+        }
+        if (changesWorkflowState) {
+          throw new ApiError(409, "TRANSITION_REQUIRED", "Legacy status or stage changes must not be combined with project updates");
+        }
+      }
+      if (changesWorkflowState) {
         const otherChanges = Object.keys(input.changes).filter((field) => field !== "status" && field !== "stageId");
         if (otherChanges.length || input.assigneeTarget !== undefined || input.threadId !== undefined || input.threadBinding !== undefined) {
           throw new ApiError(409, "TRANSITION_REQUIRED", "Legacy status or stage changes must be sent alone so TransitionService can record one atomic transition");
