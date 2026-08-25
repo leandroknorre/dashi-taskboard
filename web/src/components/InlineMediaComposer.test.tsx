@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useState, type KeyboardEventHandler } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ComposerCandidatesResponse, Task } from "../types";
@@ -156,6 +156,7 @@ describe("InlineMediaComposer completion references", () => {
     fireEvent.keyUp(editor, { key: "a" });
 
     expect(await screen.findByRole("option", { name: /任务总管/ })).toBeTruthy();
+    expect(screen.getByRole("listbox", { name: "Composer completions" }).getAttribute("aria-busy")).toBe("false");
     expect(screen.getByText("Agents")).toBeTruthy();
     expect(screen.getByText("Taskboard issues")).toBeTruthy();
     expect(screen.getAllByRole("option")).toHaveLength(2);
@@ -347,10 +348,35 @@ describe("InlineMediaComposer completion references", () => {
     placeCaretAtEnd(editor);
     fireEvent.keyUp(editor, { key: "g" });
     await screen.findByText("No matching completions");
+    const emptyMenu = screen.getByRole("listbox", { name: "Composer completions" });
+    expect(emptyMenu.getAttribute("aria-busy")).toBe("false");
+    expect(within(emptyMenu).getByRole("status").textContent).toContain("No matching completions");
+    expect(screen.queryAllByRole("option")).toHaveLength(0);
 
     fireEvent.keyDown(editor, { key: "Escape" });
     expect(screen.queryByRole("listbox")).toBeNull();
     expect(screen.getByTestId("serialized").textContent).toBe("@missing");
+  });
+
+  it("keeps loading and failed completion feedback accessible without candidates", async () => {
+    let rejectRequest!: (error: Error) => void;
+    api.getCandidates.mockReturnValue(new Promise<ComposerCandidatesResponse>((_resolve, reject) => {
+      rejectRequest = reject;
+    }));
+    render(<TestComposer initial="@unavailable" />);
+    const editor = screen.getByRole("textbox", { name: "Description" });
+    placeCaretAtEnd(editor);
+    fireEvent.keyUp(editor, { key: "e" });
+
+    const loadingMenu = await screen.findByRole("listbox", { name: "Composer completions" });
+    expect(loadingMenu.getAttribute("aria-busy")).toBe("true");
+    expect(within(loadingMenu).getByRole("status").textContent).toContain("Loading completions…");
+    expect(screen.queryAllByRole("option")).toHaveLength(0);
+
+    rejectRequest(new Error("Candidate service unavailable"));
+    expect((await screen.findByRole("alert")).textContent).toContain("Candidate service unavailable");
+    expect(screen.getByRole("listbox", { name: "Composer completions" }).getAttribute("aria-busy")).toBe("false");
+    expect(screen.queryAllByRole("option")).toHaveLength(0);
   });
 
   it("does not reopen a dismissed query when an aborted response resolves late", async () => {

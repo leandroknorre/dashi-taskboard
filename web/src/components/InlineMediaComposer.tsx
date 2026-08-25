@@ -1945,9 +1945,7 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
         >
           {atomPortals}
         </div>
-        {completionQuery
-          && (completionLoading || completionError !== null || completionSelections.length > 0)
-          && (
+        {completionQuery && (
           <ComposerCompletionMenu
             anchor={completionQuery.anchor}
             anchorRect={completionQuery.anchorRect}
@@ -1967,7 +1965,7 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
             }}
             onClose={() => setCompletionQuery(null)}
           />
-          )}
+        )}
       </>
     );
   },
