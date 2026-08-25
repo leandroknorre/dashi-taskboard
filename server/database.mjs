@@ -17,6 +17,7 @@ import {
   workspaceItemFromRow,
   workspaceOverviewFromTask,
 } from "../shared/nested-workspace.mjs";
+import { migrateLocalWorkflowLedger } from "./workflow-ledger.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
 const TASK_TREE_MAX_NODES = 1_000;
@@ -1034,6 +1035,7 @@ export class TaskboardDatabase {
       WHERE id = 'local' AND (name != '全局' OR workspace_path IS NOT NULL)
     `).run(timestamp);
     this.#migrateStageWorkflows();
+    migrateLocalWorkflowLedger(this.database);
   }
 
   #migrateStageWorkflows() {
