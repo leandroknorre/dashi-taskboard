@@ -1106,10 +1106,27 @@ test("cloud task rollup matches the deterministic local parent-only contract", a
   )).body.rollup;
 
   const latestBlocker = await latest(blocker.body.task.id);
-  assert.equal((await cloud.request(`/api/tasks/${blocker.body.task.id}`, {
-    method: "PATCH",
+  assert.equal((await cloud.request(`/api/tasks/${blocker.body.task.id}/transitions`, {
+    method: "POST",
     actorName: alice,
-    json: { version: latestBlocker.version, status: "done" },
+    headers: { "idempotency-key": "rollup_blocker_done_1" },
+    json: {
+      expectedStateVersion: latestBlocker.version,
+      actionKey: "legacy_move_3_6",
+      gateEvidence: [{
+        evidenceId: "11111111-1111-4111-8111-111111111111",
+        gateId: "human-acceptance",
+        type: "human_acceptance",
+        capturedAt: "2026-08-24T12:00:00.000Z",
+        actor: { actorId: "reviewer", kind: "human" },
+        status: "valid",
+        record: {
+          evidenceEventId: "22222222-2222-4222-8222-222222222222",
+          eventHash: "a".repeat(64),
+        },
+        revocation: null,
+      }],
+    },
   })).response.status, 200);
   const recalculated = await cloud.request(`/api/tasks/${root.body.task.id}/rollup`, { actorName: alice });
   assert.equal(recalculated.body.rollup.visual.state, "normal");
