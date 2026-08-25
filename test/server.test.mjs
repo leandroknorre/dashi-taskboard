@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHmac, randomUUID } from "node:crypto";
 import { access, chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, request as httpRequest } from "node:http";
+import { createServer as createNetServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -174,6 +175,10 @@ test("close is concurrent-safe and terminates persistent SSE connections", async
   }), { code: "ECONNREFUSED" });
   assert.throws(() => app.database.database.prepare("SELECT 1").get());
   assert.strictEqual(app.close(), firstClose);
+  await assert.rejects(
+    () => app.listen({ host: "127.0.0.1", port: 0 }),
+    { code: "APP_CLOSED" },
+  );
 });
 
 test("close before listen permanently seals the app", async () => {
@@ -243,6 +248,59 @@ test("shutdown terminates an upgrade delayed before its cloud target opens", asy
       projectMappings: {},
       threadBindings: {},
     });
+    client.terminate();
+    await app.close();
+    await new Promise((resolve) => upstream.close(resolve));
+  }
+});
+
+test("shutdown terminates a cloud WebSocket while its upstream handshake is pending", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-pending-websocket-"));
+  let upstreamSocket;
+  let upstreamConnectedResolve;
+  const upstreamConnected = new Promise((resolve) => { upstreamConnectedResolve = resolve; });
+  let upstreamClosedResolve;
+  const upstreamClosed = new Promise((resolve) => { upstreamClosedResolve = resolve; });
+  const upstream = createNetServer((socket) => {
+    upstreamSocket = socket;
+    socket.once("close", upstreamClosedResolve);
+    upstreamConnectedResolve();
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const upstreamAddress = upstream.address();
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    cloudConfigStore: {
+      async read() {
+        return {
+          remoteUrl: `http://127.0.0.1:${upstreamAddress.port}`,
+          actorName: "test-actor",
+          sharedKey: "test-shared-key",
+          projectMappings: {},
+          threadBindings: {},
+        };
+      },
+    },
+  });
+  runningApps.push({ app, directory });
+  const address = await app.listen({ host: "127.0.0.1", port: 0 });
+  const client = new WebSocket(`ws://127.0.0.1:${address.port}/api/events`);
+  const clientClosed = new Promise((resolve) => {
+    client.once("close", resolve);
+    client.once("error", () => {});
+  });
+
+  try {
+    await completeWithin(upstreamConnected, 1_000, "upstream handshake connection");
+    const closing = app.close();
+    await completeWithin(
+      Promise.all([closing, clientClosed, upstreamClosed]),
+      1_000,
+      "pending WebSocket shutdown",
+    );
+    assert.equal(upstreamSocket.destroyed, true);
+    assert.equal(app.server.listening, false);
+  } finally {
     client.terminate();
     await app.close();
     await new Promise((resolve) => upstream.close(resolve));

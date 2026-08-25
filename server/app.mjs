@@ -3587,6 +3587,8 @@ export function createTaskboardServer(options = {}) {
 
   const cloudRealtimeServer = new WebSocketServer({ noServer: true });
   const cloudRealtimeSockets = new Set();
+  const pendingCloudRealtimeSockets = new Set();
+  const pendingCloudRealtimeUpgrades = new Set();
   let lifecycle = "open";
   let listening = false;
   let listenPromise = null;
@@ -3632,6 +3634,7 @@ export function createTaskboardServer(options = {}) {
 
   server.on("upgrade", async (request, socket, head) => {
     let remoteSocket;
+    pendingCloudRealtimeUpgrades.add(socket);
     try {
       if (isClosing()) {
         terminateUpgradeSocket(socket);
@@ -3662,6 +3665,11 @@ export function createTaskboardServer(options = {}) {
         return;
       }
       remoteSocket = new WebSocketClient(target.url, { headers: target.headers });
+      pendingCloudRealtimeSockets.add(remoteSocket);
+      const removePendingRemoteSocket = () => pendingCloudRealtimeSockets.delete(remoteSocket);
+      remoteSocket.once("open", removePendingRemoteSocket);
+      remoteSocket.once("close", removePendingRemoteSocket);
+      remoteSocket.once("error", removePendingRemoteSocket);
       const pendingMessages = [];
       const queueMessage = (data, isBinary) => pendingMessages.push({ data, isBinary });
       remoteSocket.on("message", queueMessage);
@@ -3699,6 +3707,7 @@ export function createTaskboardServer(options = {}) {
           return;
         }
         const pair = { localSocket, remoteSocket };
+        pendingCloudRealtimeUpgrades.delete(socket);
         cloudRealtimeSockets.add(pair);
         const removePair = () => cloudRealtimeSockets.delete(pair);
         const forwardMessage = (data, isBinary) => {
@@ -3734,6 +3743,8 @@ export function createTaskboardServer(options = {}) {
       remoteSocket?.terminate();
       if (isClosing()) terminateUpgradeSocket(socket);
       else rejectWebSocketUpgrade(socket, error?.status ?? 502, "WebSocket connection failed");
+    } finally {
+      pendingCloudRealtimeUpgrades.delete(socket);
     }
   });
 
@@ -3769,6 +3780,14 @@ export function createTaskboardServer(options = {}) {
         firstError ??= error;
       }
     };
+    for (const socket of pendingCloudRealtimeUpgrades) {
+      await closeStep(() => terminateUpgradeSocket(socket));
+    }
+    pendingCloudRealtimeUpgrades.clear();
+    for (const remoteSocket of pendingCloudRealtimeSockets) {
+      await closeStep(() => remoteSocket.terminate());
+    }
+    pendingCloudRealtimeSockets.clear();
     for (const { localSocket, remoteSocket } of cloudRealtimeSockets) {
       await closeStep(() => localSocket.terminate());
       await closeStep(() => remoteSocket.terminate());
