@@ -1,4 +1,4 @@
-import { createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { chmod, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -35,6 +35,7 @@ import { ApiError, TaskboardDatabase } from "./database.mjs";
 import { createJiraConfigStore } from "./jira-config.mjs";
 import { createJiraIntegration } from "./jira-integration.mjs";
 import { ProjectSummaryService } from "./project-summary.mjs";
+import { TransitionService } from "./transition-service.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const execFileAsync = promisify(execFile);
@@ -692,6 +693,39 @@ function parseMove(body) {
     threadId: parseThreadId(body.threadId),
     threadBinding: parseThreadBinding(body.threadBinding),
   };
+}
+
+function parseTaskTransition(body, idempotencyHeader) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "expectedStateVersion", "actionKey", "gateEvidence", "authorizationId",
+  ]));
+  if (idempotencyHeader === undefined) {
+    throw new ApiError(400, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key header is required");
+  }
+  if (!Number.isSafeInteger(body.expectedStateVersion) || body.expectedStateVersion < 1) {
+    throw new ApiError(400, "INVALID_FIELD", "'expectedStateVersion' must be a positive integer");
+  }
+  if (body.gateEvidence !== undefined && !Array.isArray(body.gateEvidence)) {
+    throw new ApiError(400, "INVALID_FIELD", "'gateEvidence' must be an array");
+  }
+  return {
+    expectedStateVersion: body.expectedStateVersion,
+    actionKey: stringField(body.actionKey, "actionKey", { required: true, maxLength: 64 }),
+    gateEvidence: body.gateEvidence ?? [],
+    authorizationId: body.authorizationId === undefined
+      ? null
+      : stringField(body.authorizationId, "authorizationId", { nullable: true, maxLength: 96 }),
+    idempotencyKey: stringField(idempotencyHeader, "Idempotency-Key", { required: true, maxLength: 64 }),
+  };
+}
+
+function legacyTransitionIdempotencyKey({ taskId, version, status, stageId, sortOrder }) {
+  const digest = createHash("sha256")
+    .update(JSON.stringify({ taskId, version, status, stageId: stageId ?? null, sortOrder: sortOrder ?? null }))
+    .digest("hex")
+    .slice(0, 56);
+  return `legacy_${digest}`;
 }
 
 function parseStageWorkflowSave(body) {
@@ -1680,6 +1714,7 @@ export function createTaskboardServer(options = {}) {
   );
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath);
+  const transitions = new TransitionService(database);
   const events = new EventHub();
   let clientStorageWrite = Promise.resolve();
 
@@ -3126,6 +3161,40 @@ export function createTaskboardServer(options = {}) {
         return sendJson(response, 200, { workspace: database.getNestedWorkspace(id, options) });
       }
 
+      const taskTransitionRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/transitions$/);
+      if (taskTransitionRoute) {
+        let id;
+        try {
+          id = decodeURIComponent(taskTransitionRoute[1]);
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Task id contains invalid encoding");
+        }
+        if (id.length === 0 || id.length > 128) {
+          throw new ApiError(400, "INVALID_PATH", "Task id is invalid");
+        }
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Transition routes do not accept query parameters");
+        }
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const current = database.getTask(id);
+        if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+        if (current.source === "jira") {
+          throw new ApiError(409, "LOCAL_TRANSITION_UNAVAILABLE", "Jira-synchronized tasks remain controlled by Jira in this local-only transition phase");
+        }
+        const command = parseTaskTransition(
+          await readJson(request),
+          requestHeader(request, "idempotency-key"),
+        );
+        const result = transitions.transition(id, command, { actor: actorFromRequest(request) });
+        events.emit("task.transitioned", { task: result.task, transition: result.request });
+        return sendJson(response, 200, {
+          task: result.task,
+          transition: result.request,
+          event: result.event,
+          idempotent: result.idempotent,
+        });
+      }
+
       const taskRoute = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(archive|restore|move))?$/);
       if (taskRoute) {
         let id;
@@ -3164,6 +3233,43 @@ export function createTaskboardServer(options = {}) {
               "JIRA_PROJECT_MOVE_UNAVAILABLE",
               "本地任务不能移入 Jira 同步项目",
             );
+          }
+          const changesWorkflowState = Object.hasOwn(changes, "status") || Object.hasOwn(changes, "stageId");
+          if (current.source !== "jira" && changesWorkflowState) {
+            if (current.version !== version) {
+              throw new ApiError(409, "VERSION_CONFLICT", "Task changed since it was last read", {
+                expectedVersion: version,
+                actualVersion: current.version,
+              });
+            }
+            const nonTransitionFields = Object.keys(changes).filter((field) => field !== "status" && field !== "stageId");
+            if (nonTransitionFields.length > 0 || assigneeTarget !== undefined || threadId !== undefined || threadBinding !== undefined) {
+              throw new ApiError(
+                409,
+                "TRANSITION_REQUIRED",
+                "Legacy status or stage changes must be sent alone so TransitionService can record one atomic transition",
+              );
+            }
+            const result = transitions.transitionLegacy(id, {
+              expectedStateVersion: version,
+              status: changes.status,
+              stageId: changes.stageId,
+              idempotencyKey: legacyTransitionIdempotencyKey({
+                taskId: id,
+                version,
+                status: changes.status,
+                stageId: changes.stageId,
+              }),
+              actor,
+            });
+            events.emit("task.transitioned", { task: result.task, transition: result.request });
+            return sendJson(response, 200, {
+              task: result.task,
+              transition: result.request,
+              event: result.event,
+              idempotent: result.idempotent,
+              legacy: true,
+            });
           }
           if (current.source === "jira") {
             if (current.version !== version) {
@@ -3234,6 +3340,47 @@ export function createTaskboardServer(options = {}) {
           const move = resolveInputThreadBinding(parseMove(await readJson(request)));
           const current = database.getTask(id);
           if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+          const actor = actorFromRequest(request);
+          if (current.source !== "jira") {
+            if (current.version !== move.version) {
+              throw new ApiError(409, "VERSION_CONFLICT", "Task changed since it was last read", {
+                expectedVersion: move.version,
+                actualVersion: current.version,
+              });
+            }
+            const defaultDestination = move.stageId === undefined
+              ? database.getStageWorkflow(current.projectId).definition.stages.find((stage) => (
+                stage.canonicalStatus === move.status && stage.active && stage.isDefaultForStatus
+              ))
+              : null;
+            const destinationStageId = move.stageId ?? defaultDestination?.stageId;
+            if (destinationStageId !== current.stageId) {
+              const result = transitions.transitionLegacy(id, {
+                expectedStateVersion: move.version,
+                status: move.status,
+                stageId: move.stageId,
+                sortOrder: move.sortOrder,
+                idempotencyKey: legacyTransitionIdempotencyKey({
+                  taskId: id,
+                  version: move.version,
+                  status: move.status,
+                  stageId: move.stageId,
+                  sortOrder: move.sortOrder,
+                }),
+                actor,
+                threadId: move.threadId,
+                threadBinding: move.threadBinding,
+              });
+              events.emit("task.transitioned", { task: result.task, transition: result.request });
+              return sendJson(response, 200, {
+                task: result.task,
+                transition: result.request,
+                event: result.event,
+                idempotent: result.idempotent,
+                legacy: true,
+              });
+            }
+          }
           if (current.source === "jira") {
             if (current.version !== move.version) {
               throw new ApiError(409, "VERSION_CONFLICT", "Task changed since it was last read", {
@@ -3253,7 +3400,7 @@ export function createTaskboardServer(options = {}) {
             move.sortOrder,
             move.threadId,
             move.threadBinding,
-            actorFromRequest(request),
+            actor,
             move.stageId,
           );
           events.emit("task.moved", { task });

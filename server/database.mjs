@@ -18,6 +18,7 @@ import {
   workspaceOverviewFromTask,
 } from "../shared/nested-workspace.mjs";
 import { migrateLocalWorkflowLedger } from "./workflow-ledger.mjs";
+import { migrateLocalWorkflowTransitions } from "./workflow-transition-schema.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
 const TASK_TREE_MAX_NODES = 1_000;
@@ -1036,6 +1037,7 @@ export class TaskboardDatabase {
     `).run(timestamp);
     this.#migrateStageWorkflows();
     migrateLocalWorkflowLedger(this.database);
+    migrateLocalWorkflowTransitions(this.database);
   }
 
   #migrateStageWorkflows() {
@@ -1981,6 +1983,19 @@ export class TaskboardDatabase {
 
   saveStageWorkflow(projectId, expectedVersion, definition, removals = []) {
     const current = this.getStageWorkflow(projectId);
+    // Once a project has an immutable workflow revision, changing physical
+    // stages through the old editor would either invalidate pinned bindings or
+    // remap tasks without a transition event. Authoring the next immutable
+    // revision is deliberately outside this local TransitionService slice.
+    if (this.database.prepare(
+      "SELECT 1 FROM workflow_definitions WHERE project_id = ?",
+    ).get(projectId)) {
+      throw new ApiError(
+        409,
+        "WORKFLOW_AUTHORING_UNAVAILABLE",
+        "Stage workflow editing is unavailable after immutable workflow revisions are pinned",
+      );
+    }
     if (current.version !== expectedVersion) {
       throw new ApiError(409, "VERSION_CONFLICT", "Workflow was changed by another client", {
         expectedVersion,
