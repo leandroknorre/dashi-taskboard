@@ -7,12 +7,12 @@ import { request as httpRequest, createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { once } from "node:events";
 import test from "node:test";
 import WebSocket from "ws";
 
 import { createTaskboardServer } from "../server/index.mjs";
 import { TaskboardDatabase } from "../server/database.mjs";
+import { stopChild } from "./helpers/stop-child.mjs";
 
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
 const delayMs = 1_800;
@@ -371,20 +371,7 @@ async function connectCdp(port) {
 }
 
 async function stop(child) {
-  if (!child || child.exitCode !== null) return;
-  const exited = once(child, "exit");
-  child.kill("SIGTERM");
-  try {
-    await withTimeout(exited, teardownTimeoutMs, "Chrome did not stop after SIGTERM");
-  } catch (terminateError) {
-    if (child.exitCode === null) child.kill("SIGKILL");
-    try {
-      await withTimeout(exited, teardownTimeoutMs, "Chrome did not stop after SIGKILL");
-    } catch (killError) {
-      throw new AggregateError([terminateError, killError], "Chrome teardown failed");
-    }
-    throw terminateError;
-  }
+  await stopChild(child, { timeoutMs: teardownTimeoutMs, name: "Chrome" });
 }
 
 test("App repaints real DHTMLX Gantt when the project workflow arrives late", { timeout: 60_000 }, async (t) => {

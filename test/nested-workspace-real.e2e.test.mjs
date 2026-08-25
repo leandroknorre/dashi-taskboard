@@ -7,12 +7,12 @@ import { createServer, request as httpRequest } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { once } from "node:events";
 import test from "node:test";
 import WebSocket from "ws";
 
 import { createTaskboardServer } from "../server/index.mjs";
 import { TaskboardDatabase } from "../server/database.mjs";
+import { stopChild } from "./helpers/stop-child.mjs";
 
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
 const actor = { type: "user", id: "workspace-e2e", name: "Workspace E2E", avatarUrl: null };
@@ -178,20 +178,7 @@ async function connectCdp(port) {
 }
 
 async function stop(child) {
-  if (!child || child.exitCode !== null) return;
-  const exited = once(child, "exit");
-  child.kill("SIGTERM");
-  try {
-    await withTimeout(exited, teardownTimeoutMs, "Chrome did not stop after SIGTERM");
-  } catch (terminateError) {
-    if (child.exitCode === null) child.kill("SIGKILL");
-    try {
-      await withTimeout(exited, teardownTimeoutMs, "Chrome did not stop after SIGKILL");
-    } catch (killError) {
-      throw new AggregateError([terminateError, killError], "Chrome teardown failed");
-    }
-    throw terminateError;
-  }
+  await stopChild(child, { timeoutMs: teardownTimeoutMs, name: "Chrome" });
 }
 
 async function startReadOnlyProxy(targetOrigin) {
