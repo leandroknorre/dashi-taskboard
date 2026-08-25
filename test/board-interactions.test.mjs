@@ -72,6 +72,15 @@ test("the issue board has no shared vertical scroll and each status column scrol
   assert.match(styles, /\.column-header \{[\s\S]*?position: sticky;[\s\S]*?top: 0;[\s\S]*?background: var\(--board-column-surface\)/);
 });
 
+test("board detail scroll capture and restoration are keyed by stage id", () => {
+  assert.match(appSource, /boardColumnScrollRefs = useRef<Record<string, HTMLDivElement \| null>>/);
+  assert.match(appSource, /const stageId = fullTask\.stageId \?\? fullTask\.status;[\s\S]*?boardColumnScrollRefs\.current\[stageId\]/);
+  assert.match(appSource, /view: "issues",[\s\S]*?stageId,[\s\S]*?scrollTop: scrollContainer\.scrollTop/);
+  assert.match(appSource, /boardColumnScrollRefs\.current\[pendingScroll\.stageId\]/);
+  assert.match(appSource, /boardColumnScrollRefs\.current\[workflowStage\?\.stageId \?\? item\] = element/);
+  assert.doesNotMatch(appSource, /boardColumnScrollRefs\.current\[[^\]]*canonicalStatus/);
+});
+
 test("the complete issue status set shares one ordered source", () => {
   assert.deepEqual(taskStatuses(), [
     "backlog",

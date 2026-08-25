@@ -108,9 +108,6 @@ test("stage workflows provision defaults, place tasks, and require a remap befor
   const initial = await cloud.request("/api/projects/alpha/stage-workflow", { actorName: alice });
   assert.equal(initial.response.status, 200);
   assert.equal(initial.body.stageWorkflow.definition.stages.length, 7);
-  const todo = initial.body.stageWorkflow.definition.stages.find((stage) => (
-    stage.canonicalStatus === "todo"
-  ));
   const saved = await cloud.request("/api/projects/alpha/stage-workflow", {
     method: "PUT",
     actorName: alice,
@@ -130,6 +127,16 @@ test("stage workflows provision defaults, place tasks, and require a remap befor
             isDefaultForStatus: false,
             terminalKind: "none",
           },
+          {
+            stageId: null,
+            canonicalStatus: "todo",
+            name: "Parked",
+            order: 8,
+            boardVisible: true,
+            active: true,
+            isDefaultForStatus: false,
+            terminalKind: "none",
+          },
         ],
       },
       removals: [],
@@ -137,6 +144,7 @@ test("stage workflows provision defaults, place tasks, and require a remap befor
   });
   assert.equal(saved.response.status, 200, JSON.stringify(saved.body));
   const ready = saved.body.stageWorkflow.definition.stages.find((stage) => stage.name === "Ready");
+  const parked = saved.body.stageWorkflow.definition.stages.find((stage) => stage.name === "Parked");
   const task = await createTask("alpha", "Stage task", alice, { stageId: ready.stageId });
   assert.equal(task.response.status, 201);
   assert.equal(task.body.task.stageId, ready.stageId);
@@ -157,6 +165,28 @@ test("stage workflows provision defaults, place tasks, and require a remap befor
   assert.equal(withoutRemap.response.status, 409);
   assert.equal(withoutRemap.body.error.code, "STAGE_HAS_TASKS");
 
+  const inactiveDestination = await cloud.request("/api/projects/alpha/stage-workflow", {
+    method: "PUT",
+    actorName: alice,
+    json: {
+      version: saved.body.stageWorkflow.version,
+      definition: {
+        schemaVersion: 2,
+        stages: saved.body.stageWorkflow.definition.stages
+          .filter((stage) => stage.stageId !== ready.stageId)
+          .map((stage) => stage.stageId === parked.stageId ? { ...stage, active: false } : stage),
+      },
+      removals: [{ stageId: ready.stageId, destinationStageId: parked.stageId }],
+    },
+  });
+  assert.equal(inactiveDestination.response.status, 400);
+  assert.equal(inactiveDestination.body.error.code, "INVALID_STAGE");
+  const unchangedTask = await cloud.request(`/api/tasks/${task.body.task.id}`, { actorName: alice });
+  assert.equal(unchangedTask.body.task.stageId, ready.stageId);
+  const unchangedWorkflow = await cloud.request("/api/projects/alpha/stage-workflow", { actorName: alice });
+  assert.equal(unchangedWorkflow.body.stageWorkflow.version, saved.body.stageWorkflow.version);
+  assert.equal(unchangedWorkflow.body.stageWorkflow.definition.stages.find((stage) => stage.stageId === parked.stageId).active, true);
+
   const remapped = await cloud.request("/api/projects/alpha/stage-workflow", {
     method: "PUT",
     actorName: alice,
@@ -166,12 +196,12 @@ test("stage workflows provision defaults, place tasks, and require a remap befor
         schemaVersion: 2,
         stages: saved.body.stageWorkflow.definition.stages.filter((stage) => stage.stageId !== ready.stageId),
       },
-      removals: [{ stageId: ready.stageId, destinationStageId: todo.stageId }],
+      removals: [{ stageId: ready.stageId, destinationStageId: parked.stageId }],
     },
   });
   assert.equal(remapped.response.status, 200, JSON.stringify(remapped.body));
   const fetched = await cloud.request(`/api/tasks/${task.body.task.id}`, { actorName: alice });
-  assert.equal(fetched.body.task.stageId, todo.stageId);
+  assert.equal(fetched.body.task.stageId, parked.stageId);
 });
 
 test("stage workflow saves rename, reorder, hide, and reject stale versions", async () => {

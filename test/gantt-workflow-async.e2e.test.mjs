@@ -90,6 +90,67 @@ function seedWorkflowFixture(directory) {
   }
 }
 
+function seedBoardScrollFixture(directory) {
+  const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+  const actor = { type: "user", id: "user", name: "User", avatarUrl: null };
+  try {
+    database.createProject({ id: "alpha", name: "Alpha", workspacePath: null });
+    const initial = database.getStageWorkflow("alpha");
+    const stages = [
+      ...initial.definition.stages,
+      {
+        stageId: randomUUID(),
+        canonicalStatus: "todo",
+        name: "First todo rail",
+        order: initial.definition.stages.length,
+        boardVisible: true,
+        active: true,
+        isDefaultForStatus: false,
+        terminalKind: "none",
+      },
+      {
+        stageId: randomUUID(),
+        canonicalStatus: "todo",
+        name: "Second todo rail",
+        order: initial.definition.stages.length + 1,
+        boardVisible: true,
+        active: true,
+        isDefaultForStatus: false,
+        terminalKind: "none",
+      },
+    ];
+    const workflow = database.saveStageWorkflow("alpha", initial.version, {
+      schemaVersion: 2,
+      stages,
+    });
+    const [firstStage, secondStage] = workflow.definition.stages.filter((stage) => (
+      stage.name === "First todo rail" || stage.name === "Second todo rail"
+    ));
+    assert.ok(firstStage && secondStage, "fixture must retain both custom todo stages");
+    for (const [stage, prefix] of [[firstStage, "First"], [secondStage, "Second"]]) {
+      for (let index = 0; index < 14; index += 1) {
+        database.createTask({
+          projectId: "alpha",
+          title: `${prefix} rail card ${index + 1}`,
+          description: "",
+          status: stage.canonicalStatus,
+          stageId: stage.stageId,
+          priority: "none",
+          labels: [],
+          actor,
+          assignee: actor,
+          developmentContext: null,
+          startDate: null,
+          dueDate: null,
+          recurrence: null,
+        });
+      }
+    }
+  } finally {
+    database.close();
+  }
+}
+
 async function startDelayedProxy(targetOrigin) {
   let delayedWorkflowResponses = 0;
   let releasedWorkflowResponses = 0;
@@ -275,6 +336,108 @@ test("App repaints real DHTMLX Gantt when the project workflow arrives late", { 
     cdp?.close();
     await stop(child);
     await proxy?.close();
+    await app?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Board restores each custom stage rail independently when stages share a canonical status", { timeout: 60_000 }, async (t) => {
+  const chrome = chromeExecutable();
+  assert.ok(chrome, "Chrome or Chromium is required for the Board scroll acceptance test");
+  if (!existsSync(path.join(projectRoot, "dist", "web", "index.html"))) {
+    t.skip("built web assets unavailable; run npm run test:gantt-workflow");
+    return;
+  }
+
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-board-scroll-"));
+  let app;
+  let child;
+  let cdp;
+  try {
+    seedBoardScrollFixture(directory);
+    app = createTaskboardServer({ dataDirectory: directory });
+    const appAddress = await app.listen({ host: "127.0.0.1", port: 0 });
+    const profile = path.join(directory, "chrome");
+    child = spawn(chrome, [
+      "--headless=new",
+      "--disable-background-networking",
+      "--disable-gpu",
+      "--no-first-run",
+      "--no-sandbox",
+      "--remote-debugging-address=127.0.0.1",
+      "--remote-debugging-port=0",
+      `--user-data-dir=${profile}`,
+      "about:blank",
+    ], { stdio: "ignore" });
+    const debugPort = await chromeDebugPort(profile);
+    cdp = await connectCdp(debugPort);
+    await cdp.send("Page.enable");
+    await cdp.send("Runtime.enable");
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: 1366,
+      height: 768,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await cdp.send("Page.navigate", { url: `http://127.0.0.1:${appAddress.port}/?project=alpha` });
+    await eventually(async () => cdp.evaluate(`(() => {
+      const railFor = (label) => {
+        const column = [...document.querySelectorAll(".board-column")].find((node) => (
+          node.querySelector("h2")?.textContent?.includes(label)
+        ));
+        return column?.querySelector(".column-list");
+      };
+      const first = railFor("First todo rail");
+      const second = railFor("Second todo rail");
+      return first instanceof HTMLElement
+        && second instanceof HTMLElement
+        && first.scrollHeight > first.clientHeight
+        && second.scrollHeight > second.clientHeight;
+    })()`), "Custom todo rails did not render with independent vertical scroll ranges");
+
+    async function saveScrollAndOpen(label, preferredScrollTop) {
+      const saved = await cdp.evaluate(`(() => {
+        const column = [...document.querySelectorAll(".board-column")].find((node) => (
+          node.querySelector("h2")?.textContent?.includes(${JSON.stringify(label)})
+        ));
+        const rail = column?.querySelector(".column-list");
+        if (!(rail instanceof HTMLElement)) return null;
+        rail.scrollTop = Math.min(${preferredScrollTop}, rail.scrollHeight - rail.clientHeight);
+        rail.dispatchEvent(new Event("scroll", { bubbles: true }));
+        const openButton = rail.querySelector("button.task-card-open");
+        if (!(openButton instanceof HTMLButtonElement)) return null;
+        const scrollTop = rail.scrollTop;
+        openButton.click();
+        return scrollTop;
+      })()`);
+      assert.ok(Number.isFinite(saved) && saved > 0, `${label} must capture a nonzero rail position`);
+      await eventually(
+        () => cdp.evaluate(`document.querySelector("button.detail-back-button") instanceof HTMLButtonElement`),
+        `${label} task detail did not open`,
+      );
+      const closed = await cdp.evaluate(`(() => {
+        const button = document.querySelector("button.detail-back-button");
+        if (!(button instanceof HTMLButtonElement)) return false;
+        button.click();
+        return true;
+      })()`);
+      assert.equal(closed, true, `${label} task detail must close`);
+      await eventually(async () => cdp.evaluate(`(() => {
+        const column = [...document.querySelectorAll(".board-column")].find((node) => (
+          node.querySelector("h2")?.textContent?.includes(${JSON.stringify(label)})
+        ));
+        const rail = column?.querySelector(".column-list");
+        return rail instanceof HTMLElement && rail.scrollTop === ${saved};
+      })()`), `${label} did not restore its own rail position`);
+      return saved;
+    }
+
+    const firstSaved = await saveScrollAndOpen("First todo rail", 120);
+    const secondSaved = await saveScrollAndOpen("Second todo rail", 260);
+    assert.notEqual(firstSaved, secondSaved, "the fixture must distinguish the two rail positions");
+  } finally {
+    cdp?.close();
+    await stop(child);
     await app?.close();
     await rm(directory, { recursive: true, force: true });
   }

@@ -2919,8 +2919,12 @@ async function saveStageWorkflow(env, projectId, input) {
     if (Number(cards?.count ?? 0) > 0 && !removal?.destinationStageId) {
       throw new ApiError(409, "STAGE_HAS_TASKS", "A destination stage is required before removing a stage with issues", { stageId, taskCount: Number(cards.count) });
     }
-    if (removal?.destinationStageId && !nextIds.has(removal.destinationStageId)) {
+    const destination = nextStages.find((stage) => stage.stageId === removal?.destinationStageId);
+    if (removal?.destinationStageId && !destination) {
       throw new ApiError(400, "INVALID_FIELD", "Removal destination must remain in this workflow");
+    }
+    if (Number(cards?.count ?? 0) > 0 && removal?.destinationStageId && !destination.active) {
+      throw new ApiError(400, "INVALID_STAGE", "Removal destination must be an active stage in the new workflow");
     }
   }
   if (input.removals.some((removal) => !removed.includes(removal.stageId))) {

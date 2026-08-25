@@ -145,7 +145,7 @@ type ConnectionState = "connecting" | "live" | "reconnecting";
 type Theme = "light" | "dark";
 type BoardView = "readme" | "dashboard" | "issues" | "list" | "gantt";
 type DetailSourceScroll =
-  | { projectId: string; view: "issues"; status: TaskStatus; scrollTop: number }
+  | { projectId: string; view: "issues"; stageId: string; scrollTop: number }
   | { projectId: string; view: "list"; scrollTop: number };
 type GanttZoom = "day" | "week" | "month";
 type ActionError = string | readonly [string, string];
@@ -806,7 +806,7 @@ export function App() {
   const undoInFlightRef = useRef(false);
   const dragRegionRef = useRef<HTMLDivElement>(null);
   const issueListRef = useRef<HTMLDivElement>(null);
-  const boardColumnScrollRefs = useRef<Partial<Record<TaskStatus, HTMLDivElement | null>>>({});
+  const boardColumnScrollRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const detailSourceProjectIdRef = useRef<string | null>(null);
   const pendingDetailSourceScrollRef = useRef<DetailSourceScroll | null>(null);
   const taskScopeProjectId = detailSourceProjectIdRef.current ?? selectedProjectId;
@@ -1495,12 +1495,13 @@ export function App() {
         scrollTop: issueListRef.current.scrollTop,
       };
     } else if (boardView === "issues" && fullTask) {
-      const scrollContainer = boardColumnScrollRefs.current[fullTask.status];
+      const stageId = fullTask.stageId ?? fullTask.status;
+      const scrollContainer = boardColumnScrollRefs.current[stageId];
       if (scrollContainer) {
         pendingDetailSourceScrollRef.current = {
           projectId: selectedProjectId,
           view: "issues",
-          status: fullTask.status,
+          stageId,
           scrollTop: scrollContainer.scrollTop,
         };
       }
@@ -1542,7 +1543,7 @@ export function App() {
     }
     const scrollContainer = pendingScroll.view === "list"
       ? issueListRef.current
-      : boardColumnScrollRefs.current[pendingScroll.status];
+      : boardColumnScrollRefs.current[pendingScroll.stageId];
     pendingDetailSourceScrollRef.current = null;
     if (!scrollContainer) return;
     scrollContainer.scrollTop = pendingScroll.scrollTop;
@@ -1564,13 +1565,13 @@ export function App() {
           (task) => task.identifier === routeIssueIdentifier,
         );
         const scrollContainer = routeTask
-          ? boardColumnScrollRefs.current[routeTask.status]
+          ? boardColumnScrollRefs.current[routeTask.stageId ?? routeTask.status]
           : null;
         if (routeTask && scrollContainer) {
           pendingDetailSourceScrollRef.current = {
             projectId: selectedProjectId,
             view: "issues",
-            status: routeTask.status,
+            stageId: routeTask.stageId ?? routeTask.status,
             scrollTop: scrollContainer.scrollTop,
           };
         }
@@ -3746,7 +3747,7 @@ export function App() {
                       <BoardColumn
                         key={item}
                         scrollRef={(element) => {
-                          boardColumnScrollRefs.current[workflowStage?.canonicalStatus ?? item as TaskStatus] = element;
+                          boardColumnScrollRefs.current[workflowStage?.stageId ?? item] = element;
                         }}
                         status={workflowStage?.canonicalStatus ?? item as TaskStatus}
                         stageId={workflowStage?.stageId}
