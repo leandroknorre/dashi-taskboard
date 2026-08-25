@@ -347,6 +347,7 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     await cdp.send("Page.navigate", { url: `${proxy.origin}/?project=alpha` });
     await eventually(() => cdp.evaluate(`document.querySelectorAll(".task-card").length >= 50`), "Board did not render seeded direct children");
 
+    const boardUrl = `${proxy.origin}/?project=alpha`;
     async function enterWorkspace() {
       const openedDetail = await cdp.evaluate(`(() => {
         const card = [...document.querySelectorAll(".task-card")].find((node) => node.textContent?.includes("Release workspace"));
@@ -373,6 +374,19 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
       await eventually(() => cdp.evaluate(`!document.querySelector(".nested-workspace-view")`), "History back did not leave workspace");
     }
 
+    await enterWorkspace();
+    const workspaceUrl = await cdp.evaluate("location.href");
+    await cdp.send("Page.navigate", { url: "about:blank" });
+    await cdp.send("Page.navigate", { url: workspaceUrl });
+    await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-view")?.textContent?.includes("Manual purpose: ship without moving the parent.")`), "Cold nested-workspace deep link did not load its overview");
+    const coldRoute = await cdp.evaluate(`({ issue: new URL(location.href).searchParams.get("issue"), workspace: new URL(location.href).searchParams.get("workspace"), view: new URL(location.href).searchParams.get("view"), root: document.querySelector(".nested-workspace-super-card")?.textContent?.includes("Release workspace") })`);
+    assert.deepEqual(coldRoute, { issue: null, workspace: fixture.root.identifier, view: "overview", root: true });
+    await cdp.send("Page.reload");
+    await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-view")?.textContent?.includes("Manual purpose: ship without moving the parent.")`), "Reloaded nested-workspace deep link did not restore its overview");
+    const reloadedRoute = await cdp.evaluate(`({ issue: new URL(location.href).searchParams.get("issue"), workspace: new URL(location.href).searchParams.get("workspace"), view: new URL(location.href).searchParams.get("view"), root: document.querySelector(".nested-workspace-super-card")?.textContent?.includes("Release workspace") })`);
+    assert.deepEqual(reloadedRoute, { issue: null, workspace: fixture.root.identifier, view: "overview", root: true });
+    await cdp.send("Page.navigate", { url: boardUrl });
+    await eventually(() => cdp.evaluate(`document.querySelectorAll(".task-card").length >= 50`), "Board did not return after cold-link verification");
     await enterWorkspace();
     const overview = await cdp.evaluate(`(() => ({ breadcrumb: [...document.querySelectorAll(".nested-workspace-breadcrumb button")].map((node) => node.textContent?.trim()), text: document.querySelector(".nested-workspace-overview")?.innerText ?? "" }))()`);
     assert.deepEqual(overview.breadcrumb, ["Vision", "Program", "Area", "Portfolio", "Release workspace"]);
