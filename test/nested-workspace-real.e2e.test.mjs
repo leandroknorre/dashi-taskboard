@@ -347,16 +347,41 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     await cdp.send("Page.navigate", { url: `${proxy.origin}/?project=alpha` });
     await eventually(() => cdp.evaluate(`document.querySelectorAll(".task-card").length >= 50`), "Board did not render seeded direct children");
 
-    const boardUrl = `${proxy.origin}/?project=alpha`;
-    async function enterWorkspace() {
-      const openedDetail = await cdp.evaluate(`(() => {
-        const card = [...document.querySelectorAll(".task-card")].find((node) => node.textContent?.includes("Release workspace"));
-        const button = card?.querySelector(".task-card-open");
-        if (!(button instanceof HTMLButtonElement)) return false;
-        button.click();
-        return true;
-      })()`);
-      assert.equal(openedDetail, true, "Fixture root card must open its detail");
+    async function openRootDetail(sourceView) {
+      if (sourceView === "board") {
+        const opened = await cdp.evaluate(`(() => {
+          const card = [...document.querySelectorAll(".task-card")].find((node) => node.textContent?.includes("Release workspace"));
+          const button = card?.querySelector(".task-card-open");
+          if (!(button instanceof HTMLButtonElement)) return false;
+          button.click();
+          return true;
+        })()`);
+        assert.equal(opened, true, "Fixture root card must open its detail from Board");
+      } else if (sourceView === "list") {
+        const opened = await cdp.evaluate(`(() => {
+          const row = [...document.querySelectorAll(".issue-list-row")].find((node) => node.querySelector(".issue-list-title-cell strong")?.textContent?.trim() === "Release workspace");
+          if (!(row instanceof HTMLElement)) return false;
+          row.click();
+          return true;
+        })()`);
+        assert.equal(opened, true, "Fixture root row must open its detail from List");
+      } else if (sourceView === "gantt") {
+        const opened = await eventually(() => cdp.evaluate(`(() => {
+          const taskId = ${JSON.stringify(fixture.root.id)};
+          const row = document.querySelector('.gantt_row[task_id="' + taskId + '"]');
+          if (!(row instanceof HTMLElement) || !row.textContent?.includes("Release workspace")) return false;
+          row.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, detail: 2 }));
+          return true;
+        })()`), "Fixture root must render as a Gantt row");
+        assert.equal(opened, true, "Fixture root Gantt row must receive a double-click");
+      } else {
+        throw new Error(`Unsupported workspace source view: ${sourceView}`);
+      }
+      await eventually(() => cdp.evaluate(`document.querySelector(".issue-detail")?.textContent?.includes("Release workspace")`), `Fixture root detail did not open from ${sourceView}`);
+    }
+
+    async function enterWorkspace(sourceView) {
+      await openRootDetail(sourceView);
       await eventually(() => cdp.evaluate(`document.querySelector("button[aria-label='Abrir fluxo aninhado']") instanceof HTMLButtonElement`), "Supra-item detail did not expose the nested-workspace entry point");
       const openedWorkspace = await cdp.evaluate(`(() => {
         const button = document.querySelector("button[aria-label='Abrir fluxo aninhado']");
@@ -369,25 +394,17 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
       const route = await cdp.evaluate(`({ issue: new URL(location.href).searchParams.get("issue"), workspace: new URL(location.href).searchParams.get("workspace"), view: new URL(location.href).searchParams.get("view") })`);
       assert.deepEqual(route, { issue: null, workspace: fixture.root.identifier, view: "overview" });
     }
-    async function goBackToSource() {
+    async function goBackToSource(sourceView) {
       await cdp.evaluate(`history.back(); true`);
-      await eventually(() => cdp.evaluate(`!document.querySelector(".nested-workspace-view")`), "History back did not leave workspace");
+      const selector = sourceView === "board"
+        ? ".board-column"
+        : sourceView === "list"
+          ? ".issue-list-view"
+          : ".gantt_ver_scroll";
+      await eventually(() => cdp.evaluate(`!document.querySelector(".nested-workspace-view") && document.querySelector(${JSON.stringify(selector)})`), `History back did not restore the ${sourceView} source view`);
     }
 
-    await enterWorkspace();
-    const workspaceUrl = await cdp.evaluate("location.href");
-    await cdp.send("Page.navigate", { url: "about:blank" });
-    await cdp.send("Page.navigate", { url: workspaceUrl });
-    await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-view")?.textContent?.includes("Manual purpose: ship without moving the parent.")`), "Cold nested-workspace deep link did not load its overview");
-    const coldRoute = await cdp.evaluate(`({ issue: new URL(location.href).searchParams.get("issue"), workspace: new URL(location.href).searchParams.get("workspace"), view: new URL(location.href).searchParams.get("view"), root: document.querySelector(".nested-workspace-super-card")?.textContent?.includes("Release workspace") })`);
-    assert.deepEqual(coldRoute, { issue: null, workspace: fixture.root.identifier, view: "overview", root: true });
-    await cdp.send("Page.reload");
-    await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-view")?.textContent?.includes("Manual purpose: ship without moving the parent.")`), "Reloaded nested-workspace deep link did not restore its overview");
-    const reloadedRoute = await cdp.evaluate(`({ issue: new URL(location.href).searchParams.get("issue"), workspace: new URL(location.href).searchParams.get("workspace"), view: new URL(location.href).searchParams.get("view"), root: document.querySelector(".nested-workspace-super-card")?.textContent?.includes("Release workspace") })`);
-    assert.deepEqual(reloadedRoute, { issue: null, workspace: fixture.root.identifier, view: "overview", root: true });
-    await cdp.send("Page.navigate", { url: boardUrl });
-    await eventually(() => cdp.evaluate(`document.querySelectorAll(".task-card").length >= 50`), "Board did not return after cold-link verification");
-    await enterWorkspace();
+    await enterWorkspace("board");
     const overview = await cdp.evaluate(`(() => ({ breadcrumb: [...document.querySelectorAll(".nested-workspace-breadcrumb button")].map((node) => node.textContent?.trim()), text: document.querySelector(".nested-workspace-overview")?.innerText ?? "" }))()`);
     assert.deepEqual(overview.breadcrumb, ["Vision", "Program", "Area", "Portfolio", "Release workspace"]);
     assert.match(overview.text, /Manual stage\s*in review/i);
@@ -446,22 +463,59 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     await cdp.evaluate(`document.querySelector(".nested-workspace-load-more")?.click(); true`);
     await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-tree")?.textContent?.includes("Direct child 62")`), "Children pagination did not load the later page");
 
-    await goBackToSource();
+    await goBackToSource("board");
     const boardScroll = await cdp.evaluate(`(() => { const rails = [...document.querySelectorAll(".board-column")].filter((column) => /Workspace todo [AB]/.test(column.textContent ?? "")).map((column) => column.querySelector(".column-list")).filter((node) => node instanceof HTMLElement); if (rails.length !== 2) return false; rails.forEach((rail, index) => { rail.scrollTop = 120 + index * 80; rail.dispatchEvent(new Event("scroll", { bubbles: true })); }); return rails.map((rail) => rail.scrollTop); })()`);
     assert.deepEqual(boardScroll, [120, 200], "Board fixture must preserve distinct exact same-status rail positions");
-    await enterWorkspace(); await goBackToSource();
+    await enterWorkspace("board"); await goBackToSource("board");
     const restoredBoard = await eventually(async () => {
       const values = await cdp.evaluate(`(() => [...document.querySelectorAll(".board-column")].filter((column) => /Workspace todo [AB]/.test(column.textContent ?? "")).map((column) => column.querySelector(".column-list")?.scrollTop))()`);
       return JSON.stringify(values) === JSON.stringify(boardScroll) ? values : null;
     }, "Board history restoration must retain distinct stage rails");
     assert.deepEqual(restoredBoard, boardScroll, "Board history restoration must retain distinct stage rails");
 
-    for (const [label, selector] of [["List", ".issue-list-view"], ["Gantt", ".gantt_ver_scroll"]]) {
+    for (const [label, selector, sourceView] of [["List", ".issue-list-view", "list"], ["Gantt", ".gantt_ver_scroll", "gantt"]]) {
       await cdp.evaluate(`(() => { const button = [...document.querySelectorAll("button, a")].find((node) => node.textContent?.trim() === ${JSON.stringify(label)}); if (!(button instanceof HTMLElement)) return false; button.click(); return true; })()`);
-      const saved = await eventually(async () => cdp.evaluate(`(() => { const scroller = document.querySelector(${JSON.stringify(selector)}); if (!(scroller instanceof HTMLElement) || scroller.scrollHeight <= scroller.clientHeight) return null; scroller.scrollTop = Math.min(180, scroller.scrollHeight - scroller.clientHeight); scroller.dispatchEvent(new Event("scroll", { bubbles: true })); return scroller.scrollTop; })()`), `${label} source must have a vertical scroll range`);
-      await enterWorkspace(); await goBackToSource();
+      const saved = sourceView === "gantt"
+        ? await eventually(() => cdp.evaluate(`(async () => {
+          const scroller = document.querySelector(".gantt_ver_scroll");
+          const taskId = ${JSON.stringify(fixture.root.id)};
+          if (!(scroller instanceof HTMLElement) || scroller.scrollHeight <= scroller.clientHeight) return null;
+          const frame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+          for (let top = 0; top <= scroller.scrollHeight - scroller.clientHeight; top += 180) {
+            scroller.scrollTop = top;
+            scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+            await frame();
+            const row = document.querySelector('.gantt_row[task_id="' + taskId + '"]');
+            if (!(row instanceof HTMLElement)) continue;
+            const rowRect = row.getBoundingClientRect();
+            const scrollerRect = scroller.getBoundingClientRect();
+            const max = scroller.scrollHeight - scroller.clientHeight;
+            const target = Math.max(1, Math.min(max, scroller.scrollTop + rowRect.top - scrollerRect.top - 24));
+            scroller.scrollTop = target;
+            scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+            await frame();
+            return document.querySelector('.gantt_row[task_id="' + taskId + '"]') instanceof HTMLElement
+              ? scroller.scrollTop
+              : null;
+          }
+          return null;
+        })()`), "Gantt source must scroll while keeping the fixture root rendered")
+        : await eventually(async () => cdp.evaluate(`(() => { const scroller = document.querySelector(${JSON.stringify(selector)}); if (!(scroller instanceof HTMLElement) || scroller.scrollHeight <= scroller.clientHeight) return null; scroller.scrollTop = Math.min(180, scroller.scrollHeight - scroller.clientHeight); scroller.dispatchEvent(new Event("scroll", { bubbles: true })); return scroller.scrollTop; })()`), `${label} source must have a vertical scroll range`);
+      await enterWorkspace(sourceView); await goBackToSource(sourceView);
       await eventually(() => cdp.evaluate(`document.querySelector(${JSON.stringify(selector)})?.scrollTop === ${saved}`), `${label} history restoration lost source scroll`);
     }
+
+    await enterWorkspace("gantt");
+    const workspaceUrl = await cdp.evaluate("location.href");
+    await cdp.send("Page.navigate", { url: "about:blank" });
+    await cdp.send("Page.navigate", { url: workspaceUrl });
+    await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-view")?.textContent?.includes("Manual purpose: ship without moving the parent.")`), "Cold nested-workspace deep link did not load its overview");
+    const coldRoute = await cdp.evaluate(`({ issue: new URL(location.href).searchParams.get("issue"), workspace: new URL(location.href).searchParams.get("workspace"), view: new URL(location.href).searchParams.get("view"), root: document.querySelector(".nested-workspace-super-card")?.textContent?.includes("Release workspace") })`);
+    assert.deepEqual(coldRoute, { issue: null, workspace: fixture.root.identifier, view: "overview", root: true });
+    await cdp.send("Page.reload");
+    await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-view")?.textContent?.includes("Manual purpose: ship without moving the parent.")`), "Reloaded nested-workspace deep link did not restore its overview");
+    const reloadedRoute = await cdp.evaluate(`({ issue: new URL(location.href).searchParams.get("issue"), workspace: new URL(location.href).searchParams.get("workspace"), view: new URL(location.href).searchParams.get("view"), root: document.querySelector(".nested-workspace-super-card")?.textContent?.includes("Release workspace") })`);
+    assert.deepEqual(reloadedRoute, { issue: null, workspace: fixture.root.identifier, view: "overview", root: true });
 
     assert.equal(proxy.rejected.length, 0, `Workspace UI attempted a mutation: ${proxy.rejected.join(", ")}`);
     assert.ok(proxy.methods.length > 0 && proxy.methods.every((method) => method === "GET"), "Only GET requests may reach the read-only proxy");
