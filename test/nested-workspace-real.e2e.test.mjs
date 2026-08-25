@@ -448,7 +448,7 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
 
     await goBackToSource();
     const boardScroll = await cdp.evaluate(`(() => { const rails = [...document.querySelectorAll(".board-column")].filter((column) => /Workspace todo [AB]/.test(column.textContent ?? "")).map((column) => column.querySelector(".column-list")).filter((node) => node instanceof HTMLElement); if (rails.length !== 2) return false; rails.forEach((rail, index) => { rail.scrollTop = 120 + index * 80; rail.dispatchEvent(new Event("scroll", { bubbles: true })); }); return rails.map((rail) => rail.scrollTop); })()`);
-    assert.ok(Array.isArray(boardScroll) && boardScroll.every((value) => value > 0), "Board fixture must scroll both same-status rails");
+    assert.deepEqual(boardScroll, [120, 200], "Board fixture must preserve distinct exact same-status rail positions");
     await enterWorkspace(); await goBackToSource();
     const restoredBoard = await eventually(async () => {
       const values = await cdp.evaluate(`(() => [...document.querySelectorAll(".board-column")].filter((column) => /Workspace todo [AB]/.test(column.textContent ?? "")).map((column) => column.querySelector(".column-list")?.scrollTop))()`);
