@@ -626,12 +626,33 @@ export function saveStageWorkflow(
   );
 }
 
-export async function updateTask(task: Task, draft: TaskDraft, threadId?: string): Promise<Task> {
+export async function updateTask(task: Task, draft: Partial<TaskDraft>, threadId?: string): Promise<Task> {
   const data = await request<{ task: Task }>(`/api/tasks/${encodeURIComponent(task.id)}`, {
     method: "PATCH",
     body: JSON.stringify({ version: task.version, ...draft, ...(threadId ? { threadId } : {}) }),
   });
   return data.task;
+}
+
+function taskDraftValueMatches(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+export function restoreTaskDraftChanges(snapshot: Task, changed: Task): Partial<TaskDraft> {
+  const changes: Partial<TaskDraft> = {};
+  if (snapshot.title !== changed.title) changes.title = snapshot.title;
+  if (snapshot.description !== changed.description) changes.description = snapshot.description;
+  if (snapshot.status !== changed.status) changes.status = snapshot.status;
+  if (snapshot.stageId !== changed.stageId && snapshot.stageId != null) changes.stageId = snapshot.stageId;
+  if (snapshot.priority !== changed.priority) changes.priority = snapshot.priority;
+  if (!taskDraftValueMatches(snapshot.labels, changed.labels)) changes.labels = snapshot.labels;
+  if (!taskDraftValueMatches(snapshot.developmentContext, changed.developmentContext)) {
+    changes.developmentContext = snapshot.developmentContext;
+  }
+  if (snapshot.startDate !== changed.startDate) changes.startDate = snapshot.startDate;
+  if (snapshot.dueDate !== changed.dueDate) changes.dueDate = snapshot.dueDate;
+  if (!taskDraftValueMatches(snapshot.recurrence, changed.recurrence)) changes.recurrence = snapshot.recurrence;
+  return changes;
 }
 
 export async function moveTask(

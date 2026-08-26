@@ -42,6 +42,7 @@ import {
   removeTaskRelation,
   resolveTaskboardUrl,
   resolveTaskboardWebSocketUrl,
+  restoreTaskDraftChanges,
   restoreTask as restoreTaskRequest,
   setApiText,
   setCurrentUserActor,
@@ -2300,14 +2301,17 @@ export function App() {
   async function restoreTaskDetails(
     snapshot: Task,
     changed: Task,
-    assigneeTarget = assigneeTargetForActor(snapshot.assignee, currentUser),
   ) {
     const candidate = tasksRef.current.find((task) => task.id === changed.id);
     const current = candidate && candidate.version >= changed.version ? candidate : changed;
-    const restored = await updateTaskRequest(current, {
-      ...taskToDraft(snapshot),
-      ...(assigneeTarget ? { assigneeTarget } : {}),
-    });
+    const restoreChanges = restoreTaskDraftChanges(snapshot, changed);
+    const snapshotAssigneeTarget = assigneeTargetForActor(snapshot.assignee, currentUser);
+    const changedAssigneeTarget = assigneeTargetForActor(changed.assignee, currentUser);
+    if (snapshotAssigneeTarget !== changedAssigneeTarget && snapshotAssigneeTarget) {
+      restoreChanges.assigneeTarget = snapshotAssigneeTarget;
+    }
+    if (Object.keys(restoreChanges).length === 0) return;
+    const restored = await updateTaskRequest(current, restoreChanges);
     setTasks((tasks) => sortTasks(tasks.map((task) => task.id === restored.id ? restored : task)));
   }
 
@@ -2784,7 +2788,7 @@ export function App() {
       if (!draft.assigneeTarget || previousAssigneeTarget) {
         pushUndo(
           null,
-          () => restoreTaskDetails(previous, saved, previousAssigneeTarget),
+          () => restoreTaskDetails(previous, saved),
         );
       }
     }
@@ -2922,7 +2926,7 @@ export function App() {
     ));
 
     try {
-      const updated = await updateTaskRequest(task, { ...taskToDraft(task), ...changes });
+      const updated = await updateTaskRequest(task, changes);
       setTasks((current) => sortTasks(current.map((candidate) =>
         candidate.id === updated.id ? updated : candidate,
       )));
@@ -2930,7 +2934,7 @@ export function App() {
       if (!assigneeTarget || previousAssigneeTarget) {
         pushUndo(
           null,
-          () => restoreTaskDetails(previous, updated, previousAssigneeTarget),
+          () => restoreTaskDetails(previous, updated),
         );
       }
       return updated;

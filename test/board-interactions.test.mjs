@@ -145,6 +145,27 @@ test("common issue mutations enter a Linear-style undo queue", () => {
   assert.match(apiSource, /export async function restoreTask/);
 });
 
+test("detail status changes preserve the atomic PATCH transition contract", () => {
+  const updateProperties = appSource.slice(
+    appSource.indexOf("async function updateTaskProperties"),
+    appSource.indexOf("async function persistProjectLabel"),
+  );
+  const restoreTaskDetails = appSource.slice(
+    appSource.indexOf("async function restoreTaskDetails"),
+    appSource.indexOf("useEffect(() => {", appSource.indexOf("async function restoreTaskDetails")),
+  );
+
+  assert.match(
+    detailSource,
+    /void saveTask\(stage \? \{ status: stage\.canonicalStatus, stageId \} : \{ status: stageId as TaskStatus \}, "status"\)/,
+  );
+  assert.match(updateProperties, /updateTaskRequest\(task, changes\)/);
+  assert.doesNotMatch(updateProperties, /taskToDraft\(task\)/);
+  assert.match(restoreTaskDetails, /restoreTaskDraftChanges\(snapshot, changed\)/);
+  assert.doesNotMatch(restoreTaskDetails, /taskToDraft\(snapshot\)/);
+  assert.match(apiSource, /export async function moveTask[\s\S]*?\/move[\s\S]*?method: "POST"/);
+});
+
 test("issues expose processing conversations without manual binding", () => {
   assert.match(detailSource, /在新对话打开/);
   assert.match(detailSource, /onOpenInThread\(currentTask\)/);

@@ -136,6 +136,20 @@ test("legacy PATCH status and /move use controlled legacy actions; mixed and com
   assert.equal(patch.body.legacy, true);
   assert.equal(patch.body.task.version, patchTask.version + 1);
 
+  const completionPatchTask = createTask(app, "PATCH completion gate");
+  const completionPatchWorkflow = transitions.getTaskWorkflow(completionPatchTask.id);
+  const completionPatch = actionTo(transitions, completionPatchTask.id, "completed");
+  const completionBlocked = await request(baseUrl, `/api/tasks/${completionPatchTask.id}`, {
+    method: "PATCH",
+    body: {
+      version: completionPatchTask.version,
+      status: destinationStatus(app, completionPatchWorkflow.revisionId, completionPatch),
+    },
+  });
+  assert.equal(completionBlocked.response.status, 409);
+  assert.equal(completionBlocked.body.error.code, "ACCEPTANCE_EVIDENCE_REQUIRED");
+  assert.equal(app.database.getTask(completionPatchTask.id).version, completionPatchTask.version);
+
   const mixedTask = createTask(app, "Mixed legacy PATCH");
   const mixedAction = actionTo(transitions, mixedTask.id, "none");
   const mixedWorkflow = transitions.getTaskWorkflow(mixedTask.id);
