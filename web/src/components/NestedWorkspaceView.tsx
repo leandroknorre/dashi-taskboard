@@ -1,11 +1,12 @@
-import { useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type PointerEvent, type WheelEvent } from "react";
-import type { NestedWorkspace, NestedWorkspaceItem, TaskRollup } from "../types";
-import type { WorkspaceView } from "../issueRoute";
+import { useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type PointerEvent, type ReactNode, type WheelEvent } from "react";
+import type { NestedWorkspaceItem, TaskRollup } from "../types";
+import type { WorkspaceRootExtra, WorkspaceView } from "../issueRoute";
+import type { WorkspaceDescriptor, WorkspaceNavigationTarget, WorkspaceRoot } from "../workspaceDescriptor";
 import { useTaskboardI18n } from "../i18n";
 import { StatusIcon } from "./SemanticIcons";
 
 interface NestedWorkspaceViewProps {
-  workspace: NestedWorkspace;
+  workspace: WorkspaceDescriptor;
   rollup: TaskRollup | null;
   view: WorkspaceView;
   descendants: boolean;
@@ -14,7 +15,13 @@ interface NestedWorkspaceViewProps {
   onDescendantsChange: (descendants: boolean) => void;
   onLoadMore: () => void;
   onOpenTask: (item: Pick<NestedWorkspaceItem, "identifier" | "projectId">) => void;
-  onOpenWorkspace: (identifier: string) => void;
+  onOpenTaskDetail: (item: Pick<NestedWorkspaceItem, "identifier" | "projectId">) => void;
+  onOpenWorkspace: (target: WorkspaceNavigationTarget) => void;
+  /** Deliberate root-only extras such as the legacy Gantt and project docs. */
+  projectExtras?: ReadonlyArray<{ id: WorkspaceRootExtra; label: string }>;
+  activeProjectExtra?: WorkspaceRootExtra | null;
+  onProjectExtraChange?: (extra: WorkspaceRootExtra) => void;
+  projectExtraContent?: ReactNode;
 }
 
 const MACRO_BUCKET_LABELS: Record<NestedWorkspaceItem["macroBucket"], string> = {
@@ -26,7 +33,8 @@ const MACRO_BUCKET_LABELS: Record<NestedWorkspaceItem["macroBucket"], string> = 
   closed: "Closed",
 };
 
-function StatusChip({ item }: { item: Pick<NestedWorkspaceItem, "status" | "macroBucket"> }) {
+function StatusChip({ item }: { item: Pick<NestedWorkspaceItem, "status" | "macroBucket"> | WorkspaceRoot }) {
+  if (!item.status || !item.macroBucket) return null;
   return (
     <span className={`nested-workspace-status status-${item.status}`} title={`Actual stage: ${item.status}`}>
       <StatusIcon status={item.status} size={13} color="currentColor" />
@@ -38,24 +46,37 @@ function StatusChip({ item }: { item: Pick<NestedWorkspaceItem, "status" | "macr
 function WorkspaceItemButton({
   item,
   onOpenTask,
+  onOpenTaskDetail,
 }: {
   item: NestedWorkspaceItem;
   onOpenTask: NestedWorkspaceViewProps["onOpenTask"];
+  onOpenTaskDetail: NestedWorkspaceViewProps["onOpenTaskDetail"];
 }) {
+  const { text } = useTaskboardI18n();
   return (
-    <button className="nested-workspace-item" type="button" onClick={() => onOpenTask(item)}>
-      <span className="nested-workspace-item-copy">
-        <small>{item.identifier}</small>
-        <strong>{item.title}</strong>
-      </span>
-      <StatusChip item={item} />
-    </button>
+    <div className="nested-workspace-item-wrap">
+      <button className="nested-workspace-item" type="button" onClick={() => onOpenTask(item)}>
+        <span className="nested-workspace-item-copy">
+          <small>{item.identifier}</small>
+          <strong>{item.title}</strong>
+        </span>
+        <StatusChip item={item} />
+      </button>
+      <button
+        className="nested-workspace-item-detail"
+        type="button"
+        aria-label={text(`打开 ${item.identifier} 详情`, `Open details ${item.identifier}`)}
+        onClick={() => onOpenTaskDetail(item)}
+      >
+        {text("详情", "Details")}
+      </button>
+    </div>
   );
 }
 
 function WorkspaceOverview({ workspace, rollup }: Pick<NestedWorkspaceViewProps, "workspace" | "rollup">) {
   const { text } = useTaskboardI18n();
-  const root = workspace.overview;
+  const root = workspace.root;
   const sourceCount = rollup?.provenance.sourceTaskIds.length ?? 0;
   return (
     <div className="nested-workspace-overview">
@@ -71,7 +92,9 @@ function WorkspaceOverview({ workspace, rollup }: Pick<NestedWorkspaceViewProps,
             <div><dt>{text("完成", "Completed")}</dt><dd>{rollup.progress.completed}/{rollup.progress.total}</dd></div>
             <div><dt>{text("视觉状态", "Visual state")}</dt><dd>{rollup.visual.state}</dd></div>
           </dl>
-        ) : <p>{text("正在读取汇总…", "Loading rollup…")}</p>}
+        ) : <p>{workspace.kind === "project"
+          ? text("项目根目录没有任务汇总。", "A project root has no task rollup.")
+          : text("正在读取汇总…", "Loading rollup…")}</p>}
       </section>
       <section>
         <h2>{text("来源与新鲜度", "Narrative provenance & freshness")}</h2>
@@ -82,13 +105,23 @@ function WorkspaceOverview({ workspace, rollup }: Pick<NestedWorkspaceViewProps,
               ? <em className="nested-workspace-stale"> {text("数据可能过期。", "This read model may be stale.")}</em>
               : <span> {text("数据是最新的。", "Fresh at read time.")}</span>}
           </p>
-        ) : <p>{text("尚无来源信息。", "No provenance available.")}</p>}
+        ) : <p>{workspace.kind === "project"
+          ? text("项目根目录没有任务来源信息。", "A project root has no task provenance.")
+          : text("尚无来源信息。", "No provenance available.")}</p>}
       </section>
     </div>
   );
 }
 
-function WorkspaceBoard({ items, onOpenTask }: { items: NestedWorkspaceItem[]; onOpenTask: NestedWorkspaceViewProps["onOpenTask"] }) {
+function WorkspaceBoard({
+  items,
+  onOpenTask,
+  onOpenTaskDetail,
+}: {
+  items: NestedWorkspaceItem[];
+  onOpenTask: NestedWorkspaceViewProps["onOpenTask"];
+  onOpenTaskDetail: NestedWorkspaceViewProps["onOpenTaskDetail"];
+}) {
   return (
     <div className="nested-workspace-board">
       {(Object.keys(MACRO_BUCKET_LABELS) as NestedWorkspaceItem["macroBucket"][]).map((bucket) => {
@@ -97,7 +130,7 @@ function WorkspaceBoard({ items, onOpenTask }: { items: NestedWorkspaceItem[]; o
         return (
           <section className="nested-workspace-column" key={bucket}>
             <h2>{MACRO_BUCKET_LABELS[bucket]} <small>{bucketItems.length}</small></h2>
-            <div>{bucketItems.map((item) => <WorkspaceItemButton item={item} key={item.id} onOpenTask={onOpenTask} />)}</div>
+            <div>{bucketItems.map((item) => <WorkspaceItemButton item={item} key={item.id} onOpenTask={onOpenTask} onOpenTaskDetail={onOpenTaskDetail} />)}</div>
           </section>
         );
       })}
@@ -105,23 +138,43 @@ function WorkspaceBoard({ items, onOpenTask }: { items: NestedWorkspaceItem[]; o
   );
 }
 
-function WorkspaceList({ items, onOpenTask }: { items: NestedWorkspaceItem[]; onOpenTask: NestedWorkspaceViewProps["onOpenTask"] }) {
-  return <div className="nested-workspace-list">{items.map((item) => <WorkspaceItemButton item={item} key={item.id} onOpenTask={onOpenTask} />)}</div>;
+function WorkspaceList({
+  items,
+  onOpenTask,
+  onOpenTaskDetail,
+}: {
+  items: NestedWorkspaceItem[];
+  onOpenTask: NestedWorkspaceViewProps["onOpenTask"];
+  onOpenTaskDetail: NestedWorkspaceViewProps["onOpenTaskDetail"];
+}) {
+  return <div className="nested-workspace-list">{items.map((item) => <WorkspaceItemButton item={item} key={item.id} onOpenTask={onOpenTask} onOpenTaskDetail={onOpenTaskDetail} />)}</div>;
 }
 
-function WorkspaceTree({ items, onOpenTask }: { items: NestedWorkspaceItem[]; onOpenTask: NestedWorkspaceViewProps["onOpenTask"] }) {
+function WorkspaceTree({
+  items,
+  onOpenTask,
+  onOpenTaskDetail,
+}: {
+  items: NestedWorkspaceItem[];
+  onOpenTask: NestedWorkspaceViewProps["onOpenTask"];
+  onOpenTaskDetail: NestedWorkspaceViewProps["onOpenTaskDetail"];
+}) {
   return (
     <div className="nested-workspace-tree">
       {items.map((item) => (
         <div className="nested-workspace-tree-node" style={{ "--nested-depth": item.depth } as CSSProperties} key={item.id}>
-          <WorkspaceItemButton item={item} onOpenTask={onOpenTask} />
+          <WorkspaceItemButton item={item} onOpenTask={onOpenTask} onOpenTaskDetail={onOpenTaskDetail} />
         </div>
       ))}
     </div>
   );
 }
 
-type MindMapNode = Pick<NestedWorkspaceItem, "id" | "identifier" | "projectId" | "title" | "status" | "macroBucket" | "parentId" | "depth" | "path">;
+type MindMapNode = Omit<Pick<NestedWorkspaceItem, "id" | "identifier" | "projectId" | "title" | "status" | "macroBucket" | "parentId" | "depth" | "path">, "status" | "macroBucket"> & {
+  status: NestedWorkspaceItem["status"] | null;
+  macroBucket: NestedWorkspaceItem["macroBucket"] | null;
+  target: WorkspaceNavigationTarget | null;
+};
 
 function WorkspaceMindMap({
   workspace,
@@ -134,17 +187,21 @@ function WorkspaceMindMap({
   const [pan, setPan] = useState({ x: 24, y: 24 });
   const drag = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
   const root: MindMapNode = useMemo(() => ({
-    id: workspace.overview.id,
-    identifier: workspace.overview.identifier,
-    projectId: workspace.overview.projectId,
-    title: workspace.overview.title,
-    status: workspace.overview.status,
-    macroBucket: workspace.overview.macroBucket,
+    id: workspace.root.id,
+    identifier: workspace.root.identifier ?? text("项目", "Project"),
+    projectId: workspace.root.projectId,
+    title: workspace.root.title,
+    status: workspace.root.status,
+    macroBucket: workspace.root.macroBucket,
     parentId: null,
     depth: 0,
-    path: [workspace.overview.id],
-  }), [workspace.overview]);
-  const nodes = useMemo(() => [root, ...items.filter((item) => item.id !== root.id)], [items, root]);
+    path: [workspace.root.id],
+    target: workspace.root.target,
+  }), [text, workspace.root]);
+  const nodes = useMemo(() => [
+    root,
+    ...items.filter((item) => item.id !== root.id).map((item) => ({ ...item, target: null })),
+  ], [items, root]);
   const layout = useMemo(() => {
     const positions = new Map<string, { x: number; y: number }>();
     nodes.forEach((node, index) => positions.set(node.id, { x: node.depth * 236, y: index * 100 }));
@@ -212,11 +269,17 @@ function WorkspaceMindMap({
                 type="button"
                 key={node.id}
                 style={{ left: position.x, top: position.y }}
-                onClick={() => isRoot ? onOpenWorkspace(node.identifier) : onOpenTask(node)}
+                onClick={() => {
+                  if (isRoot) {
+                    if (node.target) onOpenWorkspace(node.target);
+                    return;
+                  }
+                  onOpenTask(node);
+                }}
               >
                 <small>{node.identifier}</small>
                 <strong>{node.title}</strong>
-                <span>{node.status.replace(/_/g, " ")} · {MACRO_BUCKET_LABELS[node.macroBucket]}</span>
+                {node.status && node.macroBucket && <span>{node.status.replace(/_/g, " ")} · {MACRO_BUCKET_LABELS[node.macroBucket]}</span>}
               </button>
             );
           })}
@@ -242,7 +305,15 @@ function timelineDate(item: TimelineItem) {
   return null;
 }
 
-function WorkspaceTimeline({ items, onOpenTask }: { items: NestedWorkspaceItem[]; onOpenTask: NestedWorkspaceViewProps["onOpenTask"] }) {
+function WorkspaceTimeline({
+  items,
+  onOpenTask,
+  onOpenTaskDetail,
+}: {
+  items: NestedWorkspaceItem[];
+  onOpenTask: NestedWorkspaceViewProps["onOpenTask"];
+  onOpenTaskDetail: NestedWorkspaceViewProps["onOpenTaskDetail"];
+}) {
   const { locale, text } = useTaskboardI18n();
   const ordered = useMemo(() => [...items].sort((left, right) => {
     const leftDate = timelineDate(left);
@@ -263,15 +334,18 @@ function WorkspaceTimeline({ items, onOpenTask }: { items: NestedWorkspaceItem[]
           return (
             <li className={scheduled ? "" : "is-undated"} key={item.id}>
               <span className="workspace-timeline-marker" aria-hidden="true" />
-              <button type="button" onClick={() => onOpenTask(item)}>
-                <time dateTime={date?.value ?? undefined}>
-                  {date ? `${date.label}: ${formatDate(date.date)}` : text("无日期", "No date")}
-                  {!scheduled && ` · ${text("未安排日期", "No scheduled date")}`}
-                </time>
-                <span className="workspace-timeline-copy"><small>{item.identifier}</small><strong>{item.title}</strong></span>
-                <StatusChip item={item} />
-                <span className="workspace-timeline-bucket">{MACRO_BUCKET_LABELS[item.macroBucket]}</span>
-              </button>
+              <div className="workspace-timeline-entry">
+                <button type="button" onClick={() => onOpenTask(item)}>
+                  <time dateTime={date?.value ?? undefined}>
+                    {date ? `${date.label}: ${formatDate(date.date)}` : text("无日期", "No date")}
+                    {!scheduled && ` · ${text("未安排日期", "No scheduled date")}`}
+                  </time>
+                  <span className="workspace-timeline-copy"><small>{item.identifier}</small><strong>{item.title}</strong></span>
+                  <StatusChip item={item} />
+                  <span className="workspace-timeline-bucket">{MACRO_BUCKET_LABELS[item.macroBucket]}</span>
+                </button>
+                <button className="workspace-timeline-detail" type="button" aria-label={text(`打开 ${item.identifier} 详情`, `Open details ${item.identifier}`)} onClick={() => onOpenTaskDetail(item)}>{text("详情", "Details")}</button>
+              </div>
             </li>
           );
         })}
@@ -290,41 +364,62 @@ export function NestedWorkspaceView({
   onDescendantsChange,
   onLoadMore,
   onOpenTask,
+  onOpenTaskDetail,
   onOpenWorkspace,
+  projectExtras,
+  activeProjectExtra = null,
+  onProjectExtraChange,
+  projectExtraContent,
 }: NestedWorkspaceViewProps) {
   const { text } = useTaskboardI18n();
   const page = descendants ? workspace.descendants ?? workspace.children : workspace.children;
   const items = page.items;
-  const root = workspace.overview;
+  const hierarchyItems = workspace.hierarchy?.items ?? items;
+  const root = workspace.root;
+  const showingProjectExtra = workspace.kind === "project"
+    && activeProjectExtra !== null
+    && projectExtraContent !== undefined;
+  const panelId = showingProjectExtra
+    ? `nested-workspace-panel-extra-${activeProjectExtra}`
+    : `nested-workspace-panel-${view}`;
+  const panelLabel = showingProjectExtra
+    ? `nested-workspace-extra-${activeProjectExtra}`
+    : `nested-workspace-tab-${view}`;
   return (
     <div className="nested-workspace-view">
       <nav className="nested-workspace-breadcrumb" aria-label={text("工作区层级", "Workspace hierarchy")}>
         {workspace.breadcrumb.map((item, index) => (
           <span key={item.id}>
             {index > 0 && <i aria-hidden="true">/</i>}
-            <button type="button" onClick={() => onOpenWorkspace(item.identifier)}>{item.title}</button>
+            <button type="button" onClick={() => onOpenWorkspace(item.target)}>{item.title}</button>
           </span>
         ))}
       </nav>
 
-      <button
-        className="nested-workspace-super-card"
-        type="button"
-        aria-label={text(`打开工作区 ${root.title}`, `Open workspace ${root.title}`)}
-        onClick={() => onOpenWorkspace(root.identifier)}
-      >
-        <span><small>{root.identifier}</small><strong>{root.title}</strong></span>
-        <StatusChip item={root} />
-      </button>
+      {root.target ? (
+        <button
+          className="nested-workspace-super-card"
+          type="button"
+          aria-label={text(`打开工作区 ${root.title}`, `Open workspace ${root.title}`)}
+          onClick={() => onOpenWorkspace(root.target!)}
+        >
+          <span><small>{root.identifier}</small><strong>{root.title}</strong></span>
+          <StatusChip item={root} />
+        </button>
+      ) : (
+        <div className="nested-workspace-super-card is-project-root">
+          <span><small>{text("项目", "Project")}</small><strong>{root.title}</strong></span>
+        </div>
+      )}
 
       <div className="nested-workspace-toolbar">
         <div className="view-tabs" role="tablist" aria-label={text("工作区视图", "Workspace views")}>
           {(["overview", "board", "list", "tree", "mindmap", "timeline"] as const).map((candidate) => (
             <button
-              className={`view-tab${view === candidate ? " active" : ""}`}
+              className={`view-tab${!showingProjectExtra && view === candidate ? " active" : ""}`}
               type="button"
               role="tab"
-              aria-selected={view === candidate}
+              aria-selected={!showingProjectExtra && view === candidate}
               aria-controls={`nested-workspace-panel-${candidate}`}
               id={`nested-workspace-tab-${candidate}`}
               key={candidate}
@@ -333,8 +428,22 @@ export function NestedWorkspaceView({
               {candidate === "mindmap" ? "Mind Map" : candidate[0].toUpperCase() + candidate.slice(1)}
             </button>
           ))}
+          {workspace.kind === "project" && projectExtras?.map((extra) => (
+            <button
+              className={`view-tab workspace-extra-tab${activeProjectExtra === extra.id ? " active" : ""}`}
+              type="button"
+              role="tab"
+              aria-selected={activeProjectExtra === extra.id}
+              aria-controls={`nested-workspace-panel-extra-${extra.id}`}
+              id={`nested-workspace-extra-${extra.id}`}
+              key={extra.id}
+              onClick={() => onProjectExtraChange?.(extra.id)}
+            >
+              {extra.label}
+            </button>
+          ))}
         </div>
-        {view !== "overview" && (
+        {!showingProjectExtra && view !== "overview" && (
           <label className="nested-workspace-descendants-toggle">
             <input type="checkbox" checked={descendants} onChange={(event) => onDescendantsChange(event.target.checked)} />
             {text("全部后代", "All descendants")}
@@ -343,20 +452,21 @@ export function NestedWorkspaceView({
       </div>
 
       <div
-        id={`nested-workspace-panel-${view}`}
+        id={panelId}
         role="tabpanel"
-        aria-labelledby={`nested-workspace-tab-${view}`}
+        aria-labelledby={panelLabel}
       >
-        {view === "overview" ? <WorkspaceOverview workspace={workspace} rollup={rollup} />
-          : view === "mindmap" ? <WorkspaceMindMap workspace={workspace} items={items} onOpenTask={onOpenTask} onOpenWorkspace={onOpenWorkspace} />
+        {showingProjectExtra ? projectExtraContent
+          : view === "overview" ? <WorkspaceOverview workspace={workspace} rollup={rollup} />
+          : view === "mindmap" ? <WorkspaceMindMap workspace={workspace} items={hierarchyItems} onOpenTask={onOpenTask} onOpenWorkspace={onOpenWorkspace} />
           : items.length === 0 ? <p className="nested-workspace-empty">{text("没有可显示的子项。", "No child items to show.")}</p>
-          : view === "board" ? <WorkspaceBoard items={items} onOpenTask={onOpenTask} />
-          : view === "list" ? <WorkspaceList items={items} onOpenTask={onOpenTask} />
-          : view === "tree" ? <WorkspaceTree items={items} onOpenTask={onOpenTask} />
-          : <WorkspaceTimeline items={items} onOpenTask={onOpenTask} />}
+          : view === "board" ? <WorkspaceBoard items={items} onOpenTask={onOpenTask} onOpenTaskDetail={onOpenTaskDetail} />
+          : view === "list" ? <WorkspaceList items={items} onOpenTask={onOpenTask} onOpenTaskDetail={onOpenTaskDetail} />
+          : view === "tree" ? <WorkspaceTree items={hierarchyItems} onOpenTask={onOpenTask} onOpenTaskDetail={onOpenTaskDetail} />
+          : <WorkspaceTimeline items={items} onOpenTask={onOpenTask} onOpenTaskDetail={onOpenTaskDetail} />}
       </div>
 
-      {view !== "overview" && page.nextCursor && (
+      {!showingProjectExtra && view !== "overview" && page.nextCursor && (
         <button className="button secondary nested-workspace-load-more" type="button" disabled={loadingMore} onClick={onLoadMore}>
           {loadingMore ? text("正在加载…", "Loading…") : text("加载更多", "Load more")}
         </button>

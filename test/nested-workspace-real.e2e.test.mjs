@@ -295,7 +295,7 @@ function seedWorkspace(directory) {
       tasks: database.database.prepare("SELECT * FROM tasks ORDER BY id").all(),
       relations: database.database.prepare("SELECT * FROM task_relations ORDER BY relation_type, source_task_id, target_task_id").all(),
     };
-    return { root, program, direct, deepThree, ignored, snapshot };
+    return { vision, root, program, direct, deepThree, ignored, snapshot };
   } finally { database.close(); }
 }
 
@@ -344,211 +344,166 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     await cdp.send("Page.enable");
     await cdp.send("Runtime.enable");
     await cdp.send("Emulation.setDeviceMetricsOverride", { width: 1366, height: 768, deviceScaleFactor: 1, mobile: false });
-    await cdp.send("Page.navigate", { url: `${proxy.origin}/?project=alpha` });
-    await eventually(() => cdp.evaluate(`document.querySelectorAll(".task-card").length >= 50`), "Board did not render seeded direct children");
+    await cdp.send("Page.navigate", { url: `${proxy.origin}/?project=alpha&workspaceRoot=alpha&view=board` });
+    await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-board")?.textContent?.includes("Vision")`), "Root Board did not render its immediate task");
 
-    async function openRootDetail(sourceView) {
-      if (sourceView === "board") {
-        const opened = await cdp.evaluate(`(() => {
-          const card = [...document.querySelectorAll(".task-card")].find((node) => node.textContent?.includes("Release workspace"));
-          const button = card?.querySelector(".task-card-open");
-          if (!(button instanceof HTMLButtonElement)) return false;
-          button.click();
-          return true;
-        })()`);
-        assert.equal(opened, true, "Fixture root card must open its detail from Board");
-      } else if (sourceView === "list") {
-        const opened = await cdp.evaluate(`(() => {
-          const row = [...document.querySelectorAll(".issue-list-row")].find((node) => node.querySelector(".issue-list-title-cell strong")?.textContent?.trim() === "Release workspace");
-          if (!(row instanceof HTMLElement)) return false;
-          row.click();
-          return true;
-        })()`);
-        assert.equal(opened, true, "Fixture root row must open its detail from List");
-      } else if (sourceView === "gantt") {
-        const opened = await eventually(() => cdp.evaluate(`(() => {
-          const taskId = ${JSON.stringify(fixture.root.id)};
-          const row = document.querySelector('.gantt_row[task_id="' + taskId + '"]');
-          if (!(row instanceof HTMLElement) || !row.textContent?.includes("Release workspace")) return false;
-          row.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, detail: 2 }));
-          return true;
-        })()`), "Fixture root must render as a Gantt row");
-        assert.equal(opened, true, "Fixture root Gantt row must receive a double-click");
-      } else {
-        throw new Error(`Unsupported workspace source view: ${sourceView}`);
-      }
-      await eventually(() => cdp.evaluate(`document.querySelector(".issue-detail")?.textContent?.includes("Release workspace")`), `Fixture root detail did not open from ${sourceView}`);
-    }
-
-    async function enterWorkspace(sourceView) {
-      await openRootDetail(sourceView);
-      await eventually(() => cdp.evaluate(`document.querySelector("button[aria-label='Abrir fluxo aninhado']") instanceof HTMLButtonElement`), "Supra-item detail did not expose the nested-workspace entry point");
-      const openedWorkspace = await cdp.evaluate(`(() => {
-        const button = document.querySelector("button[aria-label='Abrir fluxo aninhado']");
-        if (!(button instanceof HTMLButtonElement)) return false;
-        button.click();
+    async function selectWorkspaceTab(label) {
+      const switched = await cdp.evaluate(`(() => {
+        const tab = [...document.querySelectorAll(".view-tab")].find((node) => node.textContent?.trim() === ${JSON.stringify(label)});
+        if (!(tab instanceof HTMLButtonElement)) return false;
+        tab.click();
         return true;
       })()`);
-      assert.equal(openedWorkspace, true, "Nested-workspace entry point must be clickable");
-      await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-view")?.textContent?.includes("Manual purpose: ship without moving the parent.")`), "Workspace overview did not load");
-      const route = await cdp.evaluate(`({ issue: new URL(location.href).searchParams.get("issue"), workspace: new URL(location.href).searchParams.get("workspace"), view: new URL(location.href).searchParams.get("view") })`);
-      assert.deepEqual(route, { issue: null, workspace: fixture.root.identifier, view: "overview" });
-    }
-    async function goBackToSource(sourceView) {
-      await cdp.evaluate(`history.back(); true`);
-      const selector = sourceView === "board"
-        ? ".board-column"
-        : sourceView === "list"
-          ? ".issue-list-view"
-          : ".gantt_ver_scroll";
-      const restored = await eventually(() => cdp.evaluate(`(() => {
-        const url = new URL(location.href);
-        if (document.querySelector(".nested-workspace-view") || !document.querySelector(${JSON.stringify(selector)})) return null;
-        if (url.searchParams.get("issue") || url.searchParams.get("workspace") || url.searchParams.get("view")) return null;
-        return {
-          issue: url.searchParams.get("issue"),
-          workspace: url.searchParams.get("workspace"),
-          view: url.searchParams.get("view"),
-          sourceView: ${JSON.stringify(sourceView)},
-        };
-      })()`), `History back did not restore the ${sourceView} source view`);
-      assert.deepEqual(restored, {
-        issue: null,
-        workspace: null,
-        view: null,
-        sourceView,
-      });
+      assert.equal(switched, true, `Workspace must expose ${label}`);
+      const panel = label === "Mind Map" ? "mindmap" : label.toLowerCase();
+      await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-${panel}") instanceof HTMLElement`), `${label} panel did not render`);
     }
 
-    await enterWorkspace("board");
-    const overview = await cdp.evaluate(`(() => ({ breadcrumb: [...document.querySelectorAll(".nested-workspace-breadcrumb button")].map((node) => node.textContent?.trim()), text: document.querySelector(".nested-workspace-overview")?.innerText ?? "" }))()`);
-    assert.deepEqual(overview.breadcrumb, ["Vision", "Program", "Area", "Portfolio", "Release workspace"]);
-    assert.match(overview.text, /Manual stage\s*in review/i);
-    assert.match(overview.text, /Derived from\s*65\s*structural descendant/i);
-
-    const breadcrumbOpened = await cdp.evaluate(`(() => { const button = [...document.querySelectorAll(".nested-workspace-breadcrumb button")].find((node) => node.textContent?.trim() === "Portfolio"); if (!(button instanceof HTMLButtonElement)) return false; button.click(); return true; })()`);
-    assert.equal(breadcrumbOpened, true);
-    await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-super-card")?.textContent?.includes("Portfolio")`), "Breadcrumb did not open an ancestor workspace");
-    await cdp.evaluate(`history.back(); true`);
-    await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-super-card")?.textContent?.includes("Release workspace")`), "History back did not restore root workspace");
-    await cdp.evaluate(`history.forward(); true`);
-    await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-super-card")?.textContent?.includes("Portfolio")`), "History forward did not restore the breadcrumb destination");
-    await cdp.evaluate(`history.back(); true`);
-    await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-super-card")?.textContent?.includes("Release workspace")`), "History back did not return to root after forward");
-
-    for (const view of ["Overview", "Board", "List", "Tree", "Mind Map", "Timeline"]) {
-      await cdp.evaluate(`(() => { const button = [...document.querySelectorAll(".view-tab")].find((node) => node.textContent?.trim() === ${JSON.stringify(view)}); if (!(button instanceof HTMLButtonElement)) return false; button.click(); return true; })()`);
-      const panel = view === "Mind Map" ? "mindmap" : view.toLowerCase();
-      const expectedText = view === "Overview" ? "Manual purpose" : "Direct child";
-      await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-${panel}")?.textContent?.includes(${JSON.stringify(expectedText)})`), `${view} tab did not render its expected projection`);
+    for (const label of ["Overview", "Board", "List", "Tree", "Mind Map", "Timeline"]) {
+      await selectWorkspaceTab(label);
     }
-    await cdp.evaluate(`document.querySelector("#nested-workspace-tab-mindmap")?.click(); true`);
-    const mapNodes = await cdp.evaluate(`document.querySelectorAll(".workspace-mindmap-node").length`);
-    assert.ok(mapNodes > 1, "Mind Map must render the root and loaded workspace items");
-    await cdp.evaluate(`document.querySelector("#nested-workspace-tab-timeline")?.click(); true`);
-    const projectionDesktop = await cdp.evaluate(`(() => ({
-      timelineRows: document.querySelectorAll(".workspace-timeline li").length,
-      undated: document.querySelectorAll(".workspace-timeline .is-undated").length,
-    }))()`);
-    assert.ok(
-      projectionDesktop.timelineRows > 0
-        && projectionDesktop.undated > 0
-        && projectionDesktop.undated < projectionDesktop.timelineRows,
-      `Timeline must render both persisted scheduled and unscheduled items: ${JSON.stringify(projectionDesktop)}`,
+    const rootTabOrder = await cdp.evaluate(`[
+      ...document.querySelectorAll(".nested-workspace-toolbar .view-tab"),
+    ].map((node) => node.textContent?.trim())`);
+    assert.deepEqual(
+      rootTabOrder,
+      ["Overview", "Board", "List", "Tree", "Mind Map", "Timeline", "Gantt", "Project Docs"],
+      "Root-only extras must follow, not replace, the canonical six workspace tabs",
     );
-    await cdp.send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: false });
-    const projectionNarrow = await cdp.evaluate(`(() => ({
-      timelineExists: Boolean(document.querySelector(".workspace-timeline")),
-      timelineOverflow: document.querySelector(".workspace-timeline")?.scrollWidth > innerWidth,
-    }))()`);
-    assert.equal(projectionNarrow.timelineExists, true, "Timeline must remain visible at narrow width");
-    assert.equal(projectionNarrow.timelineOverflow, false, "Timeline must fit a narrow desktop viewport");
-    await cdp.evaluate(`document.querySelector("#nested-workspace-tab-mindmap")?.click(); true`);
-    assert.equal(await cdp.evaluate(`document.querySelector(".workspace-mindmap-viewport")?.getAttribute("tabindex")`), "0", "Mind Map pan/zoom surface must remain keyboard focusable at narrow width");
-    await cdp.send("Emulation.setDeviceMetricsOverride", { width: 1366, height: 768, deviceScaleFactor: 1, mobile: false });
-    await cdp.evaluate(`document.querySelector(".nested-workspace-super-card")?.click(); true`);
-    await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-overview")?.textContent?.includes("Manual purpose")`), "Super-card did not return the current workspace to Overview");
-    await cdp.evaluate(`document.querySelector("#nested-workspace-tab-tree")?.click(); true`);
-    await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-tree")?.textContent?.includes("Direct child")`), "Tree did not return after the super-card overview route");
-    await cdp.evaluate(`(() => { const input = document.querySelector(".nested-workspace-descendants-toggle input"); if (!(input instanceof HTMLInputElement)) return false; input.click(); return true; })()`);
-    await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-load-more") instanceof HTMLButtonElement`), "Descendants pagination control did not appear");
-    await cdp.evaluate(`(() => { const button = document.querySelector(".nested-workspace-load-more"); if (!(button instanceof HTMLButtonElement)) return false; button.click(); return true; })()`);
-    await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-tree")?.textContent?.includes("Deep descendant three")`), "Descendant pagination did not expose deep descendants");
-    await cdp.evaluate(`(() => { const input = document.querySelector(".nested-workspace-descendants-toggle input"); if (!(input instanceof HTMLInputElement) || !input.checked) return false; input.click(); return true; })()`);
-    await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-load-more") instanceof HTMLButtonElement`), "Direct-children pagination control did not return");
-    await cdp.evaluate(`document.querySelector(".nested-workspace-load-more")?.click(); true`);
-    await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-tree")?.textContent?.includes("Direct child 62")`), "Children pagination did not load the later page");
+    await cdp.evaluate(`document.querySelector("#nested-workspace-extra-docs")?.click(); true`);
+    await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-extra-docs .project-readme-container") instanceof HTMLElement`), "Project Docs extra did not render its surface");
+    await selectWorkspaceTab("Board");
+    await cdp.evaluate(`document.querySelector("#nested-workspace-extra-gantt")?.click(); true`);
+    await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-extra-gantt .gantt-view") instanceof HTMLElement`), "Gantt extra did not render its surface");
+    const ganttExtraRoute = await cdp.evaluate(`(() => {
+      const url = new URL(location.href);
+      return { workspaceRoot: url.searchParams.get("workspaceRoot"), workspaceExtra: url.searchParams.get("workspaceExtra") };
+    })()`);
+    assert.deepEqual(ganttExtraRoute, { workspaceRoot: "alpha", workspaceExtra: "gantt" });
+    await selectWorkspaceTab("Board");
+    for (const panel of ["board", "list"]) {
+      await selectWorkspaceTab(panel[0].toUpperCase() + panel.slice(1));
+      const rootItems = await cdp.evaluate(`(() => {
+        const text = document.querySelector("#nested-workspace-panel-${panel}")?.textContent ?? "";
+        return { vision: text.includes("Vision"), program: text.includes("Program") };
+      })()`);
+      assert.deepEqual(rootItems, { vision: true, program: false }, `Root ${panel} must contain only immediate tasks`);
+    }
+    await selectWorkspaceTab("Tree");
+    await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-tree")?.textContent?.includes("Vision") && document.querySelector("#nested-workspace-panel-tree")?.textContent?.includes("Program")`), "Root Tree must include descendants");
+    await selectWorkspaceTab("Mind Map");
+    await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-mindmap")?.textContent?.includes("Vision") && document.querySelector("#nested-workspace-panel-mindmap")?.textContent?.includes("Program")`), "Root Mind Map must include descendants");
 
-    await goBackToSource("board");
-    const boardScroll = await cdp.evaluate(`(() => { const rails = [...document.querySelectorAll(".board-column")].filter((column) => /Workspace todo [AB]/.test(column.textContent ?? "")).map((column) => column.querySelector(".column-list")).filter((node) => node instanceof HTMLElement); if (rails.length !== 2) return false; rails.forEach((rail, index) => { rail.scrollTop = 120 + index * 80; rail.dispatchEvent(new Event("scroll", { bubbles: true })); }); return rails.map((rail) => rail.scrollTop); })()`);
-    assert.deepEqual(boardScroll, [120, 200], "Board fixture must preserve distinct exact same-status rail positions");
-    await enterWorkspace("board"); await goBackToSource("board");
-    const restoredBoard = await eventually(async () => {
-      const values = await cdp.evaluate(`(() => [...document.querySelectorAll(".board-column")].filter((column) => /Workspace todo [AB]/.test(column.textContent ?? "")).map((column) => column.querySelector(".column-list")?.scrollTop))()`);
-      return JSON.stringify(values) === JSON.stringify(boardScroll) ? values : null;
-    }, "Board history restoration must retain distinct stage rails");
-    assert.deepEqual(restoredBoard, boardScroll, "Board history restoration must retain distinct stage rails");
+    await selectWorkspaceTab("List");
 
-    for (const [label, selector, sourceView] of [["List", ".issue-list-view", "list"], ["Gantt", ".gantt_ver_scroll", "gantt"]]) {
-      await cdp.evaluate(`(() => { const button = [...document.querySelectorAll("button, a")].find((node) => node.textContent?.trim() === ${JSON.stringify(label)}); if (!(button instanceof HTMLElement)) return false; button.click(); return true; })()`);
-      const saved = sourceView === "gantt"
-        ? await eventually(() => cdp.evaluate(`(async () => {
-          const scroller = document.querySelector(".gantt_ver_scroll");
-          const taskId = ${JSON.stringify(fixture.root.id)};
-          if (!(scroller instanceof HTMLElement) || scroller.scrollHeight <= scroller.clientHeight) return null;
-          const frame = () => new Promise((resolve) => requestAnimationFrame(resolve));
-          for (let top = 0; top <= scroller.scrollHeight - scroller.clientHeight; top += 180) {
-            scroller.scrollTop = top;
-            scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
-            await frame();
-            const row = document.querySelector('.gantt_row[task_id="' + taskId + '"]');
-            if (!(row instanceof HTMLElement)) continue;
-            const rowRect = row.getBoundingClientRect();
-            const scrollerRect = scroller.getBoundingClientRect();
-            const max = scroller.scrollHeight - scroller.clientHeight;
-            const target = Math.max(1, Math.min(max, scroller.scrollTop + rowRect.top - scrollerRect.top - 24));
-            scroller.scrollTop = target;
-            scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
-            await frame();
-            return document.querySelector('.gantt_row[task_id="' + taskId + '"]') instanceof HTMLElement
-              ? scroller.scrollTop
-              : null;
-          }
-          return null;
-        })()`), "Gantt source must scroll while keeping the fixture root rendered")
-        : await eventually(async () => cdp.evaluate(`(() => { const scroller = document.querySelector(${JSON.stringify(selector)}); if (!(scroller instanceof HTMLElement) || scroller.scrollHeight <= scroller.clientHeight) return null; scroller.scrollTop = Math.min(180, scroller.scrollHeight - scroller.clientHeight); scroller.dispatchEvent(new Event("scroll", { bubbles: true })); return scroller.scrollTop; })()`), `${label} source must have a vertical scroll range`);
-      await enterWorkspace(sourceView); await goBackToSource(sourceView);
-      await eventually(() => cdp.evaluate(`document.querySelector(${JSON.stringify(selector)})?.scrollTop === ${saved}`), `${label} history restoration lost source scroll`);
+    const visionDetail = await cdp.evaluate(`(() => {
+      const button = [...document.querySelectorAll(".nested-workspace-item-detail")].find((node) => node.textContent?.includes("Details"));
+      if (!(button instanceof HTMLButtonElement)) return false;
+      button.click();
+      return true;
+    })()`);
+    assert.equal(visionDetail, true, "Project cards retain an explicit detail affordance");
+    await eventually(() => cdp.evaluate(`document.querySelector(".issue-detail")?.textContent?.includes("Vision")`), "Explicit project-card detail did not open");
+    await cdp.evaluate(`history.back(); true`);
+    await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-list")?.textContent?.includes("Vision")`), "Back did not restore the root List workspace");
+
+    const openedVisionFromList = await cdp.evaluate(`(() => {
+      const item = [...document.querySelectorAll(".nested-workspace-item")].find((node) => node.textContent?.includes("Vision"));
+      if (!(item instanceof HTMLButtonElement)) return false;
+      item.click();
+      return true;
+    })()`);
+    assert.equal(openedVisionFromList, true, "Normal click on a root List parent-card must open its nested workspace");
+    await eventually(() => cdp.evaluate(`new URL(location.href).searchParams.get("workspace") === ${JSON.stringify(fixture.vision.identifier)}`), "Root List parent-card did not open its nested workspace");
+    await cdp.evaluate(`history.back(); true`);
+    await eventually(() => cdp.evaluate(`new URL(location.href).searchParams.get("workspaceRoot") === "alpha" && new URL(location.href).searchParams.get("workspace") === null && document.querySelector("#nested-workspace-panel-list") instanceof HTMLElement`), "Browser Back did not restore the root List workspace");
+
+    await selectWorkspaceTab("Board");
+    const openedVision = await cdp.evaluate(`(() => {
+      const item = [...document.querySelectorAll(".nested-workspace-item")].find((node) => node.textContent?.includes("Vision"));
+      if (!(item instanceof HTMLButtonElement)) return false;
+      item.click();
+      return true;
+    })()`);
+    assert.equal(openedVision, true, "Normal click on a root supra-card must open its nested workspace");
+    await eventually(() => cdp.evaluate(`new URL(location.href).searchParams.get("workspace") === ${JSON.stringify(fixture.vision.identifier)}`), "Root supra-card did not open its child workspace");
+
+    const breadcrumbToRoot = await cdp.evaluate(`(() => {
+      const button = [...document.querySelectorAll(".nested-workspace-breadcrumb button")].find((node) => node.textContent?.trim() === "Alpha");
+      if (!(button instanceof HTMLButtonElement)) return false;
+      button.click();
+      return true;
+    })()`);
+    assert.equal(breadcrumbToRoot, true, "Nested workspace must expose the root breadcrumb");
+    await eventually(() => cdp.evaluate(`new URL(location.href).searchParams.get("workspaceRoot") === "alpha" && new URL(location.href).searchParams.get("workspace") === null`), "Root breadcrumb did not return to the root workspace");
+    await selectWorkspaceTab("Board");
+    const reopenedVision = await cdp.evaluate(`(() => {
+      const item = [...document.querySelectorAll(".nested-workspace-item")].find((node) => node.textContent?.includes("Vision"));
+      if (!(item instanceof HTMLButtonElement)) return false;
+      item.click();
+      return true;
+    })()`);
+    assert.equal(reopenedVision, true);
+    await eventually(() => cdp.evaluate(`new URL(location.href).searchParams.get("workspace") === ${JSON.stringify(fixture.vision.identifier)}`), "Root Board did not reopen Vision after breadcrumb return");
+
+    for (const title of ["Program", "Area", "Portfolio", "Release workspace"]) {
+      await selectWorkspaceTab("Board");
+      const opened = await cdp.evaluate(`(() => {
+        const item = [...document.querySelectorAll(".nested-workspace-item")].find((node) => node.textContent?.includes(${JSON.stringify(title)}));
+        if (!(item instanceof HTMLButtonElement)) return false;
+        item.click();
+        return true;
+      })()`);
+      assert.equal(opened, true, `${title} must be a direct nested-workspace step`);
+      await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-super-card")?.textContent?.includes(${JSON.stringify(title)})`), `${title} workspace did not open`);
     }
 
-    await enterWorkspace("gantt");
-    const workspaceUrl = await cdp.evaluate("location.href");
+    await selectWorkspaceTab("List");
+    await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-list")?.textContent?.includes("Direct child 02")`), "Release workspace did not list a fixture leaf");
+    const leafOpened = await cdp.evaluate(`(() => {
+      const item = [...document.querySelectorAll(".nested-workspace-item")].find((node) => node.textContent?.includes("Direct child 02"));
+      if (!(item instanceof HTMLButtonElement)) return false;
+      item.click();
+      return true;
+    })()`);
+    assert.equal(leafOpened, true);
+    await eventually(() => cdp.evaluate(`document.querySelector(".issue-detail")?.textContent?.includes("Direct child 02")`), "Leaf normal click must open detail");
+    await cdp.evaluate(`history.back(); true`);
+    await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-list")?.textContent?.includes("Direct child 02")`), "Back did not restore the release List workspace");
+
+    const leafDetail = await cdp.evaluate(`(() => {
+      const button = [...document.querySelectorAll(".nested-workspace-item-detail")].find((node) => node.getAttribute("aria-label")?.includes(${JSON.stringify(fixture.direct[1].identifier)}));
+      if (!(button instanceof HTMLButtonElement)) return false;
+      button.click();
+      return true;
+    })()`);
+    assert.equal(leafDetail, true, "Leaf must retain an explicit detail action");
+    await eventually(() => cdp.evaluate(`document.querySelector(".issue-detail")?.textContent?.includes("Direct child 02")`), "Explicit leaf detail did not open");
+    await cdp.evaluate(`history.back(); true`);
+
+    await selectWorkspaceTab("Tree");
+    await cdp.evaluate(`document.querySelector(".nested-workspace-descendants-toggle input")?.click(); true`);
+    await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-load-more") instanceof HTMLButtonElement`), "Descendant pagination did not appear");
+    await cdp.evaluate(`document.querySelector(".nested-workspace-load-more")?.click(); true`);
+    await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-tree")?.textContent?.includes("Deep descendant three")`), "Descendant pagination did not expose the deep hierarchy");
+
+    const releaseUrl = await cdp.evaluate("location.href");
     await cdp.send("Page.navigate", { url: "about:blank" });
-    await cdp.send("Page.navigate", { url: workspaceUrl });
-    await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-view")?.textContent?.includes("Manual purpose: ship without moving the parent.")`), "Cold nested-workspace deep link did not load its overview");
-    const coldRoute = await cdp.evaluate(`({ issue: new URL(location.href).searchParams.get("issue"), workspace: new URL(location.href).searchParams.get("workspace"), view: new URL(location.href).searchParams.get("view"), root: document.querySelector(".nested-workspace-super-card")?.textContent?.includes("Release workspace") })`);
-    assert.deepEqual(coldRoute, { issue: null, workspace: fixture.root.identifier, view: "overview", root: true });
+    await cdp.send("Page.navigate", { url: releaseUrl });
+    await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-super-card")?.textContent?.includes("Release workspace")`), "Task-workspace cold deep link did not reload");
+    await cdp.send("Page.navigate", { url: `${proxy.origin}/?project=alpha&workspaceRoot=alpha&view=timeline` });
+    await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-timeline") instanceof HTMLElement`), "Root-project cold deep link did not retain Timeline");
     await cdp.send("Page.reload");
-    await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-view")?.textContent?.includes("Manual purpose: ship without moving the parent.")`), "Reloaded nested-workspace deep link did not restore its overview");
-    const reloadedRoute = await cdp.evaluate(`({ issue: new URL(location.href).searchParams.get("issue"), workspace: new URL(location.href).searchParams.get("workspace"), view: new URL(location.href).searchParams.get("view"), root: document.querySelector(".nested-workspace-super-card")?.textContent?.includes("Release workspace") })`);
-    assert.deepEqual(reloadedRoute, { issue: null, workspace: fixture.root.identifier, view: "overview", root: true });
+    await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-timeline") instanceof HTMLElement`), "Root-project reload did not retain Timeline");
 
     assert.equal(proxy.rejected.length, 0, `Workspace UI attempted a mutation: ${proxy.rejected.join(", ")}`);
     assert.ok(proxy.methods.length > 0 && proxy.methods.every((method) => method === "GET"), "Only GET requests may reach the read-only proxy");
-    const rootApi = `/api/tasks/${encodeURIComponent(fixture.root.identifier)}`;
-    assert.ok(proxy.requests.some((request) => request.method === "GET" && request.url === `${rootApi}/workspace`), "UI must read the real workspace endpoint");
-    assert.ok(proxy.requests.some((request) => request.method === "GET" && request.url === `${rootApi}/rollup`), "UI must read real rollup provenance");
-    assert.ok(proxy.requests.some((request) => request.url.startsWith(`${rootApi}/workspace?`) && request.url.includes("childrenCursor=")), "Children pagination must use its scoped cursor");
-    assert.ok(proxy.requests.some((request) => request.url.startsWith(`${rootApi}/workspace?`) && request.url.includes("descendants=true") && request.url.includes("descendantsCursor=")), "Descendants pagination must use descendants=true and its scoped cursor");
     const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
     try {
-      const root = database.getTask(fixture.root.id);
-      assert.equal(root.status, "in_review");
-      assert.equal(root.description, "Manual purpose: ship without moving the parent.");
-      assert.equal(root.version, fixture.root.version, "Read projection must not move or edit its parent");
-      assert.deepEqual(database.database.prepare("SELECT * FROM tasks ORDER BY id").all(), fixture.snapshot.tasks, "Read projection must not mutate any task row");
-      assert.deepEqual(database.database.prepare("SELECT * FROM task_relations ORDER BY relation_type, source_task_id, target_task_id").all(), fixture.snapshot.relations, "Read projection must not mutate relations");
+      assert.deepEqual(database.database.prepare("SELECT * FROM tasks ORDER BY id").all(), fixture.snapshot.tasks, "Read projections must not mutate task rows");
+      assert.deepEqual(database.database.prepare("SELECT * FROM task_relations ORDER BY relation_type, source_task_id, target_task_id").all(), fixture.snapshot.relations, "Read projections must not mutate relations");
     } finally { database.close(); }
+
   } finally {
     t.signal.removeEventListener("abort", onAbort);
     await cleanup();

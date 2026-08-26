@@ -20,6 +20,7 @@ interface IssueListViewProps {
   workflowStages?: readonly WorkflowStage[];
   hasActiveFilters: boolean;
   onOpenTask: (task: Task) => void;
+  onOpenTaskDetail: (task: Task) => void;
   onOpenConversation: (conversation: TaskCardPresentation["conversations"][number]) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
 }
@@ -41,6 +42,7 @@ export function IssueListView({
   workflowStages,
   hasActiveFilters,
   onOpenTask,
+  onOpenTaskDetail,
   onOpenConversation,
   onUpdate,
 }: IssueListViewProps) {
@@ -102,6 +104,18 @@ export function IssueListView({
                           <small>{displayIdentifier}</small>
                           <strong>{task.title}</strong>
                           {presentations[task.id]?.unread && <span className="task-unread-dot" aria-label={text("有未读更新", "Unread updates")} />}
+                          <button
+                            className="issue-list-detail"
+                            type="button"
+                            aria-label={text(`打开 ${displayIdentifier} 详情`, `Open details ${displayIdentifier}`)}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              onOpenTaskDetail(task);
+                            }}
+                            onKeyDown={stopRow}
+                          >
+                            {text("详情", "Details")}
+                          </button>
                         </span>
                         <span className="issue-list-metadata" aria-label={text("议题属性", "Issue properties")}>
                           <span className="issue-list-priority-control" onClick={stopRow} onKeyDown={stopRow}>

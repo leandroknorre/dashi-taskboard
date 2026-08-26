@@ -44,6 +44,8 @@ interface GanttViewProps {
   restoreViewport?: { x: number; y: number } | null;
   onRestoreViewport?: () => void;
   onOpenTask: (task: Task) => void;
+  /** Double-click remains an explicit, discoverable detail affordance. */
+  onOpenTaskDetail: (task: Task) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
 }
 
@@ -117,7 +119,7 @@ function dateCellClass(date: Date) {
   return classes.join(" ");
 }
 
-export const GanttView = forwardRef<GanttViewport, GanttViewProps>(function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCompleted, todayRequest, workflowStages, restoreViewport = null, onRestoreViewport, onOpenTask, onUpdate }, viewportRef) {
+export const GanttView = forwardRef<GanttViewport, GanttViewProps>(function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCompleted, todayRequest, workflowStages, restoreViewport = null, onRestoreViewport, onOpenTask, onOpenTaskDetail, onUpdate }, viewportRef) {
   const { language, locale, text } = useTaskboardI18n();
   const i18nRef = useRef({ language, locale, text });
   const containerRef = useRef<HTMLDivElement>(null);
@@ -131,6 +133,7 @@ export const GanttView = forwardRef<GanttViewport, GanttViewProps>(function Gant
   const hasParsedDataRef = useRef(false);
   const tasksRef = useRef(tasks);
   const onOpenTaskRef = useRef(onOpenTask);
+  const onOpenTaskDetailRef = useRef(onOpenTaskDetail);
   const onUpdateRef = useRef(onUpdate);
   useImperativeHandle(viewportRef, () => ({
     getScrollState: () => ganttRef.current?.getScrollState() ?? null,
@@ -138,6 +141,7 @@ export const GanttView = forwardRef<GanttViewport, GanttViewProps>(function Gant
   }), []);
   tasksRef.current = tasks;
   onOpenTaskRef.current = onOpenTask;
+  onOpenTaskDetailRef.current = onOpenTaskDetail;
   onUpdateRef.current = onUpdate;
   i18nRef.current = { language, locale, text };
 
@@ -185,7 +189,7 @@ export const GanttView = forwardRef<GanttViewport, GanttViewProps>(function Gant
           if (task.taskboardGroup) {
             return `<div class="gantt-grid-group"><strong>${escapeHtml(task.taskboardTitle)}</strong><span>${task.taskboardCount}</span></div>`;
           }
-          return `<div class="gantt-grid-issue"><strong>${escapeHtml(task.taskboardTitle)}</strong>${task.taskboardUnread ? `<i class="task-unread-dot" aria-label="${escapeHtml(i18nRef.current.text("有未读更新", "Unread updates"))}"></i>` : ""}</div>`;
+          return `<div class="gantt-grid-issue" title="${escapeHtml(i18nRef.current.text("双击打开详情", "Double-click for details"))}"><strong>${escapeHtml(task.taskboardTitle)}</strong>${task.taskboardUnread ? `<i class="task-unread-dot" aria-label="${escapeHtml(i18nRef.current.text("有未读更新", "Unread updates"))}"></i>` : ""}</div>`;
         },
       },
     ];
@@ -213,7 +217,7 @@ export const GanttView = forwardRef<GanttViewport, GanttViewProps>(function Gant
         : task.taskboardAssigneeAvatarUrl
         ? `<img src="${escapeHtml(task.taskboardAssigneeAvatarUrl)}" alt="">`
         : `<span>${escapeHtml(task.taskboardAssigneeInitial)}</span>`;
-      return `<span class="gantt-bar-content"><i class="gantt-bar-assignee${task.taskboardAssigneeType === "agent" ? " is-agent" : ""}" title="${escapeHtml(task.taskboardAssigneeName)}">${avatar}</i><span class="gantt-bar-copy"><strong>${escapeHtml(task.taskboardTitle)}</strong><small>${dateLabel}</small></span></span>`;
+      return `<span class="gantt-bar-content" title="${escapeHtml(i18nRef.current.text("双击打开详情", "Double-click for details"))}"><i class="gantt-bar-assignee${task.taskboardAssigneeType === "agent" ? " is-agent" : ""}" title="${escapeHtml(task.taskboardAssigneeName)}">${avatar}</i><span class="gantt-bar-copy"><strong>${escapeHtml(task.taskboardTitle)}</strong><small>${dateLabel}</small></span></span>`;
     };
     const rowClass = (item: GanttTask) => {
       const task = item as TaskboardGanttTask;
@@ -297,12 +301,30 @@ export const GanttView = forwardRef<GanttViewport, GanttViewProps>(function Gant
       void onUpdateRef.current(task, { startDate, dueDate }).catch(() => {});
       return true;
     });
+    let pendingTaskClickTimer: number | null = null;
+    const clearPendingTaskClick = () => {
+      if (pendingTaskClickTimer !== null) window.clearTimeout(pendingTaskClickTimer);
+      pendingTaskClickTimer = null;
+    };
+    instance.attachEvent("onTaskClick", (id) => {
+      const task = tasksRef.current.find((candidate) => candidate.id === String(id));
+      if (!task) return false;
+      // Let a deliberate double click claim the detail affordance before a
+      // normal click opens a child workspace.
+      clearPendingTaskClick();
+      pendingTaskClickTimer = window.setTimeout(() => {
+        pendingTaskClickTimer = null;
+        onOpenTaskRef.current(task);
+      }, 180);
+      return false;
+    });
     instance.attachEvent("onTaskDblClick", (id) => {
+      clearPendingTaskClick();
       const task = tasksRef.current.find((candidate) => candidate.id === String(id));
       if (task) {
         const scroll = instance.getScrollState();
         pendingDetailViewport = { projectId: task.projectId, x: scroll.x, y: scroll.y };
-        onOpenTaskRef.current(task);
+        onOpenTaskDetailRef.current(task);
       }
       return false;
     });
@@ -353,6 +375,7 @@ export const GanttView = forwardRef<GanttViewport, GanttViewProps>(function Gant
     });
     resizeObserver.observe(container);
     return () => {
+      clearPendingTaskClick();
       cancelAnimationFrame(markerFrame);
       resizeObserver.disconnect();
       container.removeEventListener("pointermove", handlePointerMove);

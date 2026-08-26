@@ -281,6 +281,8 @@ kbd {
   cursor: pointer;
 }
 .nested-workspace-super-card:hover { background: var(--surface-hover); }
+.nested-workspace-super-card.is-project-root { cursor: default; }
+.nested-workspace-super-card.is-project-root:hover { background: var(--surface-raised); }
 .nested-workspace-super-card span { display: grid; gap: 4px; }
 .nested-workspace-super-card small,
 .nested-workspace-item small { color: var(--text-tertiary); font-size: 11px; font-weight: 500; }
@@ -334,6 +336,23 @@ kbd {
   cursor: pointer;
 }
 .nested-workspace-item:hover { border-color: var(--accent); }
+.nested-workspace-item-wrap { display: flex; min-width: 0; gap: 6px; }
+.nested-workspace-item-wrap .nested-workspace-item { flex: 1; min-width: 0; }
+.nested-workspace-item-detail,
+.workspace-timeline-detail,
+.issue-list-detail {
+  flex: 0 0 auto;
+  padding: 0 8px;
+  border: var(--border-hairline) solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 11px;
+}
+.nested-workspace-item-detail:hover,
+.workspace-timeline-detail:hover,
+.issue-list-detail:hover { border-color: var(--accent); color: var(--text-primary); }
 .nested-workspace-item-copy { display: grid; min-width: 0; gap: 3px; }
 .nested-workspace-item-copy strong { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
 .nested-workspace-status { display: inline-flex; flex: none; align-items: center; gap: 4px; color: var(--text-secondary); font-size: 11px; text-transform: capitalize; }
@@ -363,8 +382,9 @@ kbd {
 .workspace-timeline li { position: relative; padding-left: 24px; }
 .workspace-timeline-marker { position: absolute; z-index: 1; top: 14px; left: 3px; width: 12px; height: 12px; border: 2px solid var(--accent); border-radius: 50%; background: var(--surface-raised); }
 .workspace-timeline li.is-undated .workspace-timeline-marker { border-color: var(--text-tertiary); }
-.workspace-timeline li > button { display: grid; grid-template-columns: minmax(112px, max-content) minmax(0, 1fr) max-content max-content; width: 100%; align-items: center; gap: 10px; padding: 10px 12px; border: var(--border-hairline) solid var(--border); border-radius: 7px; background: var(--surface-raised); color: var(--text-primary); cursor: pointer; text-align: left; }
-.workspace-timeline li > button:hover { border-color: var(--accent); }
+.workspace-timeline-entry { display: flex; min-width: 0; gap: 6px; }
+.workspace-timeline-entry > button:first-child { display: grid; grid-template-columns: minmax(112px, max-content) minmax(0, 1fr) max-content max-content; flex: 1; min-width: 0; align-items: center; gap: 10px; padding: 10px 12px; border: var(--border-hairline) solid var(--border); border-radius: 7px; background: var(--surface-raised); color: var(--text-primary); cursor: pointer; text-align: left; }
+.workspace-timeline-entry > button:first-child:hover { border-color: var(--accent); }
 .workspace-timeline time { color: var(--text-secondary); font-size: 11px; white-space: nowrap; }
 .workspace-timeline-copy { display: grid; min-width: 0; gap: 2px; }
 .workspace-timeline-copy strong { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
@@ -374,7 +394,7 @@ kbd {
   .nested-workspace-view { padding: 16px; }
   .nested-workspace-overview { grid-template-columns: 1fr; }
   .nested-workspace-toolbar { align-items: flex-start; flex-direction: column; }
-  .workspace-timeline li > button { grid-template-columns: minmax(0, 1fr) max-content; }
+  .workspace-timeline-entry > button:first-child { grid-template-columns: minmax(0, 1fr) max-content; }
   .workspace-timeline time { grid-column: 1 / -1; }
   .workspace-timeline-bucket { display: none; }
 }

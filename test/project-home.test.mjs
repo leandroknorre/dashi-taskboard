@@ -39,20 +39,26 @@ test("imported Codex projects persist their exact device identity", () => {
   assert.match(appSource, /setProjectCodexIdentities[\s\S]*?PROJECT_CODEX_IDENTITIES_KEY/);
 });
 
-test("project selection starts from the route or recent projects and updates the route", () => {
+test("project selection starts from the route or recent projects and canonicalizes a project root workspace", () => {
   assert.match(appSource, /const RECENT_PROJECT_IDS_KEY = "taskboard\.recentProjectIds\.v1"/);
-  assert.match(appSource, /const initialProjectId = query\.get\("project"\) \?\? recentProjectIds\[0\] \?\? ALL_PROJECTS_ID/);
+  assert.match(appSource, /const initialWorkspaceRootProjectId = readWorkspaceRootProjectId\(window\.location\.search\)/);
+  assert.match(appSource, /const initialProjectId = query\.get\("project"\) \?\? initialWorkspaceRootProjectId \?\? recentProjectIds\[0\] \?\? ALL_PROJECTS_ID/);
   assert.match(appSource, /const rememberProjectOpen = useCallback/);
   assert.match(appSource, /taskboardStorage\.setItem\(RECENT_PROJECT_IDS_KEY, JSON\.stringify\(next\)\)/);
   assert.match(appSource, /function changeProject\(projectId: string\)/);
   assert.match(appSource, /setSelectedProjectId\(projectId\)/);
-  assert.match(appSource, /const url = buildIssueUrl\(window\.location\.href, projectId, null\)/);
+  assert.match(appSource, /buildRootWorkspaceUrl\(boardUrl\.href, projectId, "overview"\)/);
   assert.match(appSource, /window\.history\.replaceState\(null, "", url\)/);
 });
 
-test("the selected project exposes the current board surfaces", () => {
+test("the selected project reuses the nested workspace surfaces at its root", () => {
   assert.match(appSource, /<header className="workspace-header">/);
   assert.match(appSource, /<div className="board-toolbar">/);
+  assert.match(appSource, /<NestedWorkspaceView/);
+  assert.match(appSource, /descriptorFromProjectTasks\(selectedProject, tasks\)/);
+  assert.match(appSource, /projectExtras=\{activeWorkspaceDescriptor\.kind === "project"/);
+  assert.match(appSource, /workspaceRootExtra === "gantt"/);
+  assert.match(appSource, /id: "docs", label: text\("项目文档", "Project Docs"\)/);
   assert.match(appSource, /<DashboardView/);
   assert.match(appSource, /<IssueListView/);
   assert.match(appSource, /<GanttView/);

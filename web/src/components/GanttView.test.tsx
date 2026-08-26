@@ -144,6 +144,7 @@ function DelayedWorkflowGantt({ workflow }: { workflow: Promise<WorkflowStage[]>
       todayRequest={0}
       workflowStages={loadedStages}
       onOpenTask={noop}
+      onOpenTaskDetail={noop}
       onUpdate={async (current) => current}
     />
   );
@@ -209,6 +210,7 @@ describe("GanttView workflow stages", () => {
         restoreViewport={{ x: 0, y: 3247 }}
         onRestoreViewport={onRestoreViewport}
         onOpenTask={noop}
+        onOpenTaskDetail={noop}
         onUpdate={async (current) => current}
       />,
     );

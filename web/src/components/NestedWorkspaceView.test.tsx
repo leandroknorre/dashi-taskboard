@@ -1,13 +1,15 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TaskboardLanguageProvider } from "../i18n";
-import type { NestedWorkspace, TaskRollup } from "../types";
+import type { TaskRollup } from "../types";
+import type { WorkspaceDescriptor } from "../workspaceDescriptor";
 import { NestedWorkspaceView } from "./NestedWorkspaceView";
 
 afterEach(cleanup);
 
-const workspace = {
-  overview: {
+const workspace: WorkspaceDescriptor = {
+  kind: "task",
+  root: {
     id: "root",
     identifier: "TASK-1",
     projectId: "project-1",
@@ -15,25 +17,26 @@ const workspace = {
     description: "Ship the public workspace.",
     status: "todo",
     macroBucket: "ready",
+    target: { kind: "task", identifier: "TASK-1" },
   },
   breadcrumb: [
-    { id: "program", identifier: "TASK-0", projectId: "project-1", title: "Program", status: "backlog", macroBucket: "planned", priority: "none", archivedAt: null, parentId: null, depth: 0, path: ["program"] },
-    { id: "root", identifier: "TASK-1", projectId: "project-1", title: "Release workspace", status: "todo", macroBucket: "ready", priority: "high", archivedAt: null, parentId: "program", depth: 1, path: ["program", "root"] },
+    { id: "program", title: "Program", target: { kind: "task", identifier: "TASK-0" } },
+    { id: "root", title: "Release workspace", target: { kind: "task", identifier: "TASK-1" } },
   ],
   children: {
     items: [
-      { id: "child", identifier: "TASK-2", projectId: "project-1", title: "Build board", status: "in_progress", macroBucket: "active", priority: "high", archivedAt: null, parentId: "root", depth: 1, path: ["root", "child"] },
+      { id: "child", identifier: "TASK-2", projectId: "project-1", title: "Build board", status: "in_progress", macroBucket: "active", priority: "high", archivedAt: null, parentId: "root", depth: 1, path: ["root", "child"], startDate: null, dueDate: null, createdAt: "2026-08-25T00:00:00.000Z", updatedAt: "2026-08-25T00:00:00.000Z" },
     ],
     nextCursor: "workspace:child",
   },
   descendants: {
     items: [
-      { id: "child", identifier: "TASK-2", projectId: "project-1", title: "Build board", status: "in_progress", macroBucket: "active", priority: "high", archivedAt: null, parentId: "root", depth: 1, path: ["root", "child"] },
-      { id: "grandchild", identifier: "TASK-3", projectId: "project-1", title: "Verify list", status: "in_review", macroBucket: "review", priority: "none", archivedAt: null, parentId: "child", depth: 2, path: ["root", "child", "grandchild"] },
+      { id: "child", identifier: "TASK-2", projectId: "project-1", title: "Build board", status: "in_progress", macroBucket: "active", priority: "high", archivedAt: null, parentId: "root", depth: 1, path: ["root", "child"], startDate: null, dueDate: null, createdAt: "2026-08-25T00:00:00.000Z", updatedAt: "2026-08-25T00:00:00.000Z" },
+      { id: "grandchild", identifier: "TASK-3", projectId: "project-1", title: "Verify list", status: "in_review", macroBucket: "review", priority: "none", archivedAt: null, parentId: "child", depth: 2, path: ["root", "child", "grandchild"], startDate: null, dueDate: null, createdAt: "2026-08-25T00:00:00.000Z", updatedAt: "2026-08-25T00:00:00.000Z" },
     ],
     nextCursor: null,
   },
-} as NestedWorkspace;
+};
 
 const rollup: TaskRollup = {
   version: 1,
@@ -50,6 +53,7 @@ function renderWorkspace(view: "overview" | "board" | "list" | "tree" | "mindmap
   const onDescendantsChange = vi.fn();
   const onLoadMore = vi.fn();
   const onOpenTask = vi.fn();
+  const onOpenTaskDetail = vi.fn();
   const onOpenWorkspace = vi.fn();
   render(
     <TaskboardLanguageProvider language="en">
@@ -63,11 +67,12 @@ function renderWorkspace(view: "overview" | "board" | "list" | "tree" | "mindmap
         onDescendantsChange={onDescendantsChange}
         onLoadMore={onLoadMore}
         onOpenTask={onOpenTask}
+        onOpenTaskDetail={onOpenTaskDetail}
         onOpenWorkspace={onOpenWorkspace}
       />
     </TaskboardLanguageProvider>,
   );
-  return { onViewChange, onDescendantsChange, onLoadMore, onOpenTask, onOpenWorkspace };
+  return { onViewChange, onDescendantsChange, onLoadMore, onOpenTask, onOpenTaskDetail, onOpenWorkspace };
 }
 
 describe("NestedWorkspaceView", () => {
@@ -78,16 +83,18 @@ describe("NestedWorkspaceView", () => {
     expect(screen.getByText(/Derived from/)).toBeTruthy();
     expect(screen.getByText(/Fresh at read time/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Open workspace Release workspace" }));
-    expect(onOpenWorkspace).toHaveBeenCalledWith("TASK-1");
+    expect(onOpenWorkspace).toHaveBeenCalledWith({ kind: "task", identifier: "TASK-1" });
     expect(onOpenTask).not.toHaveBeenCalled();
   });
 
   it("groups board cards by macro bucket while displaying the actual stage", () => {
-    const { onOpenTask, onLoadMore } = renderWorkspace("board");
+    const { onOpenTask, onOpenTaskDetail, onLoadMore } = renderWorkspace("board");
     expect(screen.getByText("Active")).toBeTruthy();
     expect(screen.getByText("in progress")).toBeTruthy();
     fireEvent.click(screen.getByText("Build board"));
     expect(onOpenTask).toHaveBeenCalledWith(expect.objectContaining({ identifier: "TASK-2" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open details TASK-2" }));
+    expect(onOpenTaskDetail).toHaveBeenCalledWith(expect.objectContaining({ identifier: "TASK-2" }));
     fireEvent.click(screen.getByText("Load more"));
     expect(onLoadMore).toHaveBeenCalledOnce();
   });
@@ -99,7 +106,7 @@ describe("NestedWorkspaceView", () => {
     fireEvent.click(screen.getByLabelText("All descendants"));
     expect(onDescendantsChange).toHaveBeenCalledWith(true);
     fireEvent.click(screen.getByText("Program"));
-    expect(onOpenWorkspace).toHaveBeenCalledWith("TASK-0");
+    expect(onOpenWorkspace).toHaveBeenCalledWith({ kind: "task", identifier: "TASK-0" });
     expect(screen.getByRole("tablist", { name: "Workspace views" })).toBeTruthy();
     expect(screen.getByRole("tab", { name: "List" }).getAttribute("aria-selected")).toBe("true");
     expect(screen.getByRole("tabpanel").getAttribute("aria-labelledby")).toBe("nested-workspace-tab-list");
@@ -115,7 +122,7 @@ describe("NestedWorkspaceView", () => {
     fireEvent.click(screen.getByRole("button", { name: /TASK-3.*Verify list/i }));
     expect(onOpenTask).toHaveBeenCalledWith(expect.objectContaining({ identifier: "TASK-3" }));
     fireEvent.click(screen.getByRole("button", { name: /TASK-1.*Release workspace/i }));
-    expect(onOpenWorkspace).toHaveBeenCalledWith("TASK-1");
+    expect(onOpenWorkspace).toHaveBeenCalledWith({ kind: "task", identifier: "TASK-1" });
   });
 
   it("keeps the workspace root visible in a mind map with no loaded children", () => {
@@ -124,6 +131,54 @@ describe("NestedWorkspaceView", () => {
     renderWorkspace("mindmap");
     expect(screen.getByRole("button", { name: /TASK-1.*Release workspace/i })).toBeTruthy();
     workspace.children.items = originalChildren;
+  });
+
+  it("keeps deliberate project extras after the six canonical workspace tabs", () => {
+    const onProjectExtraChange = vi.fn();
+    const rootWorkspace: WorkspaceDescriptor = {
+      ...workspace,
+      kind: "project",
+      root: {
+        id: "project:project-1",
+        identifier: null,
+        projectId: "project-1",
+        title: "Alpha",
+        description: "",
+        status: null,
+        macroBucket: null,
+        target: null,
+      },
+      breadcrumb: [],
+    };
+    render(
+      <TaskboardLanguageProvider language="en">
+        <NestedWorkspaceView
+          workspace={rootWorkspace}
+          rollup={null}
+          view="overview"
+          descendants={false}
+          loadingMore={false}
+          onViewChange={vi.fn()}
+          onDescendantsChange={vi.fn()}
+          onLoadMore={vi.fn()}
+          onOpenTask={vi.fn()}
+          onOpenTaskDetail={vi.fn()}
+          onOpenWorkspace={vi.fn()}
+          projectExtras={[{ id: "gantt", label: "Gantt" }, { id: "docs", label: "Project Docs" }]}
+          activeProjectExtra="gantt"
+          onProjectExtraChange={onProjectExtraChange}
+          projectExtraContent={<p>Legacy Gantt surface</p>}
+        />
+      </TaskboardLanguageProvider>,
+    );
+
+    for (const label of ["Overview", "Board", "List", "Tree", "Mind Map", "Timeline", "Gantt", "Project Docs"]) {
+      expect(screen.getByRole("tab", { name: label })).toBeTruthy();
+    }
+    expect(screen.getByText("Legacy Gantt surface")).toBeTruthy();
+    expect(screen.getByRole("tabpanel").getAttribute("aria-labelledby")).toBe("nested-workspace-extra-gantt");
+    fireEvent.click(screen.getByRole("tab", { name: "Project Docs" }));
+    expect(onProjectExtraChange).toHaveBeenCalledWith("docs");
   });
 
   it("orders the timeline deterministically and preserves real stage and macro bucket", () => {

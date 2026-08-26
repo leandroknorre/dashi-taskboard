@@ -100,10 +100,14 @@ import {
 } from "./embeddedHost.mjs";
 import {
   buildIssueUrl,
+  buildRootWorkspaceUrl,
   buildWorkspaceUrl,
   readIssueIdentifier,
   readWorkspaceIdentifier,
+  readWorkspaceRootExtra,
+  readWorkspaceRootProjectId,
   readWorkspaceView,
+  type WorkspaceRootExtra,
   type WorkspaceView,
 } from "./issueRoute";
 import {
@@ -151,6 +155,11 @@ import {
   type TaskDraft,
   type TaskStatus,
 } from "./types";
+import {
+  descriptorFromNestedWorkspace,
+  descriptorFromProjectTasks,
+  type WorkspaceNavigationTarget,
+} from "./workspaceDescriptor";
 // The poller stays in ESM JavaScript so its lifecycle can be tested directly with node:test.
 // @ts-expect-error The module's option contract is enforced by its focused node tests.
 import { createRevisionPoller, createRevisionWebSocketClient, getRevisionPollingInterval, getRevisionWebSocketConfig } from "./revisionPolling.mjs";
@@ -754,11 +763,25 @@ export function App() {
   >({});
   const [processingNow, setProcessingNow] = useState(() => Date.now());
   const [recentProjectIds, setRecentProjectIds] = useState(readRecentProjectIds);
-  const initialProjectId = query.get("project") ?? recentProjectIds[0] ?? ALL_PROJECTS_ID;
+  const initialWorkspaceRootProjectId = readWorkspaceRootProjectId(window.location.search);
+  const initialProjectId = query.get("project") ?? initialWorkspaceRootProjectId ?? recentProjectIds[0] ?? ALL_PROJECTS_ID;
+  const initialRootWorkspaceProjectId = initialWorkspaceRootProjectId ?? (
+    !readIssueIdentifier(window.location.search)
+    && !readWorkspaceIdentifier(window.location.search)
+    && initialProjectId !== ALL_PROJECTS_ID
+      ? initialProjectId
+      : null
+  );
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState(initialProjectId);
   const [workspaceIdentifier, setWorkspaceIdentifier] = useState<string | null>(
     () => readWorkspaceIdentifier(window.location.search),
+  );
+  const [workspaceRootProjectId, setWorkspaceRootProjectId] = useState<string | null>(
+    () => initialRootWorkspaceProjectId,
+  );
+  const [workspaceRootExtra, setWorkspaceRootExtra] = useState<WorkspaceRootExtra | null>(
+    () => readWorkspaceRootExtra(window.location.search),
   );
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>(
     () => readWorkspaceView(window.location.search),
@@ -767,6 +790,7 @@ export function App() {
   const [nestedWorkspaceLoad, setNestedWorkspaceLoad] = useState<NestedWorkspaceLoad>(
     EMPTY_NESTED_WORKSPACE_LOAD,
   );
+  const workspaceActive = workspaceIdentifier !== null || workspaceRootProjectId !== null;
   const [tasks, setTasks] = useState<Task[]>([]);
   const [archivedTasks, setArchivedTasks] = useState<Task[]>([]);
   const [tasksLoading, setTasksLoading] = useState(false);
@@ -1542,7 +1566,7 @@ export function App() {
     const fullTask = tasksRef.current.find((candidate) => candidate.identifier === task.identifier);
     if (fullTask) markTaskRead(fullTask);
     const currentIssue = readIssueIdentifier(window.location.search);
-    detailWorkspaceOriginScrollRef.current = !workspaceIdentifier && !currentIssue
+    detailWorkspaceOriginScrollRef.current = !workspaceActive && !currentIssue
       ? captureWorkspaceOriginScroll()
       : null;
     if (!currentIssue) detailSourceProjectIdRef.current = selectedProjectId;
@@ -1578,6 +1602,15 @@ export function App() {
       task.identifier,
     );
     window.history.pushState(window.history.state, "", detailUrl);
+  }
+
+  function openTaskOrWorkspace(task: Pick<Task, "identifier" | "projectId">) {
+    const fullTask = tasksRef.current.find((candidate) => candidate.identifier === task.identifier);
+    if (fullTask?.relations.subIssues.length) {
+      openNestedWorkspace(fullTask.identifier);
+      return;
+    }
+    openTaskDetail(task);
   }
 
   function closeTaskDetail() {
@@ -1616,10 +1649,19 @@ export function App() {
       const routeProjectId = url.searchParams.get("project") ?? GLOBAL_PROJECT_ID;
       const routeIssueIdentifier = readIssueIdentifier(url.search);
       const routeWorkspaceIdentifier = readWorkspaceIdentifier(url.search);
-      if (!workspaceIdentifier && routeWorkspaceIdentifier) {
+      const routeWorkspaceRootProjectId = readWorkspaceRootProjectId(url.search);
+      const routeWorkspaceRootExtra = readWorkspaceRootExtra(url.search);
+      const routeWorkspaceActive = Boolean(routeWorkspaceIdentifier || routeWorkspaceRootProjectId);
+      const currentWorkspaceKey = workspaceIdentifier
+        ? `task:${workspaceIdentifier}`
+        : workspaceRootProjectId ? `project:${workspaceRootProjectId}` : null;
+      const routeWorkspaceKey = routeWorkspaceIdentifier
+        ? `task:${routeWorkspaceIdentifier}`
+        : routeWorkspaceRootProjectId ? `project:${routeWorkspaceRootProjectId}` : null;
+      if (!workspaceActive && routeWorkspaceActive) {
         saveWorkspaceOriginScroll(captureWorkspaceOriginScroll());
       }
-      if (workspaceIdentifier && !routeWorkspaceIdentifier) {
+      if (workspaceActive && !routeWorkspaceActive) {
         const state = window.history.state;
         const source = state && typeof state === "object"
           ? (state as { nestedWorkspaceSourceScroll?: WorkspaceOriginScroll }).nestedWorkspaceSourceScroll
@@ -1627,8 +1669,10 @@ export function App() {
         if (source) pendingWorkspaceOriginScrollRef.current = source;
       }
       setWorkspaceIdentifier(routeWorkspaceIdentifier);
+      setWorkspaceRootProjectId(routeWorkspaceRootProjectId);
+      setWorkspaceRootExtra(routeWorkspaceRootExtra);
       setWorkspaceView(readWorkspaceView(url.search));
-      if (routeWorkspaceIdentifier !== workspaceIdentifier) setWorkspaceDescendants(false);
+      if (routeWorkspaceKey !== currentWorkspaceKey) setWorkspaceDescendants(false);
       if (routeIssueIdentifier && boardView === "list" && issueListRef.current) {
         pendingDetailSourceScrollRef.current = {
           projectId: selectedProjectId,
@@ -1653,14 +1697,15 @@ export function App() {
       }
       if (!routeIssueIdentifier) detailSourceProjectIdRef.current = null;
       setDetailTaskIdentifier(routeIssueIdentifier);
-      if (routeProjectId === selectedProjectId) return;
-      setBoardView(routeProjectId === ALL_PROJECTS_ID ? "issues" : readProjectBoardView(routeProjectId));
-      setSelectedProjectId(routeProjectId);
+      const routeWorkspaceProjectId = routeWorkspaceRootProjectId ?? routeProjectId;
+      if (routeWorkspaceProjectId === selectedProjectId) return;
+      setBoardView(routeWorkspaceProjectId === ALL_PROJECTS_ID ? "issues" : readProjectBoardView(routeWorkspaceProjectId));
+      setSelectedProjectId(routeWorkspaceProjectId);
     }
 
     window.addEventListener("popstate", syncRouteFromLocation);
     return () => window.removeEventListener("popstate", syncRouteFromLocation);
-  }, [boardView, selectedProjectId, workspaceIdentifier]);
+  }, [boardView, selectedProjectId, workspaceActive, workspaceIdentifier, workspaceRootProjectId]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -1683,6 +1728,23 @@ export function App() {
     }
   }, [selectedProjectId]);
 
+  // A project is itself the root workspace. Canonicalize ordinary project
+  // entry to its route once the project record is available, while keeping the
+  // all-projects aggregate in its existing board mode.
+  useEffect(() => {
+    if (!selectedProject || isAllProjects || detailTaskIdentifier || workspaceIdentifier) return;
+    if (
+      workspaceRootProjectId === selectedProject.id
+      && readWorkspaceRootProjectId(window.location.search) === selectedProject.id
+    ) return;
+    setWorkspaceDescendants(false);
+    setWorkspaceRootProjectId(selectedProject.id);
+    setWorkspaceRootExtra(null);
+    setWorkspaceView("overview");
+    const url = buildRootWorkspaceUrl(window.location.href, selectedProject.id, "overview");
+    window.history.replaceState(window.history.state, "", url);
+  }, [detailTaskIdentifier, isAllProjects, selectedProject, workspaceIdentifier, workspaceRootProjectId]);
+
   const nestedWorkspaceCurrentKey = nestedWorkspaceLoadKey(
     workspaceIdentifier,
     workspaceDescendants,
@@ -1694,6 +1756,23 @@ export function App() {
         key: nestedWorkspaceCurrentKey,
         loading: Boolean(workspaceIdentifier),
       };
+
+  const activeWorkspaceDescriptor = useMemo(() => {
+    if (workspaceIdentifier && activeNestedWorkspaceLoad.workspace) {
+      const workspaceProject = projects.find(
+        (project) => project.id === activeNestedWorkspaceLoad.workspace?.overview.projectId,
+      ) ?? null;
+      return descriptorFromNestedWorkspace(activeNestedWorkspaceLoad.workspace, workspaceProject);
+    }
+    if (
+      workspaceRootProjectId
+      && selectedProject
+      && selectedProject.id === workspaceRootProjectId
+    ) {
+      return descriptorFromProjectTasks(selectedProject, tasks);
+    }
+    return null;
+  }, [activeNestedWorkspaceLoad.workspace, projects, selectedProject, tasks, workspaceIdentifier, workspaceRootProjectId]);
 
   useEffect(() => {
     const requestId = ++nestedWorkspaceRequestRef.current;
@@ -1750,7 +1829,7 @@ export function App() {
   }, [workspaceDescendants, workspaceIdentifier]);
 
   useLayoutEffect(() => {
-    if (workspaceIdentifier) return;
+    if (workspaceActive) return;
     const source = pendingWorkspaceOriginScrollRef.current;
     if (!source) return;
     if (source.projectId !== selectedProjectId) {
@@ -1777,9 +1856,9 @@ export function App() {
       pendingWorkspaceOriginScrollRef.current = null;
     }
     // Gantt restores after DHTMLX has parsed its virtual rows; see restoreViewport below.
-  }, [boardView, ganttViewportVersion, selectedProjectId, tasksLoading, workspaceIdentifier]);
+  }, [boardView, ganttViewportVersion, selectedProjectId, tasksLoading, workspaceActive]);
 
-  const workspaceGanttRestore = !workspaceIdentifier
+  const workspaceGanttRestore = !workspaceActive
     && pendingWorkspaceOriginScrollRef.current?.view === "gantt"
     && pendingWorkspaceOriginScrollRef.current.projectId === selectedProjectId
     && boardView === "gantt"
@@ -2517,10 +2596,33 @@ export function App() {
   }, []);
 
   function selectWorkspaceView(view: WorkspaceView) {
-    if (!workspaceIdentifier) return;
+    if (!workspaceActive) return;
+    setWorkspaceRootExtra(null);
     setWorkspaceView(view);
-    const url = buildWorkspaceUrl(window.location.href, workspaceIdentifier, view);
+    const url = workspaceIdentifier
+      ? buildWorkspaceUrl(window.location.href, workspaceIdentifier, view)
+      : buildRootWorkspaceUrl(window.location.href, workspaceRootProjectId, view);
     window.history.replaceState(window.history.state, "", url);
+  }
+
+  function openProjectWorkspace(projectId: string) {
+    if (projectId === workspaceRootProjectId) {
+      selectWorkspaceView("overview");
+      return;
+    }
+    if (!workspaceActive) saveWorkspaceOriginScroll(captureWorkspaceOriginScroll());
+    detailWorkspaceOriginScrollRef.current = null;
+    setWorkspaceDescendants(false);
+    setWorkspaceIdentifier(null);
+    setWorkspaceRootProjectId(projectId);
+    setWorkspaceRootExtra(null);
+    setWorkspaceView("overview");
+    if (projectId !== selectedProjectId) {
+      setSelectedProjectId(projectId);
+      setBoardView(projectId === ALL_PROJECTS_ID ? "issues" : readProjectBoardView(projectId));
+    }
+    const url = buildRootWorkspaceUrl(window.location.href, projectId, "overview");
+    window.history.pushState(window.history.state, "", url);
   }
 
   function openNestedWorkspace(identifier: string) {
@@ -2528,13 +2630,32 @@ export function App() {
       selectWorkspaceView("overview");
       return;
     }
-    if (!workspaceIdentifier) saveWorkspaceOriginScroll(captureWorkspaceOriginScroll());
+    if (!workspaceActive) saveWorkspaceOriginScroll(captureWorkspaceOriginScroll());
     detailWorkspaceOriginScrollRef.current = null;
     setWorkspaceDescendants(false);
     setWorkspaceIdentifier(identifier);
+    setWorkspaceRootProjectId(null);
+    setWorkspaceRootExtra(null);
     setWorkspaceView("overview");
     const url = buildWorkspaceUrl(window.location.href, identifier, "overview");
     window.history.pushState(window.history.state, "", url);
+  }
+
+  function openWorkspaceTarget(target: WorkspaceNavigationTarget) {
+    if (target.kind === "project") openProjectWorkspace(target.projectId);
+    else openNestedWorkspace(target.identifier);
+  }
+
+  function selectRootWorkspaceExtra(extra: WorkspaceRootExtra) {
+    if (!workspaceRootProjectId) return;
+    setWorkspaceRootExtra(extra);
+    const url = buildRootWorkspaceUrl(
+      window.location.href,
+      workspaceRootProjectId,
+      workspaceView,
+      extra,
+    );
+    window.history.replaceState(window.history.state, "", url);
   }
 
   function openNestedWorkspaceFromDetail(identifier: string) {
@@ -2549,9 +2670,11 @@ export function App() {
       setSelectedProjectId(sourceProjectId);
       setBoardView(sourceProjectId === ALL_PROJECTS_ID ? "issues" : readProjectBoardView(sourceProjectId));
     }
-    if (!workspaceIdentifier) saveWorkspaceOriginScroll(detailOriginScroll ?? captureWorkspaceOriginScroll());
+    if (!workspaceActive) saveWorkspaceOriginScroll(detailOriginScroll ?? captureWorkspaceOriginScroll());
     setWorkspaceDescendants(false);
     setWorkspaceIdentifier(identifier);
+    setWorkspaceRootProjectId(null);
+    setWorkspaceRootExtra(null);
     setWorkspaceView("overview");
     const boardUrl = buildIssueUrl(window.location.href, sourceProjectId, null);
     window.history.replaceState(window.history.state, "", boardUrl);
@@ -3378,6 +3501,11 @@ export function App() {
     detailSourceProjectIdRef.current = null;
     detailWorkspaceOriginScrollRef.current = null;
     setDetailTaskIdentifier(null);
+    setWorkspaceIdentifier(null);
+    setWorkspaceRootProjectId(projectId === ALL_PROJECTS_ID ? null : projectId);
+    setWorkspaceRootExtra(null);
+    setWorkspaceView("overview");
+    setWorkspaceDescendants(false);
     setBoardView(projectId === ALL_PROJECTS_ID ? "issues" : readProjectBoardView(projectId));
     if (projectId !== ALL_PROJECTS_ID) rememberProjectOpen(projectId);
     setSelectedProjectId(projectId);
@@ -3386,7 +3514,10 @@ export function App() {
     setActionError(null);
     undoStackRef.current = [];
     setUndoNotice(null);
-    const url = buildIssueUrl(window.location.href, projectId, null);
+    const boardUrl = buildIssueUrl(window.location.href, projectId, null);
+    const url = projectId === ALL_PROJECTS_ID
+      ? boardUrl
+      : buildRootWorkspaceUrl(boardUrl.href, projectId, "overview");
     window.history.replaceState(null, "", url);
   }
 
@@ -3752,7 +3883,7 @@ export function App() {
           </div>
         </header>
 
-        {selectedProjectId && !detailTask && !workspaceIdentifier && <div className="board-toolbar">
+        {selectedProjectId && !detailTask && !workspaceActive && <div className="board-toolbar">
           <div className="view-tabs" aria-label={text("看板视图", "Board views")}>
             <button
               className={`view-tab${boardView === "dashboard" ? " active" : ""}`}
@@ -3945,17 +4076,17 @@ export function App() {
             openingThread={openingThreadTaskId === detailTask.id}
             onError={setActionError}
           />
-        ) : workspaceIdentifier ? (
-          activeNestedWorkspaceLoad.loading && !activeNestedWorkspaceLoad.workspace ? (
+        ) : workspaceActive ? (
+          workspaceIdentifier && activeNestedWorkspaceLoad.loading && !activeNestedWorkspaceLoad.workspace ? (
             <div className="board-view-loading">{text("正在打开嵌套工作区…", "Opening nested workspace…")}</div>
-          ) : activeNestedWorkspaceLoad.error && !activeNestedWorkspaceLoad.workspace ? (
+          ) : workspaceIdentifier && activeNestedWorkspaceLoad.error && !activeNestedWorkspaceLoad.workspace ? (
             <div className="page-empty">
               <h2>{text("无法打开嵌套工作区", "Could not open nested workspace")}</h2>
               <p>{activeNestedWorkspaceLoad.error}</p>
             </div>
-          ) : activeNestedWorkspaceLoad.workspace ? (
+          ) : activeWorkspaceDescriptor ? (
             <NestedWorkspaceView
-              workspace={activeNestedWorkspaceLoad.workspace}
+              workspace={activeWorkspaceDescriptor}
               rollup={activeNestedWorkspaceLoad.rollup}
               view={workspaceView}
               descendants={workspaceDescendants}
@@ -3963,10 +4094,48 @@ export function App() {
               onViewChange={selectWorkspaceView}
               onDescendantsChange={setWorkspaceDescendants}
               onLoadMore={loadMoreNestedWorkspace}
-              onOpenTask={openTaskDetail}
-              onOpenWorkspace={openNestedWorkspace}
+              onOpenTask={openTaskOrWorkspace}
+              onOpenTaskDetail={openTaskDetail}
+              onOpenWorkspace={openWorkspaceTarget}
+              projectExtras={activeWorkspaceDescriptor.kind === "project" ? [
+                { id: "gantt", label: "Gantt" },
+                { id: "docs", label: text("项目文档", "Project Docs") },
+              ] : undefined}
+              activeProjectExtra={workspaceRootExtra}
+              onProjectExtraChange={selectRootWorkspaceExtra}
+              projectExtraContent={activeWorkspaceDescriptor.kind !== "project" || workspaceRootExtra === null
+                ? undefined
+                : workspaceRootExtra === "gantt" ? (
+                  <Suspense fallback={<div className="board-view-loading">{text("正在打开甘特图…", "Opening Gantt…")}</div>}>
+                    <GanttView
+                      ref={setGanttViewport}
+                      tasks={filteredTasks}
+                      presentations={taskPresentations}
+                      hasActiveFilters={hasActiveTaskFilters}
+                      zoom={ganttZoom}
+                      hideCompleted={ganttHideCompleted}
+                      todayRequest={ganttTodayRequest}
+                      workflowStages={stageWorkflow?.definition.stages}
+                      restoreViewport={workspaceGanttRestore}
+                      onRestoreViewport={acknowledgeWorkspaceGanttRestore}
+                      onOpenTask={openTaskOrWorkspace}
+                      onOpenTaskDetail={openTaskDetail}
+                      onUpdate={updateTaskProperties}
+                    />
+                  </Suspense>
+                ) : selectedProject ? (
+                  <ProjectReadmeView
+                    key={selectedProjectId}
+                    project={selectedProject}
+                    tasks={tasks.filter((task) => task.projectId === selectedProject.id)}
+                    referenceTasks={referenceTasks.filter((task) => task.projectId === selectedProject.id)}
+                    revision={readmeRevision}
+                    onOpenTask={openTaskOrWorkspace}
+                    onError={setActionError}
+                  />
+                ) : undefined}
             />
-          ) : null
+          ) : <div className="board-view-loading">{text("正在打开工作区…", "Opening workspace…")}</div>
         ) : boardView !== "readme"
           && hasLoadedTasks
           && tasks.length === 0
@@ -4010,7 +4179,7 @@ export function App() {
             tasks={tasks.filter((task) => task.projectId === selectedProject.id)}
             referenceTasks={referenceTasks.filter((task) => task.projectId === selectedProject.id)}
             revision={readmeRevision}
-            onOpenTask={openTaskDetail}
+            onOpenTask={openTaskOrWorkspace}
             onError={setActionError}
           />
         ) : boardView === "dashboard" && (selectedProject || isAllProjects) ? (
@@ -4024,7 +4193,7 @@ export function App() {
             currentUser={currentUser}
             animateSummary={dashboardSummaryAnimatedProjectId !== selectedProjectId}
             onSummaryAnimationStart={markDashboardSummaryAnimationStarted}
-            onOpenTask={openTaskDetail}
+            onOpenTask={openTaskOrWorkspace}
             onOpenConversation={openTaskConversation}
           />
         ) : boardView === "list" ? (
@@ -4035,7 +4204,8 @@ export function App() {
             currentUser={currentUser}
             workflowStages={stageWorkflow?.definition.stages}
             hasActiveFilters={hasActiveTaskFilters}
-            onOpenTask={openTaskDetail}
+            onOpenTask={openTaskOrWorkspace}
+            onOpenTaskDetail={openTaskDetail}
             onOpenConversation={openTaskConversation}
             onUpdate={updateTaskProperties}
           />
@@ -4052,7 +4222,8 @@ export function App() {
               workflowStages={stageWorkflow?.definition.stages}
               restoreViewport={workspaceGanttRestore}
               onRestoreViewport={acknowledgeWorkspaceGanttRestore}
-              onOpenTask={openTaskDetail}
+              onOpenTask={openTaskOrWorkspace}
+              onOpenTaskDetail={openTaskDetail}
               onUpdate={updateTaskProperties}
             />
           </Suspense>
@@ -4122,7 +4293,7 @@ export function App() {
                         createEnabled={!isJiraProject}
                         onCreateLabel={persistProjectLabel}
                         onCreate={(initialStatus, stageId) => setEditor({ task: null, status: initialStatus, stageId })}
-                        onEdit={openTaskDetail}
+                        onEdit={openTaskOrWorkspace}
                         onUpdate={updateTaskProperties}
                         onComplete={(task) => void moveTask(task, "done")}
                         onContextMenu={openTaskContextMenu}
@@ -4165,7 +4336,7 @@ export function App() {
                       : (initialStatus) => setEditor({ task: null, status: initialStatus })}
                     onRestore={(task) => void restoreArchivedTask(task)}
                     onDelete={setPendingArchivedTaskDelete}
-                    onEdit={openTaskDetail}
+                    onEdit={openTaskOrWorkspace}
                     onUpdate={updateTaskProperties}
                     onContextMenu={openTaskContextMenu}
                     onDragStart={startTaskDrag}

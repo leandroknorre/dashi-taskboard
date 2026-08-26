@@ -4,8 +4,11 @@ import { test } from "node:test";
 
 import {
   buildWorkspaceUrl,
+  buildRootWorkspaceUrl,
   buildIssueUrl,
   readIssueIdentifier,
+  readWorkspaceRootExtra,
+  readWorkspaceRootProjectId,
   readWorkspaceIdentifier,
   readWorkspaceView,
 } from "../web/src/issueRoute.ts";
@@ -57,6 +60,46 @@ test("nested workspace route clears issue context and accepts public projection 
   assert.equal(readWorkspaceView("?workspace=LOCAL-73&view=unknown"), "overview");
 });
 
+test("root and task workspaces are mutually exclusive deep-link routes", () => {
+  const rootUrl = buildRootWorkspaceUrl(
+    "http://127.0.0.1:47823/?host=codex&project=alpha&issue=ALPHA-72&workspace=ALPHA-73&filter=mine",
+    "alpha",
+    "timeline",
+  );
+
+  assert.equal(readWorkspaceRootProjectId(rootUrl.search), "alpha");
+  assert.equal(readWorkspaceIdentifier(rootUrl.search), null);
+  assert.equal(readIssueIdentifier(rootUrl.search), null);
+  assert.equal(readWorkspaceView(rootUrl.search), "timeline");
+  assert.equal(rootUrl.searchParams.get("project"), "alpha");
+  assert.equal(rootUrl.searchParams.get("host"), "codex");
+  assert.equal(rootUrl.searchParams.get("filter"), "mine");
+
+  const ganttUrl = buildRootWorkspaceUrl(rootUrl.href, "alpha", "timeline", "gantt");
+  assert.equal(readWorkspaceRootExtra(ganttUrl.search), "gantt");
+  assert.equal(readWorkspaceView(ganttUrl.search), "timeline");
+  assert.equal(ganttUrl.searchParams.get("workspaceExtra"), "gantt");
+
+  const taskUrl = buildWorkspaceUrl(ganttUrl.href, "ALPHA-73", "board");
+  assert.equal(readWorkspaceIdentifier(taskUrl.search), "ALPHA-73");
+  assert.equal(readWorkspaceRootProjectId(taskUrl.search), null);
+  assert.equal(readWorkspaceRootExtra(taskUrl.search), null);
+  assert.equal(readIssueIdentifier(taskUrl.search), null);
+  assert.equal(readWorkspaceView(taskUrl.search), "board");
+
+  const detailUrl = buildIssueUrl(taskUrl.href, "alpha", "ALPHA-72");
+  assert.equal(readIssueIdentifier(detailUrl.search), "ALPHA-72");
+  assert.equal(readWorkspaceIdentifier(detailUrl.search), "ALPHA-73");
+  assert.equal(readWorkspaceRootProjectId(detailUrl.search), null);
+  assert.equal(readWorkspaceView(detailUrl.search), "board");
+
+  const rootDetailUrl = buildIssueUrl(rootUrl.href, "alpha", "ALPHA-72");
+  assert.equal(readIssueIdentifier(rootDetailUrl.search), "ALPHA-72");
+  assert.equal(readWorkspaceIdentifier(rootDetailUrl.search), null);
+  assert.equal(readWorkspaceRootProjectId(rootDetailUrl.search), "alpha");
+  assert.equal(readWorkspaceView(rootDetailUrl.search), "timeline");
+});
+
 test("the app restores issue detail from the URL and follows browser history", () => {
   assert.match(
     appSource,
@@ -66,13 +109,14 @@ test("the app restores issue detail from the URL and follows browser history", (
   assert.match(appSource, /window\.addEventListener\("popstate", syncRouteFromLocation\)/);
   assert.match(appSource, /window\.removeEventListener\("popstate", syncRouteFromLocation\)/);
   assert.match(appSource, /setWorkspaceIdentifier\(routeWorkspaceIdentifier\)/);
+  assert.match(appSource, /setWorkspaceRootProjectId\(routeWorkspaceRootProjectId\)/);
   assert.match(appSource, /setWorkspaceView\(readWorkspaceView\(url\.search\)\)/);
   const openTaskSource = appSource.slice(
     appSource.indexOf("function openTaskDetail"),
     appSource.indexOf("function closeTaskDetail"),
   );
   assert.match(openTaskSource, /buildIssueUrl\(window\.location\.href, selectedProjectId, null\)/);
-  assert.match(openTaskSource, /detailWorkspaceOriginScrollRef\.current = !workspaceIdentifier && !currentIssue[\s\S]*?captureWorkspaceOriginScroll\(\)/);
+  assert.match(openTaskSource, /detailWorkspaceOriginScrollRef\.current = !workspaceActive && !currentIssue[\s\S]*?captureWorkspaceOriginScroll\(\)/);
   assert.match(openTaskSource, /window\.history\.replaceState/);
   assert.match(openTaskSource, /window\.history\.pushState/);
   assert.match(appSource, /function closeTaskDetail\(\)[\s\S]*?window\.history\.replaceState/);
@@ -80,6 +124,18 @@ test("the app restores issue detail from the URL and follows browser history", (
   assert.match(appSource, /function openNestedWorkspaceFromDetail[\s\S]*?setDetailTaskIdentifier\(null\)/);
   assert.match(appSource, /function openNestedWorkspaceFromDetail[\s\S]*?detailOriginScroll \?\? captureWorkspaceOriginScroll\(\)/);
   assert.match(appSource, /onOpenWorkspace=\{openNestedWorkspaceFromDetail\}/);
+});
+
+test("normal supra-card clicks use their workspace while leaves retain the detail route", async () => {
+  const workspaceSource = await readFile(new URL("../web/src/components/NestedWorkspaceView.tsx", import.meta.url), "utf8");
+  const ganttSource = await readFile(new URL("../web/src/components/GanttView.tsx", import.meta.url), "utf8");
+
+  assert.match(appSource, /function openTaskOrWorkspace\([\s\S]*?relations\.subIssues\.length[\s\S]*?openNestedWorkspace\(fullTask\.identifier\)/);
+  assert.match(appSource, /function openTaskOrWorkspace[\s\S]*?openTaskDetail\(task\)/);
+  assert.match(appSource, /onOpenTask=\{openTaskOrWorkspace\}/);
+  assert.match(workspaceSource, /className="nested-workspace-item-detail"[\s\S]*?onClick=\{\(\) => onOpenTaskDetail\(item\)\}/);
+  assert.match(ganttSource, /attachEvent\("onTaskClick",[\s\S]*?onOpenTaskRef\.current\(task\)/);
+  assert.match(ganttSource, /attachEvent\("onTaskDblClick",[\s\S]*?onOpenTaskDetailRef\.current\(task\)/);
 });
 
 test("only supra-items expose the nested-workspace entry point", async () => {
@@ -104,6 +160,19 @@ test("workspace history saves and restores an origin viewport without opening th
   assert.match(appSource, /saveWorkspaceOriginScroll\(captureWorkspaceOriginScroll\(\)\)[\s\S]*?window\.history\.pushState/);
   assert.match(appSource, /nestedWorkspaceSourceScroll/);
   assert.match(appSource, /restoreViewport=\{workspaceGanttRestore\}/);
-  assert.match(workspaceSource, /onClick=\{\(\) => onOpenWorkspace\(root\.identifier\)\}/);
+  assert.match(workspaceSource, /onClick=\{\(\) => onOpenWorkspace\(root\.target!\)\}/);
   assert.doesNotMatch(workspaceSource, /nested-workspace-super-card[\s\S]{0,300}onOpenTask\(root\)/);
+});
+
+test("the root project workspace reuses the canonical six projections", async () => {
+  const workspaceSource = await readFile(new URL("../web/src/components/NestedWorkspaceView.tsx", import.meta.url), "utf8");
+  for (const view of ["overview", "board", "list", "tree", "mindmap", "timeline"]) {
+    assert.match(workspaceSource, new RegExp(`\\["${view}"|"${view}"`));
+  }
+  assert.match(appSource, /buildRootWorkspaceUrl\(window\.location\.href, [^,]+, view\)/);
+  assert.match(appSource, /workspaceRootProjectId/);
+  assert.match(appSource, /workspaceRootExtra/);
+  assert.match(appSource, /id: "gantt", label: "Gantt"/);
+  assert.match(appSource, /id: "docs", label: text\("项目文档", "Project Docs"\)/);
+  assert.match(workspaceSource, /projectExtras\?\.map/);
 });
