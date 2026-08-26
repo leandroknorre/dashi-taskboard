@@ -1165,7 +1165,11 @@ test("parent composition metadata defaults, updates atomically, and leaves later
 });
 
 test("task rollup is rebuilt from rollup-enabled parent descendants without moving the parent", async () => {
-  const baseUrl = await startServer();
+  const provider = {
+    attest: async () => ({ actor: { actorId: "rollup-reviewer", kind: "human" } }),
+    authenticate: () => ({ actor: { actorId: "rollup-reviewer", kind: "human" } }),
+  };
+  const baseUrl = await startServer(async () => ({ humanAcceptanceProvider: provider }));
   const app = runningApps.at(-1).app;
   const createIssue = async (title, extra = {}) => {
     const result = await request(baseUrl, "/api/tasks", {
@@ -1203,26 +1207,23 @@ test("task rollup is rebuilt from rollup-enabled parent descendants without movi
   const unrelatedBefore = (await request(baseUrl, `/api/tasks/${unrelated.id}/rollup`)).body.rollup;
 
   const updatedBlocker = await latest(blocker.id);
-  const completion = new TransitionService(app.database)
+  const completion = new TransitionService(app.database, { humanAcceptanceProvider: provider })
     .listActions(blocker.id)
     .find((action) => action.toTerminalKind === "completed");
   assert.ok(completion);
+  const acceptance = await request(baseUrl, `/api/tasks/${blocker.id}/evidence`, {
+    method: "POST",
+    headers: { "idempotency-key": "rollup-complete-blocker-evidence" },
+    body: { expectedStateVersion: updatedBlocker.version, actionKey: completion.actionKey },
+  });
+  assert.equal(acceptance.response.status, 201, JSON.stringify(acceptance.body));
   assert.equal((await request(baseUrl, `/api/tasks/${blocker.id}/transitions`, {
     method: "POST",
     headers: { "idempotency-key": "rollup-complete-blocker" },
     body: {
       expectedStateVersion: updatedBlocker.version,
       actionKey: completion.actionKey,
-      gateEvidence: [{
-        evidenceId: randomUUID(),
-        gateId: "human-acceptance",
-        type: "human_acceptance",
-        capturedAt: "2026-08-25T00:00:00.000Z",
-        actor: { actorId: "rollup-reviewer", kind: "human" },
-        status: "valid",
-        record: { evidenceEventId: randomUUID(), eventHash: "a".repeat(64) },
-        revocation: null,
-      }],
+      gateEvidence: [acceptance.body.evidence],
     },
   })).response.status, 200);
   const recalculated = await request(baseUrl, `/api/tasks/${root.id}/rollup`);

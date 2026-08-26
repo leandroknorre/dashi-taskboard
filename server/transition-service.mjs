@@ -16,8 +16,8 @@ import {
 } from "../shared/transition-service.mjs";
 import { automationRunFromRow, createAutomationRunForTransition } from "./automation-run-service.mjs";
 import { ApiError } from "./database.mjs";
+import { authenticateHumanAcceptance } from "./human-acceptance-provider.mjs";
 import { WorkflowLedger } from "./workflow-ledger.mjs";
-import { migrateLocalWorkflowTransitions } from "./workflow-transition-schema.mjs";
 
 function now() {
   return new Date().toISOString();
@@ -164,15 +164,15 @@ function requestMatchesEvent(row, event) {
  * event, and outbox commit or roll back together without nested BEGIN calls.
  */
 export class TransitionService {
-  constructor(taskboardDatabase, { clock = now } = {}) {
+  constructor(taskboardDatabase, { clock = now, humanAcceptanceProvider = null } = {}) {
     this.taskboardDatabase = taskboardDatabase;
     this.database = taskboardDatabase.database;
     this.ledger = new WorkflowLedger(this.database, { now: clock });
     this.clock = clock;
+    this.humanAcceptanceProvider = humanAcceptanceProvider;
   }
 
   listActions(taskId) {
-    this.#ensureDefinitions();
     const context = this.#taskContext(taskId);
     return this.database.prepare(`
       SELECT * FROM workflow_transition_rules
@@ -182,7 +182,6 @@ export class TransitionService {
   }
 
   getTaskWorkflow(taskId) {
-    this.#ensureDefinitions();
     const context = this.#taskContext(taskId);
     return {
       workflowId: context.pin.workflow_id,
@@ -194,11 +193,11 @@ export class TransitionService {
 
   transition(taskId, input, {
     actor,
+    request: httpRequest = undefined,
     sortOrder = undefined,
     threadId = undefined,
     threadBinding = undefined,
   } = {}) {
-    this.#ensureDefinitions();
     let command;
     try {
       command = normalizeTransitionCommand(input);
@@ -250,6 +249,7 @@ export class TransitionService {
             taskId,
             command,
             actor,
+            httpRequest,
             sortOrder,
             threadInput,
             event,
@@ -298,11 +298,11 @@ export class TransitionService {
     stageId,
     idempotencyKey,
     actor,
+    request: httpRequest = undefined,
     sortOrder = undefined,
     threadId = undefined,
     threadBinding = undefined,
   }) {
-    this.#ensureDefinitions();
     const context = this.#taskContext(taskId);
     const target = stageId
       ? this.database.prepare(`
@@ -337,7 +337,7 @@ export class TransitionService {
       gateEvidence: [],
       authorizationId: null,
       idempotencyKey,
-    }, { actor, sortOrder, threadId, threadBinding });
+    }, { actor, request: httpRequest, sortOrder, threadId, threadBinding });
   }
 
   storeAuthorization(value) {
@@ -444,10 +444,6 @@ export class TransitionService {
     }
   }
 
-  #ensureDefinitions() {
-    migrateLocalWorkflowTransitions(this.database);
-  }
-
   #taskContext(taskId) {
     const task = this.database.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId);
     if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
@@ -496,7 +492,7 @@ export class TransitionService {
     };
   }
 
-  #applyInsideLedger({ taskId, command, actor, sortOrder, threadInput, event, previousProjection }) {
+  #applyInsideLedger({ taskId, command, actor, httpRequest, sortOrder, threadInput, event, previousProjection }) {
     const context = this.#taskContext(taskId);
     const ruleRow = this.database.prepare(`
       SELECT * FROM workflow_transition_rules WHERE revision_id = ? AND action_key = ?
@@ -536,12 +532,15 @@ export class TransitionService {
       status: row.status,
     }));
     let allowed;
+    let persistedEvidence;
+    let acceptanceActor = null;
     try {
+      ({ evidence: persistedEvidence, actor: acceptanceActor } = this.#resolveAcceptanceEvidence(context, rule, command, httpRequest));
       allowed = evaluatePinnedTransition({
         revision: context.definition,
         rule,
         task: { id: context.task.id, stageId: context.task.stage_id, version: context.task.version, archivedAt: context.task.archived_at },
-        command: { ...command, occurredAt: event.occurredAt },
+        command: { ...command, gateEvidence: [...command.gateEvidence.filter((item) => item?.type !== "human_acceptance"), ...persistedEvidence], occurredAt: event.occurredAt },
         authorization,
         descendants,
       });
@@ -571,6 +570,11 @@ export class TransitionService {
       rule.actionKey, context.pin.workflow_id, context.pin.revision_id, rule.transitionId,
       rule.fromTaskStageId, rule.toTaskStageId, event.eventId, event.eventHash, timestamp,
     );
+    const requestId = this.database.prepare("SELECT request_id FROM workflow_transition_requests WHERE idempotency_key = ?").get(command.idempotencyKey).request_id;
+    for (const evidence of persistedEvidence) {
+      this.database.prepare("INSERT INTO workflow_transition_evidence_consumptions (request_id, evidence_id, consumed_at) VALUES (?, ?, ?)")
+        .run(requestId, evidence.evidenceId, timestamp);
+    }
     const threadStorage = resolveThreadStorage(context.task, threadInput);
     const threadAssignments = threadStorage
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
@@ -592,8 +596,10 @@ export class TransitionService {
         id, task_id, actor_type, actor_id, actor_name, actor_avatar_url, changes, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      randomUUID(), taskId, actor?.type ?? "user", actor?.id ?? "local-user",
-      actor?.name ?? "Local user", actor?.avatarUrl ?? null,
+      randomUUID(), taskId, acceptanceActor ? "user" : (actor?.type ?? "user"),
+      acceptanceActor?.actorId ?? actor?.id ?? "local-user",
+      acceptanceActor ? "Trusted human acceptance operator" : (actor?.name ?? "Local user"),
+      acceptanceActor ? null : (actor?.avatarUrl ?? null),
       JSON.stringify([
         { field: "status", before: context.task.status, after: destination.canonical_status },
         { field: "stageId", before: context.task.stage_id, after: destination.task_stage_id },
@@ -637,5 +643,35 @@ export class TransitionService {
       previousProjection,
       automationRun,
     };
+  }
+
+  #resolveAcceptanceEvidence(context, rule, command, httpRequest) {
+    const transition = context.definition.transitions.find((item) => item.transitionId === rule.transitionId);
+    const resolved = [];
+    let acceptanceActor = null;
+    for (const gateId of transition?.gateIds ?? []) {
+      const gate = context.definition.gates.find((item) => item.gateId === gateId);
+      if (gate?.kind !== "acceptance") continue;
+      const authenticated = authenticateHumanAcceptance(this.humanAcceptanceProvider, {
+        request: httpRequest, taskId: context.task.id, expectedStateVersion: command.expectedStateVersion,
+        actionKey: rule.actionKey, gateId, workflowId: context.pin.workflow_id,
+        revisionId: context.pin.revision_id, transitionId: rule.transitionId,
+      });
+      if (acceptanceActor && acceptanceActor.actorId !== authenticated.actorId) {
+        throw new ApiError(403, "HUMAN_ACTOR_REQUIRED", "Human acceptance authentication changed between gates");
+      }
+      acceptanceActor = authenticated;
+      const candidates = command.gateEvidence.filter((item) => item?.gateId === gateId && item?.type === "human_acceptance");
+      if (candidates.length !== 1) continue;
+      const candidate = candidates[0];
+      const row = this.database.prepare(`SELECT evidence.* FROM workflow_human_evidence AS evidence LEFT JOIN workflow_transition_evidence_consumptions AS consumed ON consumed.evidence_id = evidence.evidence_id WHERE evidence.evidence_id = ? AND evidence.status = 'valid' AND evidence.task_id = ? AND evidence.task_version = ? AND evidence.workflow_id = ? AND evidence.revision_id = ? AND evidence.transition_id = ? AND evidence.action_key = ? AND evidence.gate_id = ? AND consumed.evidence_id IS NULL`).get(candidate.evidenceId, context.task.id, command.expectedStateVersion, context.pin.workflow_id, context.pin.revision_id, rule.transitionId, rule.actionKey, gateId);
+      // A receipt can only be consumed by the exact human identity that the
+      // provider attested when it was minted. The client-supplied evidence
+      // payload is never sufficient on its own.
+      if (!row || acceptanceActor.actorId !== row.actor_key) continue;
+      const evidence = { evidenceId: row.evidence_id, gateId: row.gate_id, type: row.evidence_type, capturedAt: row.captured_at, actor: { actorId: row.actor_key, kind: "human" }, status: row.status, record: { evidenceEventId: row.evidence_event_id, eventHash: row.evidence_hash }, revocation: null };
+      if (canonicalJson(candidate) === canonicalJson(evidence)) resolved.push(evidence);
+    }
+    return { evidence: resolved, actor: acceptanceActor };
   }
 }

@@ -348,7 +348,7 @@ export class WorkflowLedger {
     this.now = now;
   }
 
-  append(input, { project = defaultProjection } = {}) {
+  append(input, { project = defaultProjection, afterAppend = null } = {}) {
     if (!input || typeof input !== "object" || Array.isArray(input)) {
       throw new WorkflowContractError(WORKFLOW_ERROR_CODES.INVALID_CONTRACT, "Ledger append requires an event object");
     }
@@ -421,6 +421,7 @@ export class WorkflowLedger {
         event.idempotencyKey, ledgerEventIntent(event), event.prevHash, event.eventHash,
         canonicalJson(event), event.occurredAt, timestamp,
       );
+      if (afterAppend) afterAppend(event);
       this.database.prepare(`
         INSERT INTO workflow_aggregate_projections (
           aggregate_type, aggregate_id, workflow_id, revision_id, last_sequence,

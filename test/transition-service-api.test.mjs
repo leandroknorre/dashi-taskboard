@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -19,9 +18,16 @@ afterEach(async () => {
   }
 });
 
-async function start() {
+function trustedProvider(actorId = "api-transition-tester") {
+  return {
+    attest: async () => ({ actor: { actorId, kind: "human" } }),
+    authenticate: () => ({ actor: { actorId, kind: "human" } }),
+  };
+}
+
+async function start({ humanAcceptanceProvider = trustedProvider(), ...options } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-transition-api-"));
-  const app = createTaskboardServer({ dataDirectory: directory });
+  const app = createTaskboardServer({ dataDirectory: directory, humanAcceptanceProvider, ...options });
   app.database.createProject({ id: "transition-api", name: "Transition API", workspacePath: "/tmp/transition-api" });
   const address = await app.listen({ host: "127.0.0.1", port: 0 });
   running.push({ app, directory });
@@ -71,19 +77,6 @@ function destinationStatus(app, revisionId, action) {
     SELECT canonical_status FROM workflow_revision_stage_bindings
     WHERE revision_id = ? AND task_stage_id = ?
   `).get(revisionId, action.toTaskStageId).canonical_status;
-}
-
-function validAcceptance() {
-  return [{
-    evidenceId: randomUUID(),
-    gateId: "human-acceptance",
-    type: "human_acceptance",
-    capturedAt: "2026-08-25T00:00:00.000Z",
-    actor: { actorId: "api-reviewer", kind: "human" },
-    status: "valid",
-    record: { evidenceEventId: randomUUID(), eventHash: "a".repeat(64) },
-    revocation: null,
-  }];
 }
 
 test("POST transition requires Idempotency-Key and a retry returns the original local transition", async () => {
@@ -238,6 +231,12 @@ test("a real API parent completion stays blocked while a required descendant is 
   );
   const transitions = new TransitionService(app.database);
   const completion = actionTo(transitions, parent.id, "completed");
+  const minted = await request(baseUrl, `/api/tasks/${parent.id}/evidence`, {
+    method: "POST",
+    headers: { "idempotency-key": "api-required-parent-evidence" },
+    body: { expectedStateVersion: parent.version, actionKey: completion.actionKey },
+  });
+  assert.equal(minted.response.status, 201, JSON.stringify(minted.body));
 
   const blocked = await request(baseUrl, `/api/tasks/${parent.id}/transitions`, {
     method: "POST",
@@ -245,7 +244,7 @@ test("a real API parent completion stays blocked while a required descendant is 
     body: {
       expectedStateVersion: parent.version,
       actionKey: completion.actionKey,
-      gateEvidence: validAcceptance(),
+      gateEvidence: [minted.body.evidence],
     },
   });
 
@@ -253,5 +252,42 @@ test("a real API parent completion stays blocked while a required descendant is 
   assert.equal(blocked.body.error.code, "REQUIRED_DESCENDANT_INCOMPLETE");
   assert.equal(app.database.getTask(parent.id).status, parent.status);
   assert.equal(app.database.getTask(child.id).status, child.status);
-  assert.equal(app.database.database.prepare("SELECT COUNT(*) AS count FROM workflow_ledger_events").get().count, 0);
+  assert.equal(app.database.database.prepare("SELECT COUNT(*) AS count FROM workflow_transition_requests").get().count, 0);
+});
+
+test("HTTP transition consumption binds provider-attested evidence to the same human actor", async () => {
+  const { app, baseUrl } = await start({
+    humanAcceptanceProvider: {
+      attest: async () => ({ actor: { actorId: "alpha", kind: "human" } }),
+      // Simulates the upstream-authenticated identity. It deliberately does
+      // not trust the Taskboard user headers supplied by the browser.
+      authenticate: () => ({ actor: { actorId: "beta", kind: "human" } }),
+    },
+  });
+  const task = createTask(app, "HTTP actor binding");
+  const transitions = new TransitionService(app.database);
+  const completion = actionTo(transitions, task.id, "completed");
+
+  const discovery = await request(baseUrl, `/api/tasks/${task.id}/transitions`);
+  assert.equal(discovery.response.status, 200);
+  assert.ok(discovery.body.actions.some((item) => item.actionKey === completion.actionKey));
+  assert.equal(app.database.getTask(task.id).version, task.version);
+
+  const minted = await request(baseUrl, `/api/tasks/${task.id}/evidence`, {
+    method: "POST",
+    headers: { "idempotency-key": "http-alpha-evidence", "x-taskboard-user-id": "alpha", "x-taskboard-user-name": "Alpha" },
+    body: { expectedStateVersion: task.version, actionKey: completion.actionKey },
+  });
+  assert.equal(minted.response.status, 201, JSON.stringify(minted.body));
+
+  const forgedHeader = await request(baseUrl, `/api/tasks/${task.id}/transitions`, {
+    method: "POST",
+    headers: { "idempotency-key": "http-forged-alpha-consume", "x-taskboard-user-id": "alpha", "x-taskboard-user-name": "Arbitrary%20Name" },
+    body: { expectedStateVersion: task.version, actionKey: completion.actionKey, gateEvidence: [minted.body.evidence] },
+  });
+  assert.equal(forgedHeader.response.status, 409);
+  assert.equal(forgedHeader.body.error.code, "ACCEPTANCE_EVIDENCE_REQUIRED");
+  assert.equal(app.database.getTask(task.id).version, task.version);
+  assert.equal(app.database.database.prepare("SELECT count(*) AS count FROM workflow_transition_requests WHERE task_id = ?").get(task.id).count, 0);
+  assert.equal(app.database.database.prepare("SELECT count(*) AS count FROM workflow_transition_evidence_consumptions WHERE evidence_id = ?").get(minted.body.evidence.evidenceId).count, 0);
 });

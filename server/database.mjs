@@ -20,6 +20,7 @@ import {
 import { migrateLocalWorkflowLedger } from "./workflow-ledger.mjs";
 import { migrateLocalAutomationRuns } from "./workflow-automation-run-schema.mjs";
 import { migrateLocalWorkflowTransitions } from "./workflow-transition-schema.mjs";
+import { migrateLocalHumanAcceptance } from "./human-acceptance-schema.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
 const TASK_TREE_MAX_NODES = 1_000;
@@ -1039,6 +1040,7 @@ export class TaskboardDatabase {
     this.#migrateStageWorkflows();
     migrateLocalWorkflowLedger(this.database);
     migrateLocalWorkflowTransitions(this.database);
+    migrateLocalHumanAcceptance(this.database);
     migrateLocalAutomationRuns(this.database);
   }
 
@@ -1183,6 +1185,10 @@ export class TaskboardDatabase {
       }
       throw error;
     }
+    // A project write establishes its immutable workflow before any task can
+    // be created. Read-only transition discovery must never perform this work.
+    this.#ensureStageWorkflow(input.id, timestamp);
+    migrateLocalWorkflowTransitions(this.database);
     return this.getProject(input.id);
   }
 

@@ -37,6 +37,7 @@ import { createJiraConfigStore } from "./jira-config.mjs";
 import { createJiraIntegration } from "./jira-integration.mjs";
 import { ProjectSummaryService } from "./project-summary.mjs";
 import { TransitionService } from "./transition-service.mjs";
+import { HumanAcceptanceService } from "./human-acceptance-service.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const execFileAsync = promisify(execFile);
@@ -741,6 +742,23 @@ function parseTaskTransition(body, idempotencyHeader) {
     authorizationId: body.authorizationId === undefined
       ? null
       : stringField(body.authorizationId, "authorizationId", { nullable: true, maxLength: 96 }),
+    idempotencyKey: stringField(idempotencyHeader, "Idempotency-Key", { required: true, maxLength: 64 }),
+  };
+}
+
+function parseHumanAcceptanceEvidence(body, idempotencyHeader) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["expectedStateVersion", "actionKey", "gateId"]));
+  if (idempotencyHeader === undefined) {
+    throw new ApiError(400, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key header is required");
+  }
+  if (!Number.isSafeInteger(body.expectedStateVersion) || body.expectedStateVersion < 1) {
+    throw new ApiError(400, "INVALID_FIELD", "'expectedStateVersion' must be a positive integer");
+  }
+  return {
+    expectedStateVersion: body.expectedStateVersion,
+    actionKey: stringField(body.actionKey, "actionKey", { required: true, maxLength: 64 }),
+    gateId: body.gateId === undefined ? null : stringField(body.gateId, "gateId", { required: true, maxLength: 64 }),
     idempotencyKey: stringField(idempotencyHeader, "Idempotency-Key", { required: true, maxLength: 64 }),
   };
 }
@@ -1763,7 +1781,11 @@ export function createTaskboardServer(options = {}) {
   );
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath);
-  const transitions = new TransitionService(database);
+  const humanAcceptanceProvider = options.humanAcceptanceProvider ?? null;
+  const transitions = new TransitionService(database, { humanAcceptanceProvider });
+  const humanAcceptance = new HumanAcceptanceService(database, {
+    provider: humanAcceptanceProvider,
+  });
   const automationRuns = new AutomationRunService(database);
   const events = new EventHub();
   let clientStorageWrite = Promise.resolve();
@@ -3243,7 +3265,16 @@ export function createTaskboardServer(options = {}) {
         if ([...url.searchParams.keys()].length > 0) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Transition routes do not accept query parameters");
         }
-        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        if (request.method === "GET") {
+          return sendJson(response, 200, {
+            actions: transitions.listActions(id).map((action) => ({
+              actionKey: action.actionKey,
+              transitionId: action.transitionId,
+              toTerminalKind: action.toTerminalKind,
+            })),
+          });
+        }
+        if (request.method !== "POST") return methodNotAllowed(response, ["GET", "POST"]);
         const current = database.getTask(id);
         if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
         if (current.source === "jira") {
@@ -3253,7 +3284,7 @@ export function createTaskboardServer(options = {}) {
           await readJson(request),
           requestHeader(request, "idempotency-key"),
         );
-        const result = transitions.transition(id, command, { actor: actorFromRequest(request) });
+        const result = transitions.transition(id, command, { actor: actorFromRequest(request), request });
         events.emit("task.transitioned", { task: result.task, transition: result.request });
         return sendJson(response, 200, {
           task: result.task,
@@ -3262,6 +3293,21 @@ export function createTaskboardServer(options = {}) {
           automationRun: result.automationRun,
           idempotent: result.idempotent,
         });
+      }
+
+      const taskEvidenceRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/evidence$/);
+      if (taskEvidenceRoute) {
+        let id;
+        try {
+          id = decodeURIComponent(taskEvidenceRoute[1]);
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Task id contains invalid encoding");
+        }
+        if (id.length === 0 || id.length > 128) throw new ApiError(400, "INVALID_PATH", "Task id is invalid");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const command = parseHumanAcceptanceEvidence(await readJson(request), requestHeader(request, "idempotency-key"));
+        const result = await humanAcceptance.register(id, command, request);
+        return sendJson(response, 201, result);
       }
 
       const automationRunRoute = pathname.match(/^\/api\/automation-runs\/([^/]+)(?:\/(dispatch|result))?$/);
@@ -3372,6 +3418,7 @@ export function createTaskboardServer(options = {}) {
                 stageId: changes.stageId,
               }),
               actor,
+              request,
             });
             events.emit("task.transitioned", { task: result.task, transition: result.request });
             return sendJson(response, 200, {
@@ -3480,6 +3527,7 @@ export function createTaskboardServer(options = {}) {
                   sortOrder: move.sortOrder,
                 }),
                 actor,
+                request,
                 threadId: move.threadId,
                 threadBinding: move.threadBinding,
               });

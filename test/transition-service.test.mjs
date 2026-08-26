@@ -6,15 +6,19 @@ import path from "node:path";
 import { afterEach, test } from "node:test";
 
 import { TaskboardDatabase } from "../server/database.mjs";
+import { HumanAcceptanceService } from "../server/human-acceptance-service.mjs";
 import { TransitionService } from "../server/transition-service.mjs";
 import {
-  acceptanceEvidence,
   humanAuthorization,
   revocation,
 } from "./fixtures/workflow-control.mjs";
 
 const fixtures = [];
 const actor = { type: "user", id: "transition-tester", name: "Transition Tester", avatarUrl: null };
+const humanAcceptanceProvider = {
+  attest: async () => ({ actor: { actorId: actor.id, kind: "human" } }),
+  authenticate: () => ({ actor: { actorId: actor.id, kind: "human" } }),
+};
 
 afterEach(async () => {
   while (fixtures.length > 0) {
@@ -34,7 +38,8 @@ async function createFixture() {
     directory,
     filename,
     database,
-    service: new TransitionService(database),
+    service: new TransitionService(database, { humanAcceptanceProvider }),
+    acceptance: new HumanAcceptanceService(database, { provider: humanAcceptanceProvider }),
     extraDatabases: [],
   };
   fixtures.push(fixture);
@@ -78,11 +83,13 @@ function cancellationAction(service, taskId) {
   return action;
 }
 
-function validAcceptance() {
-  return acceptanceEvidence({
-    evidenceId: randomUUID(),
-    record: { evidenceEventId: randomUUID(), eventHash: "a".repeat(64) },
-  });
+async function validAcceptance(fixture, task, action, idempotencyKey) {
+  return (await fixture.acceptance.register(task.id, {
+    expectedStateVersion: task.version,
+    actionKey: action.actionKey,
+    gateId: null,
+    idempotencyKey,
+  }, {})).evidence;
 }
 
 function command(task, action, idempotencyKey, overrides = {}) {
@@ -130,7 +137,7 @@ test("a transition appends ledger, projection, outbox, and returns the same effe
   assert.throws(
     () => fixture.service.transition(task.id, {
       ...input,
-      gateEvidence: [validAcceptance()],
+      authorizationId: "different-request-intent",
     }, { actor }),
     (error) => error?.status === 409 && error?.code === "IDEMPOTENCY_CONFLICT",
   );
@@ -142,7 +149,7 @@ test("two service connections serialize the CAS: one state write wins and the st
   const firstAction = nonTerminalAction(fixture.service, task.id);
   const secondDatabase = new TaskboardDatabase(fixture.filename);
   fixture.extraDatabases.push(secondDatabase);
-  const secondService = new TransitionService(secondDatabase);
+  const secondService = new TransitionService(secondDatabase, { humanAcceptanceProvider });
   const secondAction = nonTerminalAction(secondService, task.id);
 
   const results = await Promise.allSettled([
@@ -179,36 +186,46 @@ test("completion needs valid human acceptance and every required descendant, but
     undefined, undefined, actor, "manual", { required: false, rollup: true },
   );
   const parentCompletion = completionAction(fixture.service, parent.id);
+  const beforeRequiredEvidence = await validAcceptance(
+    fixture, parent, parentCompletion, "parent-before-required-evidence",
+  );
 
   assert.throws(
     () => fixture.service.transition(parent.id, command(
       parent,
       parentCompletion,
       "parent-before-required",
-      { gateEvidence: [validAcceptance()] },
+      { gateEvidence: [beforeRequiredEvidence] },
     ), { actor }),
     (error) => error?.status === 409 && error?.code === "REQUIRED_DESCENDANT_INCOMPLETE",
   );
-  assert.deepEqual(workflowCounts(fixture.database), { events: 0, outbox: 0, requests: 0 });
+  assert.deepEqual(workflowCounts(fixture.database), { events: 1, outbox: 1, requests: 0 });
 
   const refreshedRequiredChild = fixture.database.getTask(requiredChild.id);
   const childCompletion = completionAction(fixture.service, refreshedRequiredChild.id);
+  const childEvidence = await validAcceptance(
+    fixture, refreshedRequiredChild, childCompletion, "required-child-evidence",
+  );
   fixture.service.transition(refreshedRequiredChild.id, command(
     refreshedRequiredChild,
     childCompletion,
     "required-child-complete",
-    { gateEvidence: [validAcceptance()] },
+    { gateEvidence: [childEvidence] },
   ), { actor });
 
+  const refreshedParent = fixture.database.getTask(parent.id);
+  const parentEvidence = await validAcceptance(
+    fixture, refreshedParent, parentCompletion, "parent-after-required-evidence",
+  );
   const completedParent = fixture.service.transition(parent.id, command(
-    fixture.database.getTask(parent.id),
+    refreshedParent,
     parentCompletion,
     "parent-after-required",
-    { gateEvidence: [validAcceptance()] },
+    { gateEvidence: [parentEvidence] },
   ), { actor });
   assert.equal(completedParent.task.status, "done");
   assert.equal(fixture.database.getTask(optionalChild.id).status, "todo");
-  assert.equal(workflowCounts(fixture.database).events, 2);
+  assert.equal(workflowCounts(fixture.database).events, 5);
 });
 
 test("revoked and narrowly mismatched authorization records cannot cancel a pinned task", async () => {
@@ -405,7 +422,8 @@ test("opening a legacy task database twice creates one revision-one snapshot and
   fixture.database.close();
   const reopened = new TaskboardDatabase(fixture.filename);
   fixture.database = reopened;
-  fixture.service = new TransitionService(reopened);
+  fixture.service = new TransitionService(reopened, { humanAcceptanceProvider });
+  fixture.acceptance = new HumanAcceptanceService(reopened, { provider: humanAcceptanceProvider });
 
   const first = reopened.database.prepare(`
     SELECT definitions.workflow_id, definitions.current_revision_id, revisions.revision
@@ -432,7 +450,8 @@ test("opening a legacy task database twice creates one revision-one snapshot and
   reopened.close();
   const second = new TaskboardDatabase(fixture.filename);
   fixture.database = second;
-  fixture.service = new TransitionService(second);
+  fixture.service = new TransitionService(second, { humanAcceptanceProvider });
+  fixture.acceptance = new HumanAcceptanceService(second, { provider: humanAcceptanceProvider });
   assert.equal(second.database.prepare(`
     SELECT COUNT(*) AS count FROM workflow_definitions WHERE project_id = 'transition-project'
   `).get().count, 1);
