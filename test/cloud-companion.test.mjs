@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -89,10 +89,17 @@ function memoryConfigStore(overrides = {}) {
   };
 }
 
-function firstLanAddress() {
+function firstTrustedLanAddress() {
   return Object.values(os.networkInterfaces())
     .flat()
-    .find((entry) => entry?.family === "IPv4" && !entry.internal)?.address ?? null;
+    .find((entry) => {
+      if (entry?.family !== "IPv4" || entry.internal) return false;
+      const [first, second] = entry.address.split(".").map(Number);
+      return first === 10
+        || (first === 172 && second >= 16 && second <= 31)
+        || (first === 192 && second === 168)
+        || (first === 169 && second === 254);
+    })?.address ?? null;
 }
 
 test("cloud config persists Basic Auth credentials and device mappings in a mode-0600 file", async () => {
@@ -1030,9 +1037,9 @@ test("configured server proxies business APIs without touching local rows and ad
 });
 
 test("cloud mode exposes machine capabilities only to loopback while local mode keeps LAN access", async (t) => {
-  const lanAddress = firstLanAddress();
+  const lanAddress = firstTrustedLanAddress();
   if (!lanAddress) {
-    t.skip("No non-loopback IPv4 interface is available");
+    t.skip("No private or link-local non-loopback IPv4 interface is available");
     return;
   }
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-cloud-lan-"));
@@ -1084,6 +1091,47 @@ test("cloud mode exposes machine capabilities only to loopback while local mode 
     assert.equal(localResponse.status, 200);
     const localProjects = await fetch(`${lanBaseUrl}/api/projects`);
     assert.equal(localProjects.status, 200);
+  } finally {
+    await app.close();
+  }
+});
+
+test("cloud mode rejects a synthetic public Host before proxying upstream", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-cloud-public-host-"));
+  temporaryDirectories.push(directory);
+  const configPath = path.join(directory, "companion.json");
+  const { createCloudConfigStore } = await importCloudConfig();
+  const store = createCloudConfigStore({ configPath });
+  await store.configure({
+    remoteUrl: "https://tasks.example.test",
+    actorName: "Alice",
+    sharedKey: "two-person-shared-key",
+  });
+  let upstreamCalls = 0;
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    cloudConfigPath: configPath,
+    remoteFetch: async () => {
+      upstreamCalls += 1;
+      return jsonResponse({ projects: [] });
+    },
+  });
+  const address = await app.listen({ port: 0 });
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  try {
+    const response = await new Promise((resolve, reject) => {
+      const request = httpRequest(`${baseUrl}/api/projects`, {
+        headers: { host: "203.0.113.42" },
+      }, resolve);
+      request.once("error", reject);
+      request.end();
+    });
+    assert.equal(response.statusCode, 403);
+    let body = "";
+    for await (const chunk of response) body += chunk;
+    assert.equal(JSON.parse(body).error.code, "INVALID_HOST");
+    assert.equal(upstreamCalls, 0);
   } finally {
     await app.close();
   }
