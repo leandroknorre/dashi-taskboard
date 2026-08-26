@@ -191,6 +191,42 @@ export class TransitionService {
     };
   }
 
+  /** Read-only route guard used before an async authentication boundary. */
+  requiresHumanAcceptanceAction(taskId, actionKey) {
+    const context = this.#taskContext(taskId);
+    const rule = this.database.prepare(`
+      SELECT * FROM workflow_transition_rules
+      WHERE revision_id = ? AND from_task_stage_id = ? AND action_key = ?
+    `).get(context.pin.revision_id, context.task.stage_id, actionKey);
+    return Boolean(rule && this.#ruleRequiresHumanAcceptance(context, ruleFromRow(rule)));
+  }
+
+  /** Read-only equivalent for legacy PATCH and /move destinations. */
+  getLegacyAction(taskId, { status, stageId }) {
+    const context = this.#taskContext(taskId);
+    const target = stageId
+      ? this.database.prepare(`SELECT * FROM workflow_revision_stage_bindings WHERE revision_id = ? AND task_stage_id = ?`).get(context.pin.revision_id, stageId)
+      : this.database.prepare(`
+        SELECT bindings.* FROM workflow_revision_stage_bindings AS bindings
+        JOIN workflow_stages AS stages ON stages.id = bindings.task_stage_id
+        WHERE bindings.revision_id = ? AND bindings.canonical_status = ?
+          AND stages.active = 1 AND stages.is_default_for_status = 1
+      `).get(context.pin.revision_id, status);
+    if (!target || (status !== undefined && target.canonical_status !== status)) return null;
+    const rule = this.database.prepare(`
+      SELECT * FROM workflow_transition_rules
+      WHERE revision_id = ? AND from_task_stage_id = ? AND to_task_stage_id = ? AND legacy = 1
+    `).get(context.pin.revision_id, context.task.stage_id, target.task_stage_id);
+    return rule ? ruleFromRow(rule) : null;
+  }
+
+  requiresHumanAcceptanceLegacy(taskId, destination) {
+    const rule = this.getLegacyAction(taskId, destination);
+    if (!rule) return false;
+    const context = this.#taskContext(taskId);
+    return this.#ruleRequiresHumanAcceptance(context, rule);
+  }
+
   transition(taskId, input, {
     actor,
     request: httpRequest = undefined,
@@ -673,5 +709,12 @@ export class TransitionService {
       if (canonicalJson(candidate) === canonicalJson(evidence)) resolved.push(evidence);
     }
     return { evidence: resolved, actor: acceptanceActor };
+  }
+
+  #ruleRequiresHumanAcceptance(context, rule) {
+    const transition = context.definition.transitions.find((item) => item.transitionId === rule.transitionId);
+    return (transition?.gateIds ?? []).some((gateId) => (
+      context.definition.gates.find((item) => item.gateId === gateId)?.kind === "acceptance"
+    ));
   }
 }

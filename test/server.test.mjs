@@ -1169,7 +1169,10 @@ test("task rollup is rebuilt from rollup-enabled parent descendants without movi
     attest: async () => ({ actor: { actorId: "rollup-reviewer", kind: "human" } }),
     authenticate: () => ({ actor: { actorId: "rollup-reviewer", kind: "human" } }),
   };
-  const baseUrl = await startServer(async () => ({ humanAcceptanceProvider: provider }));
+  const baseUrl = await startServer(async () => ({
+    humanAcceptanceProvider: provider,
+    preauthenticateHumanAcceptanceRequest: async () => {},
+  }));
   const app = runningApps.at(-1).app;
   const createIssue = async (title, extra = {}) => {
     const result = await request(baseUrl, "/api/tasks", {

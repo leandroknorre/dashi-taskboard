@@ -1782,6 +1782,7 @@ export function createTaskboardServer(options = {}) {
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath);
   const humanAcceptanceProvider = options.humanAcceptanceProvider ?? null;
+  const preauthenticateHumanAcceptanceRequest = options.preauthenticateHumanAcceptanceRequest ?? null;
   const transitions = new TransitionService(database, { humanAcceptanceProvider });
   const humanAcceptance = new HumanAcceptanceService(database, {
     provider: humanAcceptanceProvider,
@@ -1789,6 +1790,46 @@ export function createTaskboardServer(options = {}) {
   const automationRuns = new AutomationRunService(database);
   const events = new EventHub();
   let clientStorageWrite = Promise.resolve();
+
+  /**
+   * The provider may need asynchronous upstream verification (for example a
+   * signed request boundary), but transition application is deliberately
+   * synchronous inside its SQLite transaction. This hook validates the exact
+   * IncomingMessage first; the provider can then synchronously retrieve its
+   * request-bound identity during evidence minting or consumption.
+   */
+  async function preauthenticateHumanAcceptance(request, scope) {
+    if (
+      !humanAcceptanceProvider
+      || typeof preauthenticateHumanAcceptanceRequest !== "function"
+    ) {
+      throw new ApiError(
+        503,
+        "HUMAN_ACCEPTANCE_UNAVAILABLE",
+        "Human acceptance is not configured for this server",
+      );
+    }
+    try {
+      await preauthenticateHumanAcceptanceRequest(request, Object.freeze({ ...scope }));
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      if (
+        error
+        && Number.isInteger(error.status)
+        && error.status >= 400
+        && error.status <= 599
+        && typeof error.code === "string"
+        && typeof error.message === "string"
+      ) {
+        throw new ApiError(error.status, error.code, error.message);
+      }
+      throw new ApiError(
+        503,
+        "HUMAN_ACCEPTANCE_UNAVAILABLE",
+        "Human acceptance authentication is unavailable",
+      );
+    }
+  }
 
   async function readClientStorage() {
     try {
@@ -3284,6 +3325,18 @@ export function createTaskboardServer(options = {}) {
           await readJson(request),
           requestHeader(request, "idempotency-key"),
         );
+        if (
+          typeof preauthenticateHumanAcceptanceRequest === "function"
+          || transitions.requiresHumanAcceptanceAction(id, command.actionKey)
+        ) {
+          await preauthenticateHumanAcceptance(request, {
+            pathname,
+            operation: "transition",
+            taskId: id,
+            expectedStateVersion: command.expectedStateVersion,
+            actionKey: command.actionKey,
+          });
+        }
         const result = transitions.transition(id, command, { actor: actorFromRequest(request), request });
         events.emit("task.transitioned", { task: result.task, transition: result.request });
         return sendJson(response, 200, {
@@ -3306,6 +3359,14 @@ export function createTaskboardServer(options = {}) {
         if (id.length === 0 || id.length > 128) throw new ApiError(400, "INVALID_PATH", "Task id is invalid");
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         const command = parseHumanAcceptanceEvidence(await readJson(request), requestHeader(request, "idempotency-key"));
+        await preauthenticateHumanAcceptance(request, {
+          pathname,
+          operation: "evidence",
+          taskId: id,
+          expectedStateVersion: command.expectedStateVersion,
+          actionKey: command.actionKey,
+          ...(command.gateId === null ? {} : { gateId: command.gateId }),
+        });
         const result = await humanAcceptance.register(id, command, request);
         return sendJson(response, 201, result);
       }
@@ -3406,6 +3467,28 @@ export function createTaskboardServer(options = {}) {
                 "TRANSITION_REQUIRED",
                 "Legacy status or stage changes must be sent alone so TransitionService can record one atomic transition",
               );
+            }
+            const legacyAction = transitions.getLegacyAction(id, {
+              status: changes.status,
+              stageId: changes.stageId,
+            });
+            if (
+              legacyAction
+              && (
+                typeof preauthenticateHumanAcceptanceRequest === "function"
+                || transitions.requiresHumanAcceptanceLegacy(id, {
+                  status: changes.status,
+                  stageId: changes.stageId,
+                })
+              )
+            ) {
+              await preauthenticateHumanAcceptance(request, {
+                pathname,
+                operation: "legacy-transition",
+                taskId: id,
+                expectedStateVersion: version,
+                actionKey: legacyAction.actionKey,
+              });
             }
             const result = transitions.transitionLegacy(id, {
               expectedStateVersion: version,
@@ -3514,6 +3597,28 @@ export function createTaskboardServer(options = {}) {
               : null;
             const destinationStageId = move.stageId ?? defaultDestination?.stageId;
             if (destinationStageId !== current.stageId) {
+              const legacyAction = transitions.getLegacyAction(id, {
+                status: move.status,
+                stageId: move.stageId,
+              });
+              if (
+                legacyAction
+                && (
+                  typeof preauthenticateHumanAcceptanceRequest === "function"
+                  || transitions.requiresHumanAcceptanceLegacy(id, {
+                    status: move.status,
+                    stageId: move.stageId,
+                  })
+                )
+              ) {
+                await preauthenticateHumanAcceptance(request, {
+                  pathname,
+                  operation: "legacy-transition",
+                  taskId: id,
+                  expectedStateVersion: move.version,
+                  actionKey: legacyAction.actionKey,
+                });
+              }
               const result = transitions.transitionLegacy(id, {
                 expectedStateVersion: move.version,
                 status: move.status,

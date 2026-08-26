@@ -18,16 +18,41 @@ afterEach(async () => {
   }
 });
 
-function trustedProvider(actorId = "api-transition-tester") {
+function trustedBoundary(actorId = "api-transition-tester") {
+  const authenticatedRequests = new WeakMap();
   return {
-    attest: async () => ({ actor: { actorId, kind: "human" } }),
-    authenticate: () => ({ actor: { actorId, kind: "human" } }),
+    preauthenticateHumanAcceptanceRequest: async (request) => {
+      authenticatedRequests.set(request, { actorId, kind: "human" });
+    },
+    humanAcceptanceProvider: {
+      attest: async ({ request }) => {
+        const actor = authenticatedRequests.get(request);
+        if (!actor) throw new Error("trusted request-bound actor is missing");
+        return { actor };
+      },
+      authenticate: ({ request }) => {
+        const actor = authenticatedRequests.get(request);
+        if (!actor) throw new Error("trusted request-bound actor is missing");
+        return { actor };
+      },
+    },
   };
 }
 
-async function start({ humanAcceptanceProvider = trustedProvider(), ...options } = {}) {
+async function start(options = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-transition-api-"));
-  const app = createTaskboardServer({ dataDirectory: directory, humanAcceptanceProvider, ...options });
+  const boundary = trustedBoundary();
+  const {
+    humanAcceptanceProvider = boundary.humanAcceptanceProvider,
+    preauthenticateHumanAcceptanceRequest = boundary.preauthenticateHumanAcceptanceRequest,
+    ...serverOptions
+  } = options;
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    ...serverOptions,
+    humanAcceptanceProvider,
+    preauthenticateHumanAcceptanceRequest,
+  });
   app.database.createProject({ id: "transition-api", name: "Transition API", workspacePath: "/tmp/transition-api" });
   const address = await app.listen({ host: "127.0.0.1", port: 0 });
   running.push({ app, directory });
@@ -256,12 +281,25 @@ test("a real API parent completion stays blocked while a required descendant is 
 });
 
 test("HTTP transition consumption binds provider-attested evidence to the same human actor", async () => {
+  let authenticatedActor = "alpha";
+  const authenticatedRequests = new WeakMap();
   const { app, baseUrl } = await start({
     humanAcceptanceProvider: {
-      attest: async () => ({ actor: { actorId: "alpha", kind: "human" } }),
-      // Simulates the upstream-authenticated identity. It deliberately does
-      // not trust the Taskboard user headers supplied by the browser.
-      authenticate: () => ({ actor: { actorId: "beta", kind: "human" } }),
+      attest: async ({ request }) => {
+        const actor = authenticatedRequests.get(request);
+        if (!actor) throw new Error("trusted request-bound actor is missing");
+        return { actor };
+      },
+      // Simulates an upstream-authenticated identity. It deliberately does
+      // not trust Taskboard user headers supplied by the browser.
+      authenticate: ({ request }) => {
+        const actor = authenticatedRequests.get(request);
+        if (!actor) throw new Error("trusted request-bound actor is missing");
+        return { actor };
+      },
+    },
+    preauthenticateHumanAcceptanceRequest: async (request) => {
+      authenticatedRequests.set(request, { actorId: authenticatedActor, kind: "human" });
     },
   });
   const task = createTask(app, "HTTP actor binding");
@@ -280,6 +318,9 @@ test("HTTP transition consumption binds provider-attested evidence to the same h
   });
   assert.equal(minted.response.status, 201, JSON.stringify(minted.body));
 
+  // The current request is independently authenticated as beta. A forged
+  // alpha header cannot select the identity used to consume evidence.
+  authenticatedActor = "beta";
   const forgedHeader = await request(baseUrl, `/api/tasks/${task.id}/transitions`, {
     method: "POST",
     headers: { "idempotency-key": "http-forged-alpha-consume", "x-taskboard-user-id": "alpha", "x-taskboard-user-name": "Arbitrary%20Name" },
@@ -290,4 +331,152 @@ test("HTTP transition consumption binds provider-attested evidence to the same h
   assert.equal(app.database.getTask(task.id).version, task.version);
   assert.equal(app.database.database.prepare("SELECT count(*) AS count FROM workflow_transition_requests WHERE task_id = ?").get(task.id).count, 0);
   assert.equal(app.database.database.prepare("SELECT count(*) AS count FROM workflow_transition_evidence_consumptions WHERE evidence_id = ?").get(minted.body.evidence.evidenceId).count, 0);
+
+  // Once the provider independently authenticates alpha, a conflicting
+  // browser header beta neither blocks nor becomes the recorded actor.
+  authenticatedActor = "alpha";
+  const trustedConsume = await request(baseUrl, `/api/tasks/${task.id}/transitions`, {
+    method: "POST",
+    headers: { "idempotency-key": "http-trusted-alpha-consume", "x-taskboard-user-id": "beta", "x-taskboard-user-name": "Another%20Arbitrary%20Name" },
+    body: { expectedStateVersion: task.version, actionKey: completion.actionKey, gateEvidence: [minted.body.evidence] },
+  });
+  assert.equal(trustedConsume.response.status, 200, JSON.stringify(trustedConsume.body));
+  assert.equal(trustedConsume.body.task.status, "done");
+  assert.equal(app.database.database.prepare("SELECT actor_id FROM task_activities WHERE task_id = ? AND json_extract(changes, '$[0].field') = 'status' LIMIT 1").get(task.id).actor_id, "alpha");
+});
+
+test("HTTP human acceptance preauthentication receives an immutable route scope", async () => {
+  const calls = [];
+  const boundary = trustedBoundary("scoped-human");
+  const { app, baseUrl } = await start({
+    ...boundary,
+    preauthenticateHumanAcceptanceRequest: async (request, scope) => {
+      calls.push(scope);
+      assert.equal(Object.isFrozen(scope), true);
+      await boundary.preauthenticateHumanAcceptanceRequest(request, scope);
+    },
+  });
+  const task = createTask(app, "Scoped preauthentication");
+  const transitions = new TransitionService(app.database);
+  const completion = actionTo(transitions, task.id, "completed");
+
+  const discovery = await request(baseUrl, `/api/tasks/${task.id}/transitions`);
+  assert.equal(discovery.response.status, 200);
+  assert.equal(calls.length, 0);
+  assert.equal(app.database.getTask(task.id).version, task.version);
+
+  const minted = await request(baseUrl, `/api/tasks/${task.id}/evidence`, {
+    method: "POST",
+    headers: { "idempotency-key": "scoped-human-evidence" },
+    body: { expectedStateVersion: task.version, actionKey: completion.actionKey },
+  });
+  assert.equal(minted.response.status, 201, JSON.stringify(minted.body));
+  assert.deepEqual(calls[0], {
+    pathname: `/api/tasks/${task.id}/evidence`,
+    operation: "evidence",
+    taskId: task.id,
+    expectedStateVersion: task.version,
+    actionKey: completion.actionKey,
+  });
+
+  const consumed = await request(baseUrl, `/api/tasks/${task.id}/transitions`, {
+    method: "POST",
+    headers: { "idempotency-key": "scoped-human-transition" },
+    body: {
+      expectedStateVersion: task.version,
+      actionKey: completion.actionKey,
+      gateEvidence: [minted.body.evidence],
+    },
+  });
+  assert.equal(consumed.response.status, 200, JSON.stringify(consumed.body));
+  assert.deepEqual(calls[1], {
+    pathname: `/api/tasks/${task.id}/transitions`,
+    operation: "transition",
+    taskId: task.id,
+    expectedStateVersion: task.version,
+    actionKey: completion.actionKey,
+  });
+});
+
+test("HTTP human acceptance preauthentication rejection leaves all workflow state untouched", async () => {
+  const calls = [];
+  const rejection = Object.assign(
+    new Error("Independent human authentication was rejected"),
+    { status: 403, code: "HUMAN_AUTH_REJECTED" },
+  );
+  const { app, baseUrl } = await start({
+    preauthenticateHumanAcceptanceRequest: async (_request, scope) => {
+      calls.push(scope);
+      throw rejection;
+    },
+  });
+  const task = createTask(app, "Rejected preauthentication");
+  const transitions = new TransitionService(app.database);
+  const completion = actionTo(transitions, task.id, "completed");
+  const before = {
+    task: app.database.getTask(task.id),
+    evidence: app.database.database.prepare("SELECT count(*) AS count FROM workflow_human_evidence").get().count,
+    consumptions: app.database.database.prepare("SELECT count(*) AS count FROM workflow_transition_evidence_consumptions").get().count,
+    requests: app.database.database.prepare("SELECT count(*) AS count FROM workflow_transition_requests").get().count,
+    ledger: app.database.database.prepare("SELECT count(*) AS count FROM workflow_ledger_events").get().count,
+  };
+
+  const evidence = await request(baseUrl, `/api/tasks/${task.id}/evidence`, {
+    method: "POST",
+    headers: { "idempotency-key": "rejected-preauthentication-evidence" },
+    body: { expectedStateVersion: task.version, actionKey: completion.actionKey },
+  });
+  assert.equal(evidence.response.status, 403, JSON.stringify(evidence.body));
+  assert.equal(evidence.body.error.code, "HUMAN_AUTH_REJECTED");
+
+  const transition = await request(baseUrl, `/api/tasks/${task.id}/transitions`, {
+    method: "POST",
+    headers: { "idempotency-key": "rejected-preauthentication-transition" },
+    body: {
+      expectedStateVersion: task.version,
+      actionKey: completion.actionKey,
+      gateEvidence: [],
+    },
+  });
+  assert.equal(transition.response.status, 403, JSON.stringify(transition.body));
+  assert.equal(transition.body.error.code, "HUMAN_AUTH_REJECTED");
+  assert.deepEqual(calls.map((scope) => scope.operation), ["evidence", "transition"]);
+  assert.deepEqual(app.database.getTask(task.id), before.task);
+  assert.equal(app.database.database.prepare("SELECT count(*) AS count FROM workflow_human_evidence").get().count, before.evidence);
+  assert.equal(app.database.database.prepare("SELECT count(*) AS count FROM workflow_transition_evidence_consumptions").get().count, before.consumptions);
+  assert.equal(app.database.database.prepare("SELECT count(*) AS count FROM workflow_transition_requests").get().count, before.requests);
+  assert.equal(app.database.database.prepare("SELECT count(*) AS count FROM workflow_ledger_events").get().count, before.ledger);
+});
+
+test("HTTP human acceptance fails closed when its provider or preauthentication hook is absent", async () => {
+  const { app, baseUrl } = await start({
+    humanAcceptanceProvider: null,
+    preauthenticateHumanAcceptanceRequest: null,
+  });
+  const task = createTask(app, "Missing human acceptance boundary");
+  const transitions = new TransitionService(app.database);
+  const completion = actionTo(transitions, task.id, "completed");
+
+  const evidence = await request(baseUrl, `/api/tasks/${task.id}/evidence`, {
+    method: "POST",
+    headers: { "idempotency-key": "missing-boundary-evidence" },
+    body: { expectedStateVersion: task.version, actionKey: completion.actionKey },
+  });
+  assert.equal(evidence.response.status, 503, JSON.stringify(evidence.body));
+  assert.equal(evidence.body.error.code, "HUMAN_ACCEPTANCE_UNAVAILABLE");
+
+  const transition = await request(baseUrl, `/api/tasks/${task.id}/transitions`, {
+    method: "POST",
+    headers: { "idempotency-key": "missing-boundary-transition" },
+    body: {
+      expectedStateVersion: task.version,
+      actionKey: completion.actionKey,
+      gateEvidence: [],
+    },
+  });
+  assert.equal(transition.response.status, 503, JSON.stringify(transition.body));
+  assert.equal(transition.body.error.code, "HUMAN_ACCEPTANCE_UNAVAILABLE");
+  assert.equal(app.database.getTask(task.id).version, task.version);
+  assert.equal(app.database.database.prepare("SELECT count(*) AS count FROM workflow_ledger_events").get().count, 0);
+  assert.equal(app.database.database.prepare("SELECT count(*) AS count FROM workflow_transition_requests").get().count, 0);
 });
