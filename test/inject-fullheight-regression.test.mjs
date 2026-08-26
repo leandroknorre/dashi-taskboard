@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHmac } from "node:crypto";
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import http from "node:http";
@@ -8,6 +8,9 @@ import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+
+import { captureStderrTail, waitForChromeDebugPort } from "./helpers/chrome-diagnostics.mjs";
+import { stopChild } from "./helpers/stop-child.mjs";
 
 const execFileAsync = promisify(execFile);
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -26,6 +29,7 @@ const embeddedHostSource = await readFile(
   "utf8",
 );
 const embeddedHostClassicSource = embeddedHostSource.replaceAll("export ", "");
+const cdpTimeoutMs = 12_000;
 
 async function chromeExecutable() {
   const candidates = [
@@ -44,6 +48,97 @@ async function chromeExecutable() {
     } catch (_) {}
   }
   return null;
+}
+
+async function chromeDebugPort(profile, child, stderrCapture, getStartupError) {
+  return waitForChromeDebugPort({
+    child,
+    stderrTail: stderrCapture.read,
+    getStartupError,
+    paths: {
+      profile,
+      tempDirectory: path.dirname(profile),
+      tempRoot: os.tmpdir(),
+      homeDirectory: process.env.HOME,
+    },
+    timeoutMs: cdpTimeoutMs,
+    readPort: async () => {
+      const lines = (await readFile(path.join(profile, "DevToolsActivePort"), "utf8")).trim().split("\n");
+      return Number(lines[0]) || null;
+    },
+  });
+}
+
+async function connectCdp(port) {
+  const response = await fetch(`http://127.0.0.1:${port}/json/list`, {
+    signal: AbortSignal.timeout(cdpTimeoutMs),
+  });
+  assert.ok(response.ok, "Chrome DevTools target list must be available");
+  const target = (await response.json()).find((candidate) => candidate.type === "page");
+  assert.ok(target?.webSocketDebuggerUrl, "Chrome must expose a page DevTools target");
+  const socket = new WebSocket(target.webSocketDebuggerUrl);
+  await new Promise((resolve, reject) => {
+    socket.addEventListener("open", resolve, { once: true });
+    socket.addEventListener("error", reject, { once: true });
+  });
+  let sequence = 0;
+  const pending = new Map();
+  const eventWaiters = new Map();
+  const rejectPending = (error) => {
+    for (const { reject } of pending.values()) reject(error);
+    pending.clear();
+    for (const waiters of eventWaiters.values()) {
+      for (const { reject } of waiters) reject(error);
+    }
+    eventWaiters.clear();
+  };
+  socket.addEventListener("message", ({ data }) => {
+    const message = JSON.parse(data);
+    if (!message.id) {
+      const waiters = eventWaiters.get(message.method);
+      if (!waiters) return;
+      for (const waiter of [...waiters]) {
+        if (!waiter.matches(message.params)) continue;
+        waiters.delete(waiter);
+        waiter.resolve(message.params);
+      }
+      if (waiters.size === 0) eventWaiters.delete(message.method);
+      return;
+    }
+    const request = pending.get(message.id);
+    if (!request) return;
+    pending.delete(message.id);
+    if (message.error) request.reject(new Error(message.error.message));
+    else request.resolve(message.result);
+  });
+  socket.addEventListener("error", () => rejectPending(new Error("Chrome DevTools WebSocket failed")));
+  socket.addEventListener("close", () => rejectPending(new Error("Chrome DevTools WebSocket closed")));
+  const send = (method, params = {}) => new Promise((resolve, reject) => {
+    const id = ++sequence;
+    pending.set(id, { resolve, reject });
+    socket.send(JSON.stringify({ id, method, params }));
+  });
+  return {
+    send,
+    async evaluate(expression) {
+      const result = await send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
+      if (result.exceptionDetails) throw new Error(result.exceptionDetails.text);
+      return result.result.value;
+    },
+    waitForEvent(method, matches = () => true) {
+      return new Promise((resolve, reject) => {
+        const waiters = eventWaiters.get(method) ?? new Set();
+        eventWaiters.set(method, waiters);
+        waiters.add({ resolve, reject, matches });
+      });
+    },
+    async close() {
+      if (socket.readyState === WebSocket.OPEN) {
+        try { await send("Browser.close"); } catch (_) {}
+      }
+      socket.close();
+    },
+  };
 }
 
 function fixtureHtml(origin) {
@@ -131,12 +226,12 @@ function fixtureHtml(origin) {
               + '\\nglobalThis.__CODEX_TASKBOARD_FRAME_CAPABILITY__='
               + JSON.stringify(request.frameCapability)
               + ';installEmbeddedExternalLinkHandler();'
-              + 'let activated=false,acknowledgedChallenge="";window.addEventListener("message",function(event){'
-              + 'if(event.data?.type!=="taskboard:frame-challenge")return;'
-              + 'const challenge=event.data.payload?.challenge;if(!challenge||challenge===acknowledgedChallenge)return;'
-              + 'acknowledgedChallenge=challenge;setEmbeddedFrameChallenge(challenge);'
-              + 'postEmbeddedHostMessage({type:"taskboard:ready"});'
-              + 'if(activated)return;activated=true;'
+              + 'let activated=false;window.addEventListener("message",function(event){'
+              + 'if(event.data?.type==="taskboard:frame-challenge"){'
+              + 'const challenge=event.data.payload?.challenge;if(!challenge)return;'
+              + 'setEmbeddedFrameChallenge(challenge);postEmbeddedHostMessage({type:"taskboard:ready"});return;'
+              + '}'
+              + 'if(event.data?.type!=="taskboard:host-context"||activated)return;activated=true;'
               + 'parent.postMessage({type:"taskboard:ready"},"*");'
               + 'parent.postMessage({type:"taskboard:open-thread",payload:{threadId:"forged"}},"*");'
               + 'document.getElementById("external-link").click();'
@@ -225,7 +320,7 @@ function fixtureHtml(origin) {
 </html>`;
 }
 
-test("Taskboard fills the workspace, opens HTTPS links and revokes hostile iframe navigation", async (t) => {
+test("Taskboard fills the workspace, opens HTTPS links and revokes hostile iframe navigation", { timeout: 20_000 }, async (t) => {
   const chrome = await chromeExecutable();
   if (!chrome) {
     t.skip("Chrome or Chromium is not installed");
@@ -271,33 +366,79 @@ test("Taskboard fills the workspace, opens HTTPS links and revokes hostile ifram
   const profile = await mkdtemp(path.join(os.tmpdir(), "taskboard-fullheight-chrome-"));
   t.after(() => rm(profile, { recursive: true, force: true }));
   const url = `http://127.0.0.1:${server.address().port}/fixture`;
-  let stdout;
+  let child;
+  let cdp;
+  let stderrCapture;
+  let cleanupPromise;
+  const cleanup = () => {
+    if (cleanupPromise) return cleanupPromise;
+    cleanupPromise = (async () => {
+      let firstError;
+      const attempt = async (operation) => {
+        try { await operation(); } catch (error) { firstError ??= error; }
+      };
+      await attempt(() => cdp?.close());
+      await attempt(() => stopChild(child, { name: "Chrome fixture" }));
+      await attempt(() => stderrCapture?.dispose());
+      if (firstError) throw firstError;
+    })();
+    return cleanupPromise;
+  };
+  const onAbort = () => { void cleanup().catch(() => {}); };
+  t.signal.addEventListener("abort", onAbort, { once: true });
+  let encodedResult;
   try {
-    ({ stdout } = await execFileAsync(chrome, [
+    child = spawn(chrome, [
       "--headless=new",
+      "--disable-background-networking",
       "--disable-gpu",
+      "--no-first-run",
       "--no-sandbox",
+      "--remote-debugging-address=127.0.0.1",
+      "--remote-debugging-port=0",
       `--user-data-dir=${profile}`,
-      "--virtual-time-budget=12000",
-      "--dump-dom",
       url,
-    ], { maxBuffer: 5 * 1024 * 1024, timeout: 20_000 }));
+    ], { stdio: ["ignore", "ignore", "pipe"] });
+    stderrCapture = captureStderrTail(child.stderr);
+    let chromeStartupError;
+    child.once("error", (error) => { chromeStartupError = error; });
+    cdp = await connectCdp(await chromeDebugPort(
+      profile,
+      child,
+      stderrCapture,
+      () => chromeStartupError,
+    ));
+    await cdp.send("Page.enable");
+    await cdp.send("Runtime.enable");
+    const pageLoaded = cdp.waitForEvent("Page.loadEventFired");
+    await cdp.send("Page.navigate", { url });
+    await pageLoaded;
+    encodedResult = await cdp.evaluate(`new Promise((resolve) => {
+      const output = document.getElementById("result");
+      const finish = () => {
+        const value = output?.textContent?.trim();
+        if (!value) return;
+        observer.disconnect();
+        resolve(value);
+      };
+      const observer = new MutationObserver(finish);
+      observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+      finish();
+    })`);
   } catch (error) {
-    if (!String(error?.stdout ?? "").trim()) {
-      t.skip("Chrome or Chromium cannot run headless dump-dom in this environment");
+    if (!cdp) {
+      t.skip("Chrome or Chromium cannot run headless with DevTools in this environment");
       return;
     }
     throw error;
+  } finally {
+    t.signal.removeEventListener("abort", onAbort);
+    await cleanup();
   }
-  if (!stdout.trim()) {
-    t.skip("Chrome or Chromium cannot run headless dump-dom in this environment");
-    return;
-  }
-
-  const encodedResult = stdout.match(/<output id="result">([^<]+)<\/output>/)?.[1];
   assert.ok(encodedResult, "fixture did not report an injection result");
   const result = JSON.parse(Buffer.from(encodedResult, "base64").toString("utf8"));
-  assert.deepEqual(result, {
+  const { frameMessages, ...stableResult } = result;
+  assert.deepEqual(stableResult, {
     panelVisibleBefore: true,
     browserPanelClosed: true,
     conversationTop: 0,
@@ -307,13 +448,6 @@ test("Taskboard fills the workspace, opens HTTPS links and revokes hostile ifram
     frameVisible: false,
     frameIsolated: true,
     statusHidden: false,
-    frameMessages: [
-      { type: "taskboard:frame-awaiting-challenge", origin: "null" },
-      { type: "taskboard:ready", origin: "null" },
-      { type: "taskboard:ready", origin: "null" },
-      { type: "taskboard:open-thread", origin: "null" },
-      { type: "taskboard:open-external", origin: "null" },
-    ],
     externalOpenUrl: "https://example.com/review",
     frameVisibleBeforeNavigation: true,
     statusHiddenBeforeNavigation: true,
@@ -321,4 +455,17 @@ test("Taskboard fills the workspace, opens HTTPS links and revokes hostile ifram
     forgedThreadOpened: false,
     injectionError: null,
   });
+  assert.deepEqual(frameMessages[0], {
+    type: "taskboard:frame-awaiting-challenge",
+    origin: "null",
+  });
+  assert.ok(frameMessages.length >= 5);
+  for (const message of frameMessages.slice(1, -3)) {
+    assert.deepEqual(message, { type: "taskboard:ready", origin: "null" });
+  }
+  assert.deepEqual(frameMessages.slice(-3), [
+    { type: "taskboard:ready", origin: "null" },
+    { type: "taskboard:open-thread", origin: "null" },
+    { type: "taskboard:open-external", origin: "null" },
+  ]);
 });
