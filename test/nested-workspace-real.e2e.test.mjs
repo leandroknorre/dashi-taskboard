@@ -256,10 +256,13 @@ async function startReadOnlyProxy(targetOrigin) {
 
 function seedWorkspace(directory) {
   const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
-  const create = (title, status, stageId, description = "", dates = {}) => database.createTask({
-    projectId: "alpha", title, description, status, stageId, priority: "none", labels: [], actor,
-    assignee: actor, developmentContext: null, startDate: dates.startDate ?? null, dueDate: dates.dueDate ?? null, recurrence: null,
-  });
+  const create = (title, status, stageId, description = "", options = {}) => {
+    const { sortOrder, startDate = null, dueDate = null } = options;
+    return database.createTask({
+      projectId: "alpha", title, description, status, stageId, priority: "none", labels: [], actor,
+      assignee: actor, developmentContext: null, startDate, dueDate, recurrence: null, sortOrder,
+    });
+  };
   const relate = (child, parent, metadata = undefined) => database.addTaskRelation(
     child.id, child.version, "parent", parent.id, null, null, actor, "manual", metadata,
   ).task;
@@ -282,8 +285,11 @@ function seedWorkspace(directory) {
     for (let index = 0; index < 62; index += 1) {
       const status = ["todo", "in_progress", "in_review", "blocked", "done"][index % 5];
       const stageId = status === "todo" ? todo.stageId : stageFor(status).stageId;
-      const dates = index % 2 === 0 ? { startDate: `2026-08-${String((index % 28) + 1).padStart(2, "0")}` } : {};
-      direct.push(relate(create(`Direct child ${String(index + 1).padStart(2, "0")}`, status, stageId, "", dates), root));
+      const options = {
+        sortOrder: index,
+        ...(index % 2 === 0 ? { startDate: `2026-08-${String((index % 28) + 1).padStart(2, "0")}` } : {}),
+      };
+      direct.push(relate(create(`Direct child ${String(index + 1).padStart(2, "0")}`, status, stageId, "", options), root));
     }
     const deepOne = relate(create("Deep descendant one", "in_progress", stageFor("in_progress").stageId), direct[0]);
     const deepTwo = relate(create("Deep descendant two", "todo", todo.stageId), deepOne);
@@ -426,13 +432,19 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     assert.equal(openedVision, true, "Normal click on a root supra-card must open its nested workspace");
     await eventually(() => cdp.evaluate(`new URL(location.href).searchParams.get("workspace") === ${JSON.stringify(fixture.vision.identifier)}`), "Root supra-card did not open its child workspace");
 
+    await eventually(() => cdp.evaluate(`[
+      ...document.querySelectorAll(".nested-workspace-breadcrumb button"),
+    ].some((node) => node.textContent?.trim() === "Alpha")`), "Nested workspace must expose the root breadcrumb");
+    const breadcrumbLabels = await cdp.evaluate(`[
+      ...document.querySelectorAll(".nested-workspace-breadcrumb button"),
+    ].map((node) => node.textContent?.trim())`);
     const breadcrumbToRoot = await cdp.evaluate(`(() => {
       const button = [...document.querySelectorAll(".nested-workspace-breadcrumb button")].find((node) => node.textContent?.trim() === "Alpha");
       if (!(button instanceof HTMLButtonElement)) return false;
       button.click();
       return true;
     })()`);
-    assert.equal(breadcrumbToRoot, true, "Nested workspace must expose the root breadcrumb");
+    assert.equal(breadcrumbToRoot, true, `Nested workspace must expose the root breadcrumb (found: ${breadcrumbLabels.join(", ")})`);
     await eventually(() => cdp.evaluate(`new URL(location.href).searchParams.get("workspaceRoot") === "alpha" && new URL(location.href).searchParams.get("workspace") === null`), "Root breadcrumb did not return to the root workspace");
     await selectWorkspaceTab("Board");
     const reopenedVision = await cdp.evaluate(`(() => {
@@ -470,7 +482,7 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-list")?.textContent?.includes("Direct child 02")`), "Back did not restore the release List workspace");
 
     const leafDetail = await cdp.evaluate(`(() => {
-      const button = [...document.querySelectorAll(".nested-workspace-item-detail")].find((node) => node.getAttribute("aria-label")?.includes(${JSON.stringify(fixture.direct[1].identifier)}));
+      const button = [...document.querySelectorAll(".nested-workspace-item-detail")].find((node) => node.getAttribute("aria-label")?.endsWith(${JSON.stringify(fixture.direct[1].identifier)}));
       if (!(button instanceof HTMLButtonElement)) return false;
       button.click();
       return true;
