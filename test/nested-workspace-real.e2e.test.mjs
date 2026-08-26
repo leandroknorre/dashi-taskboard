@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer, request as httpRequest } from "node:http";
@@ -266,31 +265,30 @@ function seedWorkspace(directory) {
   ).task;
   try {
     database.createProject({ id: "alpha", name: "Alpha", workspacePath: null });
-    const initial = database.getStageWorkflow("alpha");
-    const firstTodo = { stageId: randomUUID(), canonicalStatus: "todo", name: "Workspace todo A", order: initial.definition.stages.length, boardVisible: true, active: true, isDefaultForStatus: false, terminalKind: "none" };
-    const secondTodo = { stageId: randomUUID(), canonicalStatus: "todo", name: "Workspace todo B", order: initial.definition.stages.length + 1, boardVisible: true, active: true, isDefaultForStatus: false, terminalKind: "none" };
-    const workflow = database.saveStageWorkflow("alpha", initial.version, { schemaVersion: 2, stages: [...initial.definition.stages, firstTodo, secondTodo] });
+    // Project creation now publishes the immutable default workflow before
+    // any task is accepted. This fixture deliberately uses that public,
+    // already-pinned workflow instead of trying to author physical stages.
+    const workflow = database.getStageWorkflow("alpha");
     const stageFor = (status) => workflow.definition.stages.find((stage) => stage.canonicalStatus === status && stage.isDefaultForStatus);
-    const todoA = workflow.definition.stages.find((stage) => stage.name === firstTodo.name);
-    const todoB = workflow.definition.stages.find((stage) => stage.name === secondTodo.name);
-    assert.ok(stageFor("in_review") && stageFor("in_progress") && stageFor("blocked") && stageFor("done") && todoA && todoB);
+    const todo = stageFor("todo");
+    assert.ok(stageFor("in_review") && stageFor("in_progress") && stageFor("blocked") && stageFor("done") && todo);
 
-    const vision = create("Vision", "todo", todoA.stageId);
-    const program = relate(create("Program", "todo", todoB.stageId), vision);
+    const vision = create("Vision", "todo", todo.stageId);
+    const program = relate(create("Program", "todo", todo.stageId), vision);
     const area = relate(create("Area", "in_progress", stageFor("in_progress").stageId), program);
-    const portfolio = relate(create("Portfolio", "todo", todoA.stageId), area);
+    const portfolio = relate(create("Portfolio", "todo", todo.stageId), area);
     const root = relate(create("Release workspace", "in_review", stageFor("in_review").stageId, "Manual purpose: ship without moving the parent."), portfolio);
     const direct = [];
     for (let index = 0; index < 62; index += 1) {
       const status = ["todo", "in_progress", "in_review", "blocked", "done"][index % 5];
-      const stageId = status === "todo" ? (index % 2 ? todoA.stageId : todoB.stageId) : stageFor(status).stageId;
+      const stageId = status === "todo" ? todo.stageId : stageFor(status).stageId;
       const dates = index % 2 === 0 ? { startDate: `2026-08-${String((index % 28) + 1).padStart(2, "0")}` } : {};
       direct.push(relate(create(`Direct child ${String(index + 1).padStart(2, "0")}`, status, stageId, "", dates), root));
     }
     const deepOne = relate(create("Deep descendant one", "in_progress", stageFor("in_progress").stageId), direct[0]);
-    const deepTwo = relate(create("Deep descendant two", "todo", todoA.stageId), deepOne);
+    const deepTwo = relate(create("Deep descendant two", "todo", todo.stageId), deepOne);
     const deepThree = relate(create("Deep descendant three", "done", stageFor("done").stageId), deepTwo);
-    const ignored = relate(create("Non-rollup descendant", "todo", todoB.stageId), root, { required: false, rollup: false });
+    const ignored = relate(create("Non-rollup descendant", "todo", todo.stageId), root, { required: false, rollup: false });
     const snapshot = {
       tasks: database.database.prepare("SELECT * FROM tasks ORDER BY id").all(),
       relations: database.database.prepare("SELECT * FROM task_relations ORDER BY relation_type, source_task_id, target_task_id").all(),
