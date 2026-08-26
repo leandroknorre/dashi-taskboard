@@ -352,6 +352,12 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-board")?.textContent?.includes("Vision")`), "Root Board did not render its immediate task");
 
     async function selectWorkspaceTab(label) {
+      // URL navigation commits before the asynchronously-loaded workspace toolbar
+      // is rendered.  Wait for the real tab rather than treating that transient
+      // render gap as a missing view.
+      await eventually(() => cdp.evaluate(`[
+        ...document.querySelectorAll(".view-tab"),
+      ].some((node) => node instanceof HTMLButtonElement && node.textContent?.trim() === ${JSON.stringify(label)})`), `Workspace did not expose ${label}`);
       const switched = await cdp.evaluate(`(() => {
         const tab = [...document.querySelectorAll(".view-tab")].find((node) => node.textContent?.trim() === ${JSON.stringify(label)});
         if (!(tab instanceof HTMLButtonElement)) return false;
