@@ -85,8 +85,10 @@ test("panel cards reuse TaskCard and the existing ranked board drop path", () =>
   assert.match(panelSource, /onDragStart=\{onDragStart\}/);
   assert.match(panelSource, /onDragEnd=\{onDragEnd\}/);
   assert.match(panelSource, /onOpenConversation=\{onOpenConversation\}/);
-  assert.equal(appSource.match(/onDragStart=\{startTaskDrag\}/g)?.length, 2);
-  assert.equal(appSource.match(/onDragEnd=\{endTaskDrag\}/g)?.length, 2);
+  // Main Board, the optional side panel, and the project-root physical Board
+  // all use the same ranked drag path.
+  assert.equal(appSource.match(/onDragStart=\{startTaskDrag\}/g)?.length, 3);
+  assert.equal(appSource.match(/onDragEnd=\{endTaskDrag\}/g)?.length, 3);
   assert.match(boardColumnSource, /findDropBefore\(event\.currentTarget, event\.clientY\)/);
   assert.match(boardColumnSource, /onDrop\(status, taskId, findDropBefore/);
   assert.match(panelSource, /findDropBefore\(event\.currentTarget, event\.clientY\)/);

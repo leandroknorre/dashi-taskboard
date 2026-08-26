@@ -471,21 +471,32 @@ test("App repaints real DHTMLX Gantt when the project workflow arrives late", { 
       "Delayed workflow response was not released",
       delayMs + 2_000,
     );
-    const bottom = await eventually(async () => cdp.evaluate(`(() => {
+    const bottom = await eventually(async () => cdp.evaluate(`(async () => {
       const scroller = document.querySelector(".gantt_ver_scroll");
-      if (!(scroller instanceof HTMLElement)) return { error: "Gantt vertical scroller missing" };
-      scroller.scrollTop = scroller.scrollHeight;
-      scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
-      return {
-        text: document.querySelector(".gantt_grid_data")?.innerText ?? "",
-        scrollTop: scroller.scrollTop,
-        maxScrollTop: scroller.scrollHeight - scroller.clientHeight,
-      };
+      if (!(scroller instanceof HTMLElement)) return null;
+      const maxScrollTop = scroller.scrollHeight - scroller.clientHeight;
+      let sawStage = false;
+      let sawCard = false;
+      // DHTMLX keeps a very small virtual DOM window. Traverse actual scroll
+      // positions and wait for its next paint at each position; a single
+      // synchronous snapshot may contain either the group row or its card,
+      // never both.
+      for (let scrollTop = maxScrollTop; scrollTop >= 1; scrollTop -= 46) {
+        scroller.scrollTop = scrollTop;
+        scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const text = document.querySelector(".gantt_grid_data")?.innerText ?? "";
+        sawStage ||= /Stage 14/.test(text);
+        sawCard ||= /Card 14/.test(text);
+        if (scroller.scrollTop > 0 && sawStage && sawCard) {
+          return { text, observedText: (sawStage ? "Stage 14" : "") + " " + (sawCard ? "Card 14" : ""), scrollTop: scroller.scrollTop, maxScrollTop };
+        }
+      }
+      return null;
     })()`), "Custom workflow did not repaint the virtualized Gantt after its delayed response");
-    assert.equal(bottom.error, undefined);
     assert.ok(bottom.scrollTop > 0, "fixture must exercise the virtualized Gantt scroll");
-    assert.match(bottom.text, /Stage 14/);
-    assert.match(bottom.text, /Card 14/);
+    assert.match(bottom.observedText, /Stage 14/);
+    assert.match(bottom.observedText, /Card 14/);
   } finally {
     t.signal.removeEventListener("abort", onAbort);
     await cleanup();
@@ -554,7 +565,7 @@ test("Board restores each custom stage rail independently when stages share a ca
       deviceScaleFactor: 1,
       mobile: false,
     });
-    await cdp.send("Page.navigate", { url: `http://127.0.0.1:${appAddress.port}/?project=alpha` });
+    await cdp.send("Page.navigate", { url: `http://127.0.0.1:${appAddress.port}/?project=alpha&workspaceRoot=alpha&view=board` });
     await eventually(async () => cdp.evaluate(`(() => {
       const railFor = (label) => {
         const column = [...document.querySelectorAll(".board-column")].find((node) => (

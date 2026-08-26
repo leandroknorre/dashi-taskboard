@@ -429,8 +429,20 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     await eventually(() => cdp.evaluate(`new URL(location.href).searchParams.get("workspaceRoot") === "alpha" && new URL(location.href).searchParams.get("workspace") === null && document.querySelector("#nested-workspace-panel-list") instanceof HTMLElement`), "Browser Back did not restore the root List workspace");
 
     await selectWorkspaceTab("Board");
+    const physicalRootBoard = await cdp.evaluate(`(() => {
+      const root = document.querySelector("#nested-workspace-panel-board");
+      const rails = [...root?.querySelectorAll(".board-column") ?? []].map((column) => column.querySelector("h2")?.textContent?.trim());
+      return {
+        rails,
+        vision: root?.textContent?.includes("Vision") ?? false,
+        program: root?.textContent?.includes("Program") ?? false,
+      };
+    })()`);
+    assert.equal(physicalRootBoard.vision, true, "Root Board must project its parent-less card");
+    assert.equal(physicalRootBoard.program, false, "Root Board must not duplicate descendants as project-root cards");
+    assert.ok(physicalRootBoard.rails.some((label) => label?.includes("To do")), "Root Board must use physical workflow stage rails");
     const openedVision = await cdp.evaluate(`(() => {
-      const item = [...document.querySelectorAll(".nested-workspace-item")].find((node) => node.textContent?.includes("Vision"));
+      const item = [...document.querySelectorAll("#nested-workspace-panel-board button.task-card-open")].find((node) => node.getAttribute("aria-label")?.includes("Vision"));
       if (!(item instanceof HTMLButtonElement)) return false;
       item.click();
       return true;
@@ -454,7 +466,7 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     await eventually(() => cdp.evaluate(`new URL(location.href).searchParams.get("workspaceRoot") === "alpha" && new URL(location.href).searchParams.get("workspace") === null`), "Root breadcrumb did not return to the root workspace");
     await selectWorkspaceTab("Board");
     const reopenedVision = await cdp.evaluate(`(() => {
-      const item = [...document.querySelectorAll(".nested-workspace-item")].find((node) => node.textContent?.includes("Vision"));
+      const item = [...document.querySelectorAll("#nested-workspace-panel-board button.task-card-open")].find((node) => node.getAttribute("aria-label")?.includes("Vision"));
       if (!(item instanceof HTMLButtonElement)) return false;
       item.click();
       return true;

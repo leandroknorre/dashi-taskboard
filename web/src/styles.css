@@ -315,6 +315,11 @@ kbd {
 .nested-workspace-stale { color: var(--warning, #b7791f); font-style: normal; }
 
 .nested-workspace-board { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); align-items: start; gap: 14px; }
+.nested-workspace-physical-board {
+  min-height: 360px;
+  height: min(720px, calc(100vh - 330px));
+  padding: 0;
+}
 .nested-workspace-column { min-width: 0; padding: 12px; border-radius: 8px; background: var(--surface-hover); }
 .nested-workspace-column h2 { display: flex; justify-content: space-between; color: var(--text-secondary); }
 .nested-workspace-column h2 small { color: var(--text-tertiary); font-weight: 500; }

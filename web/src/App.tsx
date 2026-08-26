@@ -2506,6 +2506,14 @@ export function App() {
     : boardDisplaySettings.sidebarStatuses;
   const otherTaskTabsKey = otherTaskTabs.join(",");
   const otherTasksAvailable = otherTaskTabs.length > 0;
+  // A project root is an operational board. Its cards are only the direct
+  // roots of the project hierarchy, and its columns are the project's actual
+  // active, visible workflow stages. Nested task workspaces intentionally use
+  // the macro buckets supplied by their read model instead.
+  const rootWorkspaceBoardTasks = useMemo(() => filteredTasks.filter((task) => (
+    task.projectId === workspaceRootProjectId
+    && task.relations.parent === null
+  )), [filteredTasks, workspaceRootProjectId]);
 
   useEffect(() => {
     if (!otherTasksAvailable) {
@@ -4134,6 +4142,76 @@ export function App() {
                     onError={setActionError}
                   />
                 ) : undefined}
+              projectBoardContent={activeWorkspaceDescriptor.kind !== "project" ? undefined : (
+                <div
+                  className="issue-board-layout nested-workspace-physical-board"
+                  data-main-columns={mainBoardItems.length}
+                  style={{
+                    "--main-column-count": mainColumnCount,
+                    "--main-board-min-width": `${mainBoardMinWidth}px`,
+                    "--main-board-max-width": `${mainBoardMaxWidth}px`,
+                  } as CSSProperties}
+                >
+                  {tasksLoading && !hasLoadedTasks ? (
+                    <div className="loading-board" aria-label={text("正在加载议题", "Loading issues")} aria-busy="true">
+                      {mainBoardItems.map((item) => (
+                        <div className="loading-column" key={item}>
+                          <span /><div /><div />
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="board-scroll" aria-label={text("项目根看板", "Project root board")}>
+                      <div className="board">
+                        {mainBoardItems.map((item) => {
+                          const workflowStage = workflowBoardStages.find((stage) => stage.stageId === item);
+                          return (
+                            <BoardColumn
+                              key={item}
+                              scrollRef={(element) => {
+                                boardColumnScrollRefs.current[workflowStage?.stageId ?? item] = element;
+                              }}
+                              status={workflowStage?.canonicalStatus ?? item as TaskStatus}
+                              stageId={workflowStage?.stageId}
+                              label={workflowStage?.name}
+                              tasks={workflowStage
+                                ? rootWorkspaceBoardTasks.filter((task) => task.stageId === workflowStage.stageId)
+                                : rootWorkspaceBoardTasks.filter((task) => task.status === item)}
+                              presentations={taskPresentations}
+                              now={processingNow}
+                              emptyMessage={hasActiveTaskFilters
+                                ? text("当前筛选下无匹配议题", "No issues match the current filters")
+                                : text("暂无议题", "No issues")}
+                              isDropTarget={dropTarget === (workflowStage?.stageId ?? item)}
+                              draggedTaskId={draggedTaskId}
+                              draggedTaskHeight={draggedTaskHeight}
+                              movingTaskId={movingTaskId}
+                              settlingTaskId={settlingTaskId}
+                              contextMenuTaskId={contextMenu?.taskId ?? null}
+                              availableLabels={availableLabels}
+                              currentUser={currentUser}
+                              showCover={boardDisplaySettings.cover}
+                              showBody={boardDisplaySettings.body}
+                              createEnabled={!isJiraProject}
+                              onCreateLabel={persistProjectLabel}
+                              onCreate={(initialStatus, stageId) => setEditor({ task: null, status: initialStatus, stageId })}
+                              onEdit={openTaskOrWorkspace}
+                              onUpdate={updateTaskProperties}
+                              onComplete={(task) => void moveTask(task, "done")}
+                              onContextMenu={openTaskContextMenu}
+                              onDragStart={startTaskDrag}
+                              onDragEnd={endTaskDrag}
+                              onDragEnter={(_status, stageId) => setDropTarget(stageId ?? _status)}
+                              onDrop={finishTaskDrop}
+                              onOpenConversation={openTaskConversation}
+                            />
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
             />
           ) : <div className="board-view-loading">{text("正在打开工作区…", "Opening workspace…")}</div>
         ) : boardView !== "readme"
