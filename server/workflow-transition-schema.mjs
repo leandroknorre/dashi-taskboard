@@ -303,6 +303,33 @@ function insertSnapshot(database, { projectId, workflowId, definition, bindings,
   }
 }
 
+/**
+ * Materialize the immutable legacy workflow only when a project receives its
+ * first task. Projects without work items remain editable through the stage
+ * workflow editor; action discovery never calls this helper.
+ *
+ * The caller owns the surrounding transaction. The transition schema and
+ * insert trigger are installed by migrateLocalWorkflowTransitions at startup.
+ */
+export function ensureLocalWorkflowTransitionForProject(database, projectId, timestamp = now()) {
+  const existing = database.prepare(
+    "SELECT workflow_id FROM workflow_definitions WHERE project_id = ?",
+  ).get(projectId);
+  if (existing) return existing.workflow_id;
+
+  const stages = database.prepare(`
+    SELECT id, canonical_status, terminal_kind
+    FROM workflow_stages WHERE project_id = ? ORDER BY stage_order, id
+  `).all(projectId);
+  if (stages.length === 0) {
+    throw new Error(`Cannot pin workflow for project '${projectId}' without stages`);
+  }
+  const workflowId = workflowIdForProject(projectId);
+  const snapshot = workflowSnapshot(workflowId, stages, timestamp);
+  insertSnapshot(database, { projectId, workflowId, ...snapshot, timestamp });
+  return workflowId;
+}
+
 /** Local-only migration. It snapshots existing stage workflows without creating ledger history. */
 export function migrateLocalWorkflowTransitions(database) {
   database.exec("PRAGMA recursive_triggers = ON");
@@ -310,17 +337,13 @@ export function migrateLocalWorkflowTransitions(database) {
   try {
     database.exec(WORKFLOW_TRANSITION_SCHEMA_SQL);
     const timestamp = now();
-    for (const project of database.prepare("SELECT id FROM projects ORDER BY id").all()) {
-      const existing = database.prepare("SELECT workflow_id FROM workflow_definitions WHERE project_id = ?").get(project.id);
-      if (existing) continue;
-      const stages = database.prepare(`
-        SELECT id, canonical_status, terminal_kind
-        FROM workflow_stages WHERE project_id = ? ORDER BY stage_order, id
-      `).all(project.id);
-      if (stages.length === 0) continue;
-      const workflowId = workflowIdForProject(project.id);
-      const snapshot = workflowSnapshot(workflowId, stages, timestamp);
-      insertSnapshot(database, { projectId: project.id, workflowId, ...snapshot, timestamp });
+    for (const project of database.prepare(`
+      SELECT projects.id
+      FROM projects
+      WHERE EXISTS (SELECT 1 FROM tasks WHERE tasks.project_id = projects.id)
+      ORDER BY projects.id
+    `).all()) {
+      ensureLocalWorkflowTransitionForProject(database, project.id, timestamp);
     }
     database.prepare(`
       INSERT INTO workflow_task_pins (task_id, workflow_id, revision_id, pinned_at)

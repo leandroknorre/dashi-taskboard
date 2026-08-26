@@ -19,7 +19,10 @@ import {
 } from "../shared/nested-workspace.mjs";
 import { migrateLocalWorkflowLedger } from "./workflow-ledger.mjs";
 import { migrateLocalAutomationRuns } from "./workflow-automation-run-schema.mjs";
-import { migrateLocalWorkflowTransitions } from "./workflow-transition-schema.mjs";
+import {
+  ensureLocalWorkflowTransitionForProject,
+  migrateLocalWorkflowTransitions,
+} from "./workflow-transition-schema.mjs";
 import { migrateLocalHumanAcceptance } from "./human-acceptance-schema.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
@@ -1185,10 +1188,6 @@ export class TaskboardDatabase {
       }
       throw error;
     }
-    // A project write establishes its immutable workflow before any task can
-    // be created. Read-only transition discovery must never perform this work.
-    this.#ensureStageWorkflow(input.id, timestamp);
-    migrateLocalWorkflowTransitions(this.database);
     return this.getProject(input.id);
   }
 
@@ -1298,6 +1297,8 @@ export class TaskboardDatabase {
         seenTaskIds.add(existing?.id ?? issue.id);
         const labels = JSON.stringify(issue.labels);
         if (!existing) {
+          this.#ensureStageWorkflow(JIRA_PROJECT_ID, timestamp);
+          ensureLocalWorkflowTransitionForProject(this.database, JIRA_PROJECT_ID, timestamp);
           insertTask.run(
             issue.id,
             issue.identifier,
@@ -2378,6 +2379,8 @@ export class TaskboardDatabase {
         `).get(input.projectId, input.stageId);
         sortOrder = row.minimum === null ? 1000 : row.minimum - 1000;
       }
+
+      ensureLocalWorkflowTransitionForProject(this.database, input.projectId, timestamp);
 
       this.database.prepare(`
         UPDATE projects SET next_task_number = ?, labels = ?, updated_at = ? WHERE id = ?
