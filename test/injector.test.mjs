@@ -229,8 +229,11 @@ test("the injector ignores auxiliary Codex windows", () => {
   assert.match(source, /!target\.url\?\.includes\("initialRoute=%2Fglobal-dictation"\)/);
 });
 
-test("a completed web build refreshes an already-open Codex iframe", () => {
-  assert.match(packageJson.scripts.build, /--refresh-if-running/);
+test("web builds stay pure while refresh remains an explicit command", () => {
+  assert.equal(packageJson.scripts.build, "npm run build:web");
+  assert.equal(packageJson.scripts["build:refresh"], "npm run build && npm run codex:refresh");
+  assert.doesNotMatch(packageJson.scripts.build, /codex-injector|refresh/);
+  assert.doesNotMatch(packageJson.scripts.check, /codex-injector|refresh/);
   assert.match(packageJson.scripts["codex:refresh"], /--refresh/);
   assert.match(source, /async function refreshTaskboardFrames/);
   assert.match(source, /function codexDebuggingPorts/);
