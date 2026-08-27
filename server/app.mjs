@@ -205,22 +205,49 @@ function parseTrustedOrigins(value) {
   return origins;
 }
 
-function assertTrustedNetworkRequest(request, allowOpaqueOrigin = false, trustedOrigins = new Set()) {
-  let host;
-  try {
-    host = new URL(`http://${request.headers.host ?? ""}`).hostname;
-  } catch {
-    throw new ApiError(403, "INVALID_HOST", "Request Host must be local or private");
+function parseRequestHostAuthority(value) {
+  if (
+    typeof value !== "string"
+    || !value
+    || value !== value.trim()
+    || value.endsWith(":")
+    || /[\s/?#@\\%]/.test(value)
+  ) {
+    throw new ApiError(403, "INVALID_HOST", "Request Host must be local, private, or explicitly trusted");
   }
-  if (!isTrustedNetworkHost(host)) {
-    throw new ApiError(403, "INVALID_HOST", "Request Host must be local or private");
+
+  let url;
+  try {
+    url = new URL(`https://${value}`);
+  } catch {
+    throw new ApiError(403, "INVALID_HOST", "Request Host must be local, private, or explicitly trusted");
+  }
+  if (
+    !url.hostname
+    || url.username
+    || url.password
+    || url.pathname !== "/"
+    || url.search
+    || url.hash
+  ) {
+    throw new ApiError(403, "INVALID_HOST", "Request Host must be local, private, or explicitly trusted");
+  }
+  return url;
+}
+
+function assertTrustedNetworkRequest(request, allowOpaqueOrigin = false, trustedOrigins = new Set()) {
+  const hostUrl = parseRequestHostAuthority(request.headers.host);
+  const trustedNetworkHost = isTrustedNetworkHost(hostUrl.hostname);
+  const configuredTrustedHost = !trustedNetworkHost && trustedOrigins.has(hostUrl.origin);
+  if (!trustedNetworkHost && !configuredTrustedHost) {
+    throw new ApiError(403, "INVALID_HOST", "Request Host must be local, private, or explicitly trusted");
   }
 
   const origin = request.headers.origin;
-  if (!origin) return;
-  if (TRUSTED_EMBED_ORIGINS.has(origin)) return;
-  if (allowOpaqueOrigin && origin === "null") return;
-  if (trustedOrigins.has(origin)) return;
+  if (!origin) return configuredTrustedHost;
+  if (TRUSTED_EMBED_ORIGINS.has(origin)) return configuredTrustedHost;
+  if (allowOpaqueOrigin && origin === "null") return configuredTrustedHost;
+  if (trustedOrigins.has(origin)) return true;
   let originHost;
   try {
     originHost = new URL(origin).hostname;
@@ -230,6 +257,7 @@ function assertTrustedNetworkRequest(request, allowOpaqueOrigin = false, trusted
   if (!isTrustedNetworkHost(originHost)) {
     throw new ApiError(403, "INVALID_ORIGIN", "Request Origin must be local or private");
   }
+  return configuredTrustedHost;
 }
 
 function assertLoopbackRequest(request) {
@@ -2162,7 +2190,7 @@ export function createTaskboardServer(options = {}) {
         request.url = `${incomingUrl.pathname.slice(routePrefix.length) || "/"}${incomingUrl.search}`;
       }
 
-      assertTrustedNetworkRequest(
+      const configuredTrustedRequest = assertTrustedNetworkRequest(
         request,
         Boolean(resolved.instanceToken),
         resolved.trustedOrigins,
@@ -2198,6 +2226,21 @@ export function createTaskboardServer(options = {}) {
       }
       const url = new URL(request.url, "http://127.0.0.1");
       const pathname = url.pathname;
+      const isDevelopmentContextsRoute = /^\/api\/projects\/[^/]+\/development-contexts$/.test(pathname);
+      if (
+        configuredTrustedRequest
+        && (
+          pathname.startsWith("/api/local/")
+          || pathname === "/api/device-workspaces"
+          || isDevelopmentContextsRoute
+        )
+      ) {
+        throw new ApiError(
+          409,
+          "LOCAL_COMPANION_REQUIRED",
+          "This capability requires a device-local Taskboard origin",
+        );
+      }
       const isLocalAiRoute = pathname === "/api/local/ai" || pathname.startsWith("/api/local/ai/");
       if (isLocalAiRoute) {
         assertAiLoopbackRequest(request);
@@ -2206,7 +2249,7 @@ export function createTaskboardServer(options = {}) {
       }
       const isMachineCapabilityRoute = pathname === "/api/meta"
         || pathname === "/api/device-workspaces"
-        || /^\/api\/projects\/[^/]+\/development-contexts$/.test(pathname);
+        || isDevelopmentContextsRoute;
       const capabilityCloudConfig = isMachineCapabilityRoute
         ? await cloudConfig.read()
         : null;
@@ -2449,8 +2492,11 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/meta does not accept query parameters");
         }
         return sendJson(response, 200, {
-          manageTaskboardSkillPath: resolved.skillPath,
-          capabilities: { localAiChat: isLoopbackAddress(request.socket.remoteAddress) },
+          ...(configuredTrustedRequest ? {} : { manageTaskboardSkillPath: resolved.skillPath }),
+          capabilities: {
+            localAiChat: !configuredTrustedRequest
+              && isLoopbackAddress(request.socket.remoteAddress),
+          },
           ...(capabilityCloudConfig?.remoteUrl
             ? {
               mode: "cloud",
@@ -2458,7 +2504,7 @@ export function createTaskboardServer(options = {}) {
                 transport: "websocket",
                 endpoint: "/api/events",
               },
-              localCapabilities: { available: true },
+              localCapabilities: { available: !configuredTrustedRequest },
             }
             : {}),
         });

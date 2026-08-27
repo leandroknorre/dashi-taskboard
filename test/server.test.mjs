@@ -50,8 +50,8 @@ async function request(baseUrl, pathname, options = {}) {
   };
 }
 
-async function requestWithHost(baseUrl, host, headers = {}) {
-  const target = new URL("/health", baseUrl);
+async function requestWithHost(baseUrl, host, headers = {}, pathname = "/health") {
+  const target = new URL(pathname, baseUrl);
   return new Promise((resolve, reject) => {
     const outgoing = httpRequest(target, { headers: { host, ...headers } }, (response) => {
       const chunks = [];
@@ -638,7 +638,7 @@ test("accepts private LAN requests and rejects public Host and Origin headers", 
   assert.equal(originResult.body.error.code, "INVALID_ORIGIN");
 });
 
-test("trusted HTTPS origins allow a loopback reverse tunnel for HTTP and SSE only", async () => {
+test("trusted HTTPS origins allow their exact public Host through a loopback reverse tunnel", async () => {
   const trustedOrigin = "https://board.example.test";
   const baseUrl = await startServer(() => ({
     processEnv: { ...process.env, CODEX_TASKBOARD_TRUSTED_ORIGINS: trustedOrigin },
@@ -658,19 +658,115 @@ test("trusted HTTPS origins allow a loopback reverse tunnel for HTTP and SSE onl
     assert.equal(events.status, expectedStatus);
   }
 
-  const publicHost = await requestWithHost(baseUrl, "board.example.test", {
+  for (const origin of [undefined, trustedOrigin]) {
+    const publicHost = await requestWithHost(
+      baseUrl,
+      "board.example.test",
+      origin ? { origin } : {},
+    );
+    assert.equal(publicHost.status, 200);
+  }
+
+  const foreignOrigin = await requestWithHost(baseUrl, "board.example.test", {
+    origin: "https://other.example.test",
+  });
+  assert.equal(foreignOrigin.status, 403);
+  assert.equal(foreignOrigin.body.error.code, "INVALID_ORIGIN");
+
+  const divergentPort = await requestWithHost(baseUrl, "board.example.test:8443", {
     origin: trustedOrigin,
   });
-  assert.equal(publicHost.status, 403);
-  assert.equal(publicHost.body.error.code, "INVALID_HOST");
+  assert.equal(divergentPort.status, 403);
+  assert.equal(divergentPort.body.error.code, "INVALID_HOST");
 
   const forwardedHost = await requestWithHost(baseUrl, "untrusted.example.test", {
     origin: trustedOrigin,
-    "x-forwarded-host": host,
+    "x-forwarded-host": "board.example.test",
     "x-forwarded-proto": "https",
   });
   assert.equal(forwardedHost.status, 403);
   assert.equal(forwardedHost.body.error.code, "INVALID_HOST");
+});
+
+test("trusted public requests do not inherit device-local capabilities from tunnel loopback", async () => {
+  const trustedOrigin = "https://board.example.test";
+  let skillPath;
+  const baseUrl = await startServer(async (directory) => {
+    skillPath = path.join(directory, "skills", "manage-taskboard", "SKILL.md");
+    return {
+      skillPath,
+      processEnv: { ...process.env, CODEX_TASKBOARD_TRUSTED_ORIGINS: trustedOrigin },
+      cloudConfigStore: {
+        async read() {
+          return {
+            remoteUrl: "https://tasks.example.test",
+            actorName: "Test actor",
+            sharedKey: "test-shared-key",
+            projectMappings: {},
+          };
+        },
+      },
+    };
+  });
+  const publicHost = "board.example.test";
+  const remoteMetadata = {
+    capabilities: { localAiChat: false },
+    mode: "cloud",
+    realtime: {
+      transport: "websocket",
+      endpoint: "/api/events",
+    },
+    localCapabilities: { available: false },
+  };
+
+  const publicMetadata = await requestWithHost(baseUrl, publicHost, {}, "/api/meta");
+  assert.equal(publicMetadata.status, 200);
+  assert.deepEqual(publicMetadata.body, remoteMetadata);
+  assert.equal(Object.hasOwn(publicMetadata.body, "manageTaskboardSkillPath"), false);
+
+  for (const pathname of [
+    "/api/local/host-runtime",
+    "/api/local/jira-connection",
+    "/api/local/ai/catalog?projectId=local",
+    "/api/device-workspaces",
+    "/api/projects/local/development-contexts",
+  ]) {
+    const result = await requestWithHost(baseUrl, publicHost, {}, pathname);
+    assert.equal(result.status, 409, pathname);
+    assert.equal(result.body.error.code, "LOCAL_COMPANION_REQUIRED", pathname);
+  }
+
+  const trustedOriginMetadata = await requestWithHost(
+    baseUrl,
+    "127.0.0.1",
+    { origin: trustedOrigin },
+    "/api/meta",
+  );
+  assert.equal(trustedOriginMetadata.status, 200);
+  assert.deepEqual(trustedOriginMetadata.body, remoteMetadata);
+  const trustedOriginLocalRoute = await requestWithHost(
+    baseUrl,
+    "127.0.0.1",
+    { origin: trustedOrigin },
+    "/api/local/host-runtime",
+  );
+  assert.equal(trustedOriginLocalRoute.status, 409);
+  assert.equal(trustedOriginLocalRoute.body.error.code, "LOCAL_COMPANION_REQUIRED");
+
+  const localMetadata = await request(baseUrl, "/api/meta");
+  assert.equal(localMetadata.response.status, 200);
+  assert.deepEqual(localMetadata.body, {
+    manageTaskboardSkillPath: skillPath,
+    capabilities: { localAiChat: true },
+    mode: "cloud",
+    realtime: {
+      transport: "websocket",
+      endpoint: "/api/events",
+    },
+    localCapabilities: { available: true },
+  });
+  assert.equal((await request(baseUrl, "/api/local/host-runtime")).response.status, 200);
+  assert.equal((await request(baseUrl, "/api/device-workspaces")).response.status, 200);
 });
 
 test("trusted HTTPS origins apply to cloud WebSocket upgrades without widening loopback routes", async () => {
@@ -708,6 +804,17 @@ test("trusted HTTPS origins apply to cloud WebSocket upgrades without widening l
       const headers = { host: "127.0.0.1", ...(origin ? { origin } : {}) };
       assert.equal(await openWebSocket(url, headers), expectedStatus);
     }
+
+    assert.equal(await openWebSocket(url, {
+      host: "board.example.test",
+      origin: trustedOrigin,
+    }), 101);
+    assert.equal(await openWebSocket(url, {
+      host: "untrusted.example.test",
+      origin: trustedOrigin,
+      "x-forwarded-host": "board.example.test",
+      "x-forwarded-proto": "https",
+    }), 403);
   } finally {
     await app.close();
     upstreamWebSockets.close();
