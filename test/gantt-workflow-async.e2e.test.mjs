@@ -529,7 +529,12 @@ test("Board restores each custom stage rail independently when stages share a ca
       await attempt(() => stderrCapture?.dispose());
       await attempt(() => app?.server.closeAllConnections?.());
       await attempt(() => app?.close());
-      await attempt(() => rm(directory, { recursive: true, force: true }));
+      await attempt(() => rm(directory, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 100,
+      }));
       if (firstError) throw firstError;
     })();
     return cleanupPromise;
