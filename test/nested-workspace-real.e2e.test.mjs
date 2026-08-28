@@ -348,8 +348,19 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     await cdp.send("Page.enable");
     await cdp.send("Runtime.enable");
     await cdp.send("Emulation.setDeviceMetricsOverride", { width: 1366, height: 768, deviceScaleFactor: 1, mobile: false });
-    await cdp.send("Page.navigate", { url: `${proxy.origin}/?project=alpha&workspaceRoot=alpha&view=board` });
-    await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-board")?.textContent?.includes("Vision")`), "Root Board did not render its immediate task");
+    await cdp.send("Page.navigate", { url: `${proxy.origin}/` });
+    await eventually(() => cdp.evaluate(`
+      document.querySelector(".header-project-button")?.getAttribute("aria-expanded") === "true"
+      && localStorage.getItem("taskboard.first-use-complete.v1") === "true"
+    `), "Fresh bare URL did not expose the project onboarding menu");
+    await cdp.evaluate("localStorage.clear(); true");
+    await cdp.send("Page.navigate", { url: `${proxy.origin}/?project=alpha&workspaceRoot=alpha&view=overview` });
+    await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-overview") instanceof HTMLElement`), "Root Overview did not render from its deep link");
+    assert.equal(
+      await cdp.evaluate(`document.querySelector(".header-project-button")?.getAttribute("aria-expanded")`),
+      "false",
+      "Fresh deep links must not open the project menu over workspace tabs",
+    );
 
     async function selectWorkspaceTab(label) {
       // URL navigation commits before the asynchronously-loaded workspace toolbar
@@ -358,14 +369,25 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
       await eventually(() => cdp.evaluate(`[
         ...document.querySelectorAll(".view-tab"),
       ].some((node) => node instanceof HTMLButtonElement && node.textContent?.trim() === ${JSON.stringify(label)})`), `Workspace did not expose ${label}`);
-      const switched = await cdp.evaluate(`(() => {
-        const tab = [...document.querySelectorAll(".view-tab")].find((node) => node.textContent?.trim() === ${JSON.stringify(label)});
-        if (!(tab instanceof HTMLButtonElement)) return false;
-        tab.click();
-        return true;
-      })()`);
-      assert.equal(switched, true, `Workspace must expose ${label}`);
       const panel = label === "Mind Map" ? "mindmap" : label.toLowerCase();
+      const hitPoint = await cdp.evaluate(`(() => {
+        const tab = [...document.querySelectorAll(".view-tab")].find((node) => node.textContent?.trim() === ${JSON.stringify(label)});
+        if (!(tab instanceof HTMLButtonElement)) return null;
+        const bounds = tab.getBoundingClientRect();
+        const x = bounds.left + bounds.width / 2;
+        const y = bounds.top + bounds.height / 2;
+        const target = document.elementFromPoint(x, y);
+        return {
+          x,
+          y,
+          hitsTab: target instanceof Element && target.closest(".view-tab") === tab,
+          target: target instanceof Element ? target.tagName.toLowerCase() + "." + target.className : null,
+        };
+      })()`);
+      assert.ok(hitPoint, `Workspace must expose ${label}`);
+      assert.equal(hitPoint.hitsTab, true, `${label} tab must be the physical hit target (found ${hitPoint.target})`);
+      await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x: hitPoint.x, y: hitPoint.y, button: "left", clickCount: 1 });
+      await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: hitPoint.x, y: hitPoint.y, button: "left", clickCount: 1 });
       await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-${panel}") instanceof HTMLElement`), `${label} panel did not render`);
     }
 

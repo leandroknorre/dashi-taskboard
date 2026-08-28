@@ -735,6 +735,7 @@ function LocalRealtimeSync({
 
 export function App() {
   const query = useMemo(() => new URL(document.baseURI).searchParams, []);
+  const hasExplicitRoute = ["project", "workspaceRoot", "workspace", "issue"].some((parameter) => query.has(parameter));
   const host = query.get("host");
   const embedded = host === "codex" || host === "workbuddy" || host === "deepseek-harness";
   const undoShortcut = navigator.userAgent.includes("Macintosh") ? "⌘Z" : "Ctrl+Z";
@@ -844,7 +845,7 @@ export function App() {
   const [openingProjectId, setOpeningProjectId] = useState<string | null>(null);
   const [openingThreadTaskId, setOpeningThreadTaskId] = useState<string | null>(null);
   const [projectMenuOpen, setProjectMenuOpen] = useState(
-    () => taskboardStorage.getItem(FIRST_USE_COMPLETE_KEY) === null,
+    () => taskboardStorage.getItem(FIRST_USE_COMPLETE_KEY) === null && !hasExplicitRoute,
   );
   const [projectContextMenu, setProjectContextMenu] = useState<ProjectContextMenuState | null>(null);
   const [projectCreateOpen, setProjectCreateOpen] = useState(false);
