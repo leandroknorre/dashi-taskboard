@@ -173,12 +173,26 @@ export class TransitionService {
   }
 
   listActions(taskId) {
+    const storedTask = this.database.prepare("SELECT kind FROM tasks WHERE id = ? OR identifier = ?").get(taskId, taskId);
+    if (storedTask?.kind === "source_record") return [];
     const context = this.#taskContext(taskId);
     return this.database.prepare(`
       SELECT * FROM workflow_transition_rules
       WHERE revision_id = ? AND from_task_stage_id = ?
       ORDER BY action_key
-    `).all(context.pin.revision_id, context.task.stage_id).map(ruleFromRow);
+    `).all(context.pin.revision_id, context.task.stage_id).map((row) => {
+      const rule = ruleFromRow(row);
+      const destination = this.database.prepare(`
+        SELECT canonical_status FROM workflow_revision_stage_bindings
+        WHERE revision_id = ? AND task_stage_id = ?
+      `).get(context.pin.revision_id, rule.toTaskStageId);
+      return {
+        ...rule,
+        toStageId: rule.toTaskStageId,
+        toStatus: destination?.canonical_status ?? null,
+        requiresAcceptance: this.#ruleRequiresHumanAcceptance(context, rule),
+      };
+    });
   }
 
   getTaskWorkflow(taskId) {
@@ -234,6 +248,7 @@ export class TransitionService {
     threadId = undefined,
     threadBinding = undefined,
   } = {}) {
+    this.taskboardDatabase.assertTaskWritable(taskId);
     let command;
     try {
       command = normalizeTransitionCommand(input);
@@ -339,6 +354,7 @@ export class TransitionService {
     threadId = undefined,
     threadBinding = undefined,
   }) {
+    this.taskboardDatabase.assertTaskWritable(taskId);
     const context = this.#taskContext(taskId);
     const target = stageId
       ? this.database.prepare(`

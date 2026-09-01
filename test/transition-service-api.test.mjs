@@ -136,6 +136,36 @@ test("POST transition requires Idempotency-Key and a retry returns the original 
   assert.equal(app.database.database.prepare("SELECT COUNT(*) AS count FROM workflow_outbox").get().count, 1);
 });
 
+test("GET transition actions exposes destinations and POST preserves explicit sort order", async () => {
+  const { app, baseUrl } = await start();
+  const task = createTask(app, "Explicit transition metadata");
+  const transitions = new TransitionService(app.database);
+  const expectedAction = actionTo(transitions, task.id, "none");
+
+  const listed = await request(baseUrl, `/api/tasks/${task.id}/transitions`);
+  assert.equal(listed.response.status, 200);
+  const action = listed.body.actions.find((candidate) => candidate.actionKey === expectedAction.actionKey);
+  assert.deepEqual(Object.keys(action).sort(), [
+    "actionKey", "requiresAcceptance", "toStageId", "toStatus", "toTerminalKind", "transitionId",
+  ]);
+  assert.equal(action.toStageId, expectedAction.toTaskStageId);
+  assert.equal(action.toStatus, destinationStatus(app, transitions.getTaskWorkflow(task.id).revisionId, expectedAction));
+  assert.equal(action.requiresAcceptance, false);
+
+  const moved = await request(baseUrl, `/api/tasks/${task.id}/transitions`, {
+    method: "POST",
+    headers: { "idempotency-key": "api-transition-sort-order-1" },
+    body: {
+      expectedStateVersion: task.version,
+      actionKey: action.actionKey,
+      gateEvidence: [],
+      sortOrder: 2500.5,
+    },
+  });
+  assert.equal(moved.response.status, 200, JSON.stringify(moved.body));
+  assert.equal(moved.body.task.sortOrder, 2500.5);
+});
+
 test("legacy PATCH status and /move use controlled legacy actions; mixed and completion bypasses are rejected", async () => {
   const { app, baseUrl } = await start();
   const transitions = new TransitionService(app.database);

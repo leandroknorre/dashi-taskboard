@@ -16,6 +16,7 @@ export class HumanAcceptanceService {
   constructor(taskboardDatabase, { provider = null, clock = now } = {}) { this.taskboardDatabase = taskboardDatabase; this.database = taskboardDatabase.database; this.provider = provider; this.clock = clock; this.ledger = new WorkflowLedger(this.database, { now: clock }); }
 
   async register(taskId, command, request) {
+    this.taskboardDatabase.assertTaskWritable(taskId);
     if (!this.provider || typeof this.provider.attest !== "function") throw new ApiError(503, "HUMAN_ACCEPTANCE_UNAVAILABLE", "Human acceptance is not configured for this server");
     const context = this.#context(taskId);
     if (context.task.version !== command.expectedStateVersion) throw new ApiError(409, "EXPECTED_STATE_CONFLICT", "Task changed since the requested acceptance state");

@@ -27,6 +27,35 @@ import { migrateLocalHumanAcceptance } from "./human-acceptance-schema.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
 const TASK_TREE_MAX_NODES = 1_000;
+const WORK_CARD_FIELD_OWNERSHIP = Object.freeze({
+  title: "local",
+  description: "local",
+  status: "local",
+  stageId: "local",
+  priority: "local",
+  labels: "local",
+  assignee: "local",
+  dueDate: "local",
+});
+const SOURCE_RECORD_FIELD_OWNERSHIP = Object.freeze({
+  title: "source",
+  description: "source",
+  status: "source",
+  stageId: "source",
+  priority: "source",
+  labels: "source",
+  sortOrder: "source",
+  startDate: "source",
+  dueDate: "source",
+  recurrence: "source",
+  externalKey: "source",
+  externalUrl: "source",
+  externalVersion: "source",
+  sourceFingerprint: "source",
+  candidateState: "local",
+});
+const WORK_CARD_FIELD_OWNERSHIP_JSON = JSON.stringify(WORK_CARD_FIELD_OWNERSHIP);
+const SOURCE_RECORD_FIELD_OWNERSHIP_JSON = JSON.stringify(SOURCE_RECORD_FIELD_OWNERSHIP);
 
 export class ApiError extends Error {
   constructor(status, code, message, details) {
@@ -252,6 +281,7 @@ function taskFromRow(row) {
     : row.git_branch
       ? { type: "branch", branch: row.git_branch }
       : null;
+  const kind = row.kind ?? "work_card";
   return {
     id: row.id,
     identifier: row.identifier,
@@ -282,6 +312,17 @@ function taskFromRow(row) {
     recurrence: row.recurrence_interval && row.recurrence_unit
       ? { interval: row.recurrence_interval, unit: row.recurrence_unit }
       : null,
+    kind,
+    readOnly: kind === "source_record",
+    sourceSystem: row.external_source ?? null,
+    externalId: row.external_id ?? null,
+    externalVersion: row.source_version ?? null,
+    sourceFingerprint: row.source_fingerprint ?? null,
+    fieldOwnership: JSON.parse(
+      row.field_ownership
+      ?? (kind === "source_record" ? SOURCE_RECORD_FIELD_OWNERSHIP_JSON : WORK_CARD_FIELD_OWNERSHIP_JSON),
+    ),
+    candidateState: row.candidate_state ?? null,
     source: row.external_source === "jira" ? "jira" : "local",
     externalOrigin: row.external_origin ?? null,
     externalKey: row.external_key ?? null,
@@ -294,6 +335,7 @@ function taskFromRow(row) {
 }
 
 function taskRelationSummaryFromRow(row) {
+  const kind = row.kind ?? "work_card";
   return {
     id: row.id,
     identifier: row.identifier,
@@ -302,6 +344,8 @@ function taskRelationSummaryFromRow(row) {
     title: row.title,
     status: row.status,
     priority: row.priority,
+    kind,
+    readOnly: kind === "source_record",
     assignee: {
       type: row.assignee_type,
       id: row.assignee_id,
@@ -530,6 +574,11 @@ export class TaskboardDatabase {
         external_id TEXT,
         external_key TEXT,
         external_url TEXT,
+        kind TEXT NOT NULL DEFAULT 'work_card' CHECK (kind IN ('work_card', 'source_record')),
+        source_version TEXT,
+        source_fingerprint TEXT,
+        field_ownership TEXT NOT NULL DEFAULT '${WORK_CARD_FIELD_OWNERSHIP_JSON}',
+        candidate_state TEXT CHECK (candidate_state IN ('available', 'adopted', 'merged', 'discarded')),
         archived_at TEXT,
         version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
         created_at TEXT NOT NULL,
@@ -780,6 +829,21 @@ export class TaskboardDatabase {
     }
     if (!migratedTaskColumns.some((column) => column.name === "external_url")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN external_url TEXT");
+    }
+    if (!migratedTaskColumns.some((column) => column.name === "kind")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'work_card' CHECK (kind IN ('work_card', 'source_record'))");
+    }
+    if (!migratedTaskColumns.some((column) => column.name === "source_version")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN source_version TEXT");
+    }
+    if (!migratedTaskColumns.some((column) => column.name === "source_fingerprint")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN source_fingerprint TEXT");
+    }
+    if (!migratedTaskColumns.some((column) => column.name === "field_ownership")) {
+      this.database.exec(`ALTER TABLE tasks ADD COLUMN field_ownership TEXT NOT NULL DEFAULT '${WORK_CARD_FIELD_OWNERSHIP_JSON}'`);
+    }
+    if (!migratedTaskColumns.some((column) => column.name === "candidate_state")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN candidate_state TEXT CHECK (candidate_state IN ('available', 'adopted', 'merged', 'discarded'))");
     }
     this.database.exec(`
       DROP INDEX IF EXISTS tasks_external_source_id;
@@ -2335,6 +2399,15 @@ export class TaskboardDatabase {
   }
 
   createTask(input) {
+    const kind = input.kind ?? "work_card";
+    if (kind !== "work_card" && kind !== "source_record") {
+      throw new ApiError(400, "INVALID_FIELD", "Task kind must be work_card or source_record");
+    }
+    if (kind === "source_record" && (!input.sourceSystem || !input.externalOrigin || !input.externalId)) {
+      throw new ApiError(400, "INVALID_FIELD", "A source_record requires sourceSystem, externalOrigin, and externalId");
+    }
+    const fieldOwnership = input.fieldOwnership
+      ?? (kind === "source_record" ? SOURCE_RECORD_FIELD_OWNERSHIP : WORK_CARD_FIELD_OWNERSHIP);
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const project = this.database.prepare(`
@@ -2399,8 +2472,13 @@ export class TaskboardDatabase {
           assignee_type, assignee_id, assignee_name, assignee_avatar_url,
           git_branch, worktree_path, worktree_branch,
           start_date, due_date, recurrence_interval, recurrence_unit,
+          external_source, external_origin, external_id, external_key, external_url,
+          kind, source_version, source_fingerprint, field_ownership, candidate_state,
           archived_at, version, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)
+        ) VALUES (
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?
+        )
       `).run(
         id,
         identifier,
@@ -2428,6 +2506,16 @@ export class TaskboardDatabase {
         input.dueDate,
         input.recurrence?.interval ?? null,
         input.recurrence?.unit ?? null,
+        input.sourceSystem ?? null,
+        input.externalOrigin ?? null,
+        input.externalId ?? null,
+        input.externalKey ?? null,
+        input.externalUrl ?? null,
+        kind,
+        input.externalVersion ?? null,
+        input.sourceFingerprint ?? null,
+        JSON.stringify(fieldOwnership),
+        kind === "source_record" ? (input.candidateState ?? "available") : null,
         timestamp,
         timestamp,
       );
@@ -2439,8 +2527,122 @@ export class TaskboardDatabase {
     }
   }
 
+  ingestSourceRecord(input) {
+    const externalOrigin = input.externalOrigin ?? "default";
+    const existingRow = this.database.prepare(`
+      SELECT * FROM tasks
+      WHERE external_source = ? AND external_origin = ? AND external_id = ?
+    `).get(input.sourceSystem, externalOrigin, input.externalId);
+    if (!existingRow) {
+      try {
+        return {
+          task: this.createTask({
+            ...input,
+            externalOrigin,
+            kind: "source_record",
+            candidateState: "available",
+            fieldOwnership: SOURCE_RECORD_FIELD_OWNERSHIP,
+          }),
+          created: true,
+          idempotent: false,
+        };
+      } catch (error) {
+        if (!String(error?.message).includes("UNIQUE constraint failed")) throw error;
+        const raced = this.database.prepare(`
+          SELECT * FROM tasks
+          WHERE external_source = ? AND external_origin = ? AND external_id = ?
+        `).get(input.sourceSystem, externalOrigin, input.externalId);
+        if (!raced) throw error;
+        return { task: this.getTask(raced.id), created: false, idempotent: true };
+      }
+    }
+
+    const current = taskFromRow(existingRow);
+    if (current.kind !== "source_record") {
+      throw new ApiError(409, "SOURCE_IDENTITY_CONFLICT", "External identity is already owned by a work_card");
+    }
+    if (current.projectId !== input.projectId) {
+      throw new ApiError(409, "SOURCE_RECORD_PROJECT_CONFLICT", "A source_record cannot move projects during ingest");
+    }
+    const stage = this.#resolveStage(input.projectId, input.stageId, input.status);
+    const next = {
+      title: input.title,
+      description: input.description,
+      status: stage.canonical_status,
+      stageId: stage.id,
+      priority: input.priority,
+      labels: input.labels,
+      sortOrder: input.sortOrder ?? current.sortOrder,
+      startDate: input.startDate,
+      dueDate: input.dueDate,
+      recurrence: input.recurrence,
+      externalVersion: input.externalVersion ?? null,
+      sourceFingerprint: input.sourceFingerprint ?? null,
+      externalKey: input.externalKey ?? null,
+      externalUrl: input.externalUrl ?? null,
+    };
+    const activityChanges = taskFieldChanges(current, next);
+    if (activityChanges.length === 0) {
+      return { task: this.getTask(current.id), created: false, idempotent: true };
+    }
+
+    const timestamp = now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.database.prepare(`
+        UPDATE tasks SET
+          title = ?, description = ?, status = ?, stage_id = ?, priority = ?, labels = ?,
+          sort_order = ?, start_date = ?, due_date = ?, recurrence_interval = ?, recurrence_unit = ?,
+          source_version = ?, source_fingerprint = ?, external_key = ?, external_url = ?,
+          field_ownership = ?, version = version + 1, updated_at = ?
+        WHERE id = ? AND version = ? AND kind = 'source_record'
+      `).run(
+        next.title,
+        next.description,
+        next.status,
+        next.stageId,
+        next.priority,
+        JSON.stringify(next.labels),
+        next.sortOrder,
+        next.startDate,
+        next.dueDate,
+        next.recurrence?.interval ?? null,
+        next.recurrence?.unit ?? null,
+        next.externalVersion,
+        next.sourceFingerprint,
+        next.externalKey,
+        next.externalUrl,
+        SOURCE_RECORD_FIELD_OWNERSHIP_JSON,
+        timestamp,
+        current.id,
+        current.version,
+      );
+      if (result.changes !== 1) this.#throwMissingOrConflict(current.id, current.version);
+      const project = this.database.prepare("SELECT labels FROM projects WHERE id = ?").get(current.projectId);
+      const projectLabels = JSON.parse(project.labels);
+      const mergedLabels = [...new Set([...projectLabels, ...next.labels])];
+      if (mergedLabels.length !== projectLabels.length) {
+        this.database.prepare("UPDATE projects SET labels = ?, updated_at = ? WHERE id = ?")
+          .run(JSON.stringify(mergedLabels), timestamp, current.projectId);
+      }
+      this.#recordTaskActivity(current.id, input.actor, activityChanges, timestamp);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    return { task: this.getTask(current.id), created: false, idempotent: false };
+  }
+
+  assertTaskWritable(id) {
+    const task = this.#requireTask(id);
+    this.#assertTaskWritable(task);
+    return task;
+  }
+
   updateTask(id, version, changes, threadId, threadBinding, actor) {
     const current = this.#requireTask(id);
+    this.#assertTaskWritable(current);
     this.#requireVersion(current, version);
     const targetProjectId = Object.hasOwn(changes, "projectId") ? changes.projectId : current.projectId;
     if (Object.hasOwn(changes, "stageId") || Object.hasOwn(changes, "status") || Object.hasOwn(changes, "projectId")) {
@@ -2589,6 +2791,7 @@ export class TaskboardDatabase {
 
   moveTask(id, version, status, sortOrder, threadId, threadBinding, actor, stageId) {
     const current = this.#requireTask(id);
+    this.#assertTaskWritable(current);
     this.#requireVersion(current, version);
     if (current.archivedAt !== null) {
       throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be moved");
@@ -2644,6 +2847,7 @@ export class TaskboardDatabase {
 
   archiveTask(id, version, threadId, threadBinding, actor) {
     const current = this.#requireTask(id);
+    this.#assertTaskWritable(current);
     this.#requireVersion(current, version);
     const timestamp = now();
     const storedBinding = storedThreadBindingForExisting(current, threadBinding, threadId);
@@ -2677,6 +2881,7 @@ export class TaskboardDatabase {
 
   restoreTask(id, version, threadId, threadBinding, actor) {
     const current = this.#requireTask(id);
+    this.#assertTaskWritable(current);
     this.#requireVersion(current, version);
     if (current.archivedAt === null) {
       throw new ApiError(409, "TASK_NOT_ARCHIVED", "Only archived tasks can be restored");
@@ -2715,6 +2920,7 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const current = this.#requireTask(id);
+      this.#assertTaskWritable(current);
       this.#requireVersion(current, version);
       if (current.archivedAt === null) {
         throw new ApiError(409, "TASK_NOT_ARCHIVED", "Only archived tasks can be deleted");
@@ -2739,6 +2945,8 @@ export class TaskboardDatabase {
     try {
       const task = this.#requireTask(id);
       const relatedTask = this.#requireTask(relatedId);
+      this.#assertTaskWritable(task);
+      this.#assertTaskWritable(relatedTask);
       this.#requireVersion(task, version);
       this.#validateRelationTasks(task, relatedTask);
 
@@ -2831,6 +3039,8 @@ export class TaskboardDatabase {
     try {
       const task = this.#requireTask(id);
       const relatedTask = this.#requireTask(relatedId);
+      this.#assertTaskWritable(task);
+      this.#assertTaskWritable(relatedTask);
       this.#requireVersion(task, version);
       this.#validateRelationTasks(task, relatedTask);
       const { relationType, sourceTaskId, targetTaskId } = this.#relationEndpoints(type, task.id, relatedTask.id);
@@ -2868,6 +3078,8 @@ export class TaskboardDatabase {
     try {
       const task = this.#requireTask(id);
       const relatedTask = this.#requireTask(relatedId);
+      this.#assertTaskWritable(task);
+      this.#assertTaskWritable(relatedTask);
       this.#requireVersion(task, version);
       this.#validateRelationTasks(task, relatedTask);
       const { relationType, sourceTaskId, targetTaskId } = this.#relationEndpoints(
@@ -2999,6 +3211,7 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(taskId);
+      this.#assertTaskWritable(task);
       const changeRevision = this.#nextCommentAttachmentRevision();
       this.database.prepare(`
         INSERT INTO comments (
@@ -3042,6 +3255,7 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const current = this.#requireComment(id);
+      this.#assertTaskWritable(this.#requireTask(current.taskId));
       this.#requireCommentVersion(current, version);
       const changeRevision = this.#nextCommentAttachmentRevision();
       const result = this.database.prepare(`
@@ -3063,6 +3277,7 @@ export class TaskboardDatabase {
 
   deleteComment(id, version) {
     const current = this.#requireComment(id);
+    this.#assertTaskWritable(this.#requireTask(current.taskId));
     this.#requireCommentVersion(current, version);
     const result = this.database.prepare(`
       DELETE FROM comments WHERE id = ? AND version = ?
@@ -3094,6 +3309,7 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(taskId);
+      this.#assertTaskWritable(task);
       const changeRevision = this.#nextCommentAttachmentRevision();
       this.database.prepare(`
         INSERT INTO attachments (
@@ -3129,6 +3345,7 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const comment = this.#requireComment(commentId);
+      this.#assertTaskWritable(this.#requireTask(comment.taskId));
       const changeRevision = this.#nextCommentAttachmentRevision();
       this.database.prepare(`
         INSERT INTO attachments (
@@ -3163,6 +3380,7 @@ export class TaskboardDatabase {
     if (!attachment) {
       throw new ApiError(404, "ATTACHMENT_NOT_FOUND", `Attachment '${id}' does not exist`);
     }
+    this.#assertTaskWritable(this.#requireTask(attachment.taskId));
     this.database.prepare("DELETE FROM attachments WHERE id = ?").run(id);
     return attachment;
   }
@@ -3437,6 +3655,16 @@ export class TaskboardDatabase {
       throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
     }
     return task;
+  }
+
+  #assertTaskWritable(task) {
+    if (task.kind === "source_record") {
+      throw new ApiError(
+        409,
+        "SOURCE_RECORD_READ_ONLY",
+        "source_record items are projections and can only change through the dedicated ingest lifecycle",
+      );
+    }
   }
 
   #requireComment(id) {

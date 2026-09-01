@@ -705,6 +705,47 @@ function parseTaskCreate(body) {
   return task;
 }
 
+function parseSourceRecordIngest(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "projectId", "title", "description", "status", "stageId", "priority", "labels", "sortOrder",
+    "threadId", "threadBinding", "startDate", "dueDate", "recurrence",
+    "sourceSystem", "externalOrigin", "externalId", "externalVersion", "sourceFingerprint",
+    "externalKey", "externalUrl",
+  ]));
+  const sourceSystem = stringField(body.sourceSystem, "sourceSystem", { required: true, maxLength: 64 });
+  if (!/^[a-z][a-z0-9_-]{0,63}$/.test(sourceSystem)) {
+    throw new ApiError(400, "INVALID_FIELD", "'sourceSystem' must be a stable lowercase identifier");
+  }
+  const task = {
+    projectId: validateProjectId(body.projectId ?? DEFAULT_PROJECT_ID),
+    title: stringField(body.title, "title", { required: true, maxLength: 240 }),
+    description: stringField(body.description ?? "", "description", { maxLength: 100_000 }),
+    status: parseStatus(body.status, "backlog"),
+    stageId: body.stageId === undefined ? undefined : stringField(body.stageId, "stageId", { required: true, maxLength: 64 }),
+    priority: parsePriority(body.priority, "none"),
+    labels: body.labels === undefined ? [] : parseLabels(body.labels),
+    sortOrder: body.sortOrder === undefined ? undefined : parseSortOrder(body.sortOrder),
+    threadId: parseThreadId(body.threadId),
+    threadBinding: parseThreadBinding(body.threadBinding),
+    developmentContext: null,
+    startDate: parseDueDate(body.startDate ?? null, "startDate"),
+    dueDate: parseDueDate(body.dueDate ?? null),
+    recurrence: parseRecurrence(body.recurrence ?? null),
+    sourceSystem,
+    externalOrigin: stringField(body.externalOrigin ?? "default", "externalOrigin", { required: true, maxLength: 128 }),
+    externalId: stringField(body.externalId, "externalId", { required: true, maxLength: 240 }),
+    externalVersion: stringField(body.externalVersion ?? null, "externalVersion", { nullable: true, maxLength: 240 }),
+    sourceFingerprint: stringField(body.sourceFingerprint ?? null, "sourceFingerprint", { nullable: true, maxLength: 256 }),
+    externalKey: stringField(body.externalKey ?? null, "externalKey", { nullable: true, maxLength: 240 }),
+    externalUrl: stringField(body.externalUrl ?? null, "externalUrl", { nullable: true, maxLength: 2048 }),
+  };
+  if (task.recurrence && !task.dueDate) {
+    throw new ApiError(400, "INVALID_FIELD", "A recurring source_record requires 'dueDate'");
+  }
+  return task;
+}
+
 function parseTaskPatch(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
@@ -752,7 +793,7 @@ function parseMove(body) {
 function parseTaskTransition(body, idempotencyHeader) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
-    "expectedStateVersion", "actionKey", "gateEvidence", "authorizationId",
+    "expectedStateVersion", "actionKey", "gateEvidence", "authorizationId", "sortOrder",
   ]));
   if (idempotencyHeader === undefined) {
     throw new ApiError(400, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key header is required");
@@ -764,13 +805,16 @@ function parseTaskTransition(body, idempotencyHeader) {
     throw new ApiError(400, "INVALID_FIELD", "'gateEvidence' must be an array");
   }
   return {
-    expectedStateVersion: body.expectedStateVersion,
-    actionKey: stringField(body.actionKey, "actionKey", { required: true, maxLength: 64 }),
-    gateEvidence: body.gateEvidence ?? [],
-    authorizationId: body.authorizationId === undefined
-      ? null
-      : stringField(body.authorizationId, "authorizationId", { nullable: true, maxLength: 96 }),
-    idempotencyKey: stringField(idempotencyHeader, "Idempotency-Key", { required: true, maxLength: 64 }),
+    command: {
+      expectedStateVersion: body.expectedStateVersion,
+      actionKey: stringField(body.actionKey, "actionKey", { required: true, maxLength: 64 }),
+      gateEvidence: body.gateEvidence ?? [],
+      authorizationId: body.authorizationId === undefined
+        ? null
+        : stringField(body.authorizationId, "authorizationId", { nullable: true, maxLength: 96 }),
+      idempotencyKey: stringField(idempotencyHeader, "Idempotency-Key", { required: true, maxLength: 64 }),
+    },
+    sortOrder: body.sortOrder === undefined ? undefined : parseSortOrder(body.sortOrder),
   };
 }
 
@@ -2896,6 +2940,21 @@ export function createTaskboardServer(options = {}) {
         );
       }
 
+      if (pathname === "/api/source-records") {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Source record ingest does not accept query parameters");
+        }
+        const actor = actorFromRequest(request);
+        const input = resolveInputThreadBinding(parseSourceRecordIngest(await readJson(request)));
+        if (input.projectId === JIRA_PROJECT_ID) {
+          throw new ApiError(409, "SOURCE_RECORD_PROJECT_UNAVAILABLE", "Dedicated source records cannot be ingested into the Jira synchronization project");
+        }
+        const result = database.ingestSourceRecord({ ...input, actor, assignee: actor });
+        events.emit(result.created ? "source-record.created" : "source-record.updated", { task: result.task });
+        return sendJson(response, result.created ? 201 : 200, result);
+      }
+
       if (pathname === "/api/tasks") {
         if (request.method === "GET") {
           const filters = parseTaskFilters(url.searchParams);
@@ -3357,7 +3416,10 @@ export function createTaskboardServer(options = {}) {
             actions: transitions.listActions(id).map((action) => ({
               actionKey: action.actionKey,
               transitionId: action.transitionId,
+              toStageId: action.toStageId,
+              toStatus: action.toStatus,
               toTerminalKind: action.toTerminalKind,
+              requiresAcceptance: action.requiresAcceptance,
             })),
           });
         }
@@ -3367,7 +3429,7 @@ export function createTaskboardServer(options = {}) {
         if (current.source === "jira") {
           throw new ApiError(409, "LOCAL_TRANSITION_UNAVAILABLE", "Jira-synchronized tasks remain controlled by Jira in this local-only transition phase");
         }
-        const command = parseTaskTransition(
+        const { command, sortOrder } = parseTaskTransition(
           await readJson(request),
           requestHeader(request, "idempotency-key"),
         );
@@ -3383,7 +3445,11 @@ export function createTaskboardServer(options = {}) {
             actionKey: command.actionKey,
           });
         }
-        const result = transitions.transition(id, command, { actor: actorFromRequest(request), request });
+        const result = transitions.transition(id, command, {
+          actor: actorFromRequest(request),
+          request,
+          sortOrder,
+        });
         events.emit("task.transitioned", { task: result.task, transition: result.request });
         return sendJson(response, 200, {
           task: result.task,
@@ -3405,6 +3471,7 @@ export function createTaskboardServer(options = {}) {
         if (id.length === 0 || id.length > 128) throw new ApiError(400, "INVALID_PATH", "Task id is invalid");
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         const command = parseHumanAcceptanceEvidence(await readJson(request), requestHeader(request, "idempotency-key"));
+        database.assertTaskWritable(id);
         await preauthenticateHumanAcceptance(request, {
           pathname,
           operation: "evidence",

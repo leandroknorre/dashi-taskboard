@@ -90,7 +90,7 @@ const COMMAND_OPTIONS = new Map([
     "if-version",
     "json",
   ])],
-  ["issue transition", new Set(["action-key", "gate-evidence", "authorization-id", "idempotency-key", "if-version", "json"])],
+  ["issue transition", new Set(["action-key", "gate-evidence", "authorization-id", "idempotency-key", "sort-order", "if-version", "json"])],
   ["issue archive", new Set(["thread-id", "if-version", "json"])],
   ["issue restore", new Set(["thread-id", "if-version", "json"])],
   ["issue tree", new Set(["direction", "depth", "json"])],
@@ -176,7 +176,8 @@ Actions:
      | --clear-binding-thread]
     [--if-version N] [--json]
   transition ISSUE_ID --action-key ACTION --idempotency-key KEY
-    [--gate-evidence JSON] [--authorization-id ID] [--if-version N] [--json]
+    [--gate-evidence JSON] [--authorization-id ID] [--sort-order NUMBER]
+    [--if-version N] [--json]
   archive ISSUE_ID [--thread-id ID] [--if-version N] [--json]
   restore ISSUE_ID [--thread-id ID] [--if-version N] [--json]
   tree ISSUE_ID --direction descendants|ancestors --depth N [--json]
@@ -945,11 +946,19 @@ async function transitionIssue(api, taskId, options) {
     try { gateEvidence = JSON.parse(options["gate-evidence"]); } catch { throw usageError("--gate-evidence must be JSON"); }
     if (!Array.isArray(gateEvidence)) throw usageError("--gate-evidence must be a JSON array");
   }
+  let sortOrder;
+  if (options["sort-order"] !== undefined) {
+    sortOrder = Number(options["sort-order"]);
+    if (!Number.isFinite(sortOrder) || Math.abs(sortOrder) > 1_000_000_000_000) {
+      throw usageError("--sort-order must be a finite number between -1000000000000 and 1000000000000");
+    }
+  }
   return api.request("POST", `${taskPath(taskId)}/transitions`, {
     expectedStateVersion: await resolveVersion(api, taskId, options["if-version"]),
     actionKey,
     gateEvidence,
     ...optionalField("authorizationId", options["authorization-id"]),
+    ...optionalField("sortOrder", sortOrder),
   }, { headers: { "idempotency-key": idempotencyKey } });
 }
 
