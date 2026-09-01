@@ -4112,7 +4112,9 @@ export function App() {
                 type="button"
                 onClick={() => {
                   if (bannerControl === "reauthenticate") {
-                    window.location.reload();
+                    setActionError(null);
+                    setConnection("reconnecting");
+                    invalidateCloudData();
                     return;
                   }
                   setActionError(null);

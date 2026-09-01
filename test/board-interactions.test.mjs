@@ -178,6 +178,10 @@ test("workflow blockers, authentication, conflicts and outages keep distinct UI 
   assert.match(feedback, /failure\.kind === "conflict"[\s\S]*?control: "refresh"/);
   assert.match(feedback, /failure\.kind === "unavailable"[\s\S]*?control: "retry"/);
   assert.match(appSource, /bannerControl === "reauthenticate"[\s\S]*?"Sign in again"/);
+  assert.match(
+    appSource,
+    /bannerControl === "reauthenticate"[\s\S]*?setConnection\("reconnecting"\)[\s\S]*?invalidateCloudData\(\)/,
+  );
   assert.match(appSource, /bannerControl === "refresh"[\s\S]*?"Refresh"[\s\S]*?"Try again"/);
 });
 
