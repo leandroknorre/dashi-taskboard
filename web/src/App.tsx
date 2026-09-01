@@ -16,6 +16,7 @@ import {
   ApiError,
   addTaskRelation,
   archiveTask as archiveTaskRequest,
+  classifyTaskMutationFailure,
   createProjectLabel as createProjectLabelRequest,
   createProject as createProjectRequest,
   createTask as createTaskRequest,
@@ -183,7 +184,17 @@ type NestedWorkspaceLoad = {
   error: string | null;
 };
 type GanttZoom = "day" | "week" | "month";
-type ActionError = string | readonly [string, string];
+type LocalizedActionError = string | readonly [string, string];
+type ActionErrorControl = "retry" | "reauthenticate" | "refresh";
+type ActionErrorDetail = {
+  message: LocalizedActionError;
+  control: ActionErrorControl | null;
+};
+type ActionError = LocalizedActionError | ActionErrorDetail;
+
+function isActionErrorDetail(error: ActionError): error is ActionErrorDetail {
+  return typeof error === "object" && !Array.isArray(error);
+}
 type ProjectLoadError = {
   source: "projects";
   operation: "initial" | "refresh";
@@ -800,11 +811,18 @@ export function App() {
   const [tasksLoadError, setTasksLoadError] = useState<TasksLoadError | null>(null);
   const loadError: LoadError | null = projectLoadError ?? tasksLoadError;
   const [actionError, setActionError] = useState<ActionError | null>(null);
-  const actionErrorText = actionError === null
+  const actionErrorValue = actionError !== null && isActionErrorDetail(actionError)
+    ? actionError.message
+    : actionError;
+  const actionErrorText = actionErrorValue === null
     ? null
-    : typeof actionError === "string"
-      ? actionError
-      : text(actionError[0], actionError[1]);
+    : typeof actionErrorValue === "string"
+      ? actionErrorValue
+      : text(actionErrorValue[0], actionErrorValue[1]);
+  const actionErrorControl = actionError !== null && isActionErrorDetail(actionError)
+    ? actionError.control
+    : null;
+  const bannerControl = actionError !== null ? actionErrorControl : loadError ? "retry" : null;
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [search, setSearch] = useState("");
   const [filters, setFilters] = useState(readTaskFilters);
@@ -907,6 +925,57 @@ export function App() {
       "加载议题时出现问题。",
       "Something went wrong while loading your issues.",
     );
+  }
+  function taskMutationActionError(error: unknown): ActionErrorDetail {
+    const failure = classifyTaskMutationFailure(error);
+    if (failure.kind === "blocker") {
+      const blockerNames = failure.taskIds.flatMap((id) => {
+        const blocker = tasksRef.current.find((candidate) => candidate.id === id);
+        return blocker ? [`${blocker.identifier} — ${blocker.title}`] : [];
+      });
+      const visibleBlockers = blockerNames.slice(0, 3);
+      const remaining = Math.max(0, failure.taskIds.length - visibleBlockers.length);
+      const detail = visibleBlockers.length > 0
+        ? ` Complete first: ${visibleBlockers.join("; ")}${remaining > 0 ? `; and ${remaining} more` : ""}.`
+        : failure.taskIds.length > 0
+          ? ` ${failure.taskIds.length} required sub-issue${failure.taskIds.length === 1 ? " is" : "s are"} still open.`
+          : " A required sub-issue is still open.";
+      return {
+        message: [
+          "完成此议题前，请先完成所有必需的子议题。",
+          `This issue cannot be completed yet.${detail}`,
+        ],
+        control: null,
+      };
+    }
+    if (failure.kind === "authentication") {
+      return {
+        message: [
+          "登录已过期。请重新登录后再次操作。",
+          "Your sign-in expired. Sign in again before changing this issue.",
+        ],
+        control: "reauthenticate",
+      };
+    }
+    if (failure.kind === "conflict") {
+      return {
+        message: [
+          "该议题已在其他位置更新。请刷新后再试。",
+          "This issue changed elsewhere. Refresh it before trying again.",
+        ],
+        control: "refresh",
+      };
+    }
+    if (failure.kind === "unavailable") {
+      return {
+        message: [
+          "暂时无法连接 Taskboard 服务。议题未被移动。",
+          "The Taskboard service is unavailable. The issue was not moved.",
+        ],
+        control: "retry",
+      };
+    }
+    return { message: errorMessage(error), control: null };
   }
   const pendingAutomationRequestsRef = useRef(new Map<string, PendingAutomationRequest>());
   const automationRequestInFlightRef = useRef<"list" | "save" | null>(null);
@@ -2932,12 +3001,12 @@ export function App() {
     beforeTaskId: string | null = null,
     useDropPosition = false,
     stageId?: string,
-  ) {
+  ): Promise<Task | null> {
     if (movingTaskId) {
       setDropTarget(null);
       setDraggedTaskId(null);
       setDraggedTaskHeight(0);
-      return;
+      return null;
     }
 
     const destination = tasks.filter((candidate) => (
@@ -2966,7 +3035,7 @@ export function App() {
       setDropTarget(null);
       setDraggedTaskId(null);
       setDraggedTaskHeight(0);
-      return;
+      return task;
     }
     const previousTask = destination[targetIndex - 1] ?? null;
     const nextTask = destination[targetIndex] ?? null;
@@ -2985,27 +3054,27 @@ export function App() {
     )));
 
     try {
-      const moved = await moveTaskRequest(task, status, sortOrder, undefined, undefined, stageId);
+      const moved = await moveTaskRequest(task, status, sortOrder, stageId);
       setTasks((current) => sortTasks(current.map((candidate) =>
         candidate.id === moved.id ? moved : candidate,
       )));
       pushUndo(null, async () => {
         const candidate = tasksRef.current.find((current) => current.id === moved.id);
         const current = candidate && candidate.version >= moved.version ? candidate : moved;
-        const restored = await moveTaskRequest(current, previous.status, previous.sortOrder, undefined, undefined, previous.stageId ?? undefined);
+        const restored = await moveTaskRequest(current, previous.status, previous.sortOrder, previous.stageId ?? undefined);
         setTasks((tasks) => sortTasks(tasks.map((item) => item.id === restored.id ? restored : item)));
       });
+      return moved;
     } catch (error) {
       setTasks((current) => sortTasks(current.map((candidate) =>
         candidate.id === previous.id ? previous : candidate,
       )));
-      setActionError(error instanceof ApiError && error.code === "VERSION_CONFLICT"
-        ? textRef.current(
-          "该议题已在其他位置更新，看板已重新同步。",
-          "This issue changed elsewhere. The board has been synced.",
-        )
-        : errorMessage(error));
-      if (taskScopeProjectId) void refreshTasks(taskScopeProjectId, { quiet: true });
+      const failure = classifyTaskMutationFailure(error);
+      setActionError(taskMutationActionError(error));
+      if (failure.kind === "conflict" && taskScopeProjectId) {
+        void refreshTasks(taskScopeProjectId, { quiet: true });
+      }
+      return null;
     } finally {
       setMovingTaskId(null);
       setDropTarget(null);
@@ -4038,19 +4107,29 @@ export function App() {
           <div className="error-banner" role="alert">
             <span className="error-mark" aria-hidden="true"><LinearIcon name="alert" /></span>
             <div><strong>{text("任务面板需要处理", "Taskboard needs attention")}</strong><p>{actionErrorText ?? loadError?.message}</p></div>
-            <button
-              type="button"
-              onClick={() => {
-                setActionError(null);
-                if (loadError?.source === "projects") {
-                  if (loadError.operation === "initial") void loadProjectList();
-                  else void refreshProjectList();
-                } else if (taskScopeProjectId) void refreshTasks(taskScopeProjectId);
-                else void loadProjectList();
-              }}
-            >
-              {text("重试", "Try again")}
-            </button>
+            {bannerControl && (
+              <button
+                type="button"
+                onClick={() => {
+                  if (bannerControl === "reauthenticate") {
+                    window.location.reload();
+                    return;
+                  }
+                  setActionError(null);
+                  if (loadError?.source === "projects") {
+                    if (loadError.operation === "initial") void loadProjectList();
+                    else void refreshProjectList();
+                  } else if (taskScopeProjectId) void refreshTasks(taskScopeProjectId);
+                  else void loadProjectList();
+                }}
+              >
+                {bannerControl === "reauthenticate"
+                  ? text("重新登录", "Sign in again")
+                  : bannerControl === "refresh"
+                    ? text("刷新", "Refresh")
+                    : text("重试", "Try again")}
+              </button>
+            )}
           </div>
         )}
 
@@ -4070,6 +4149,7 @@ export function App() {
             onCreateLabel={persistProjectLabel}
             onDeleteLabel={removeProjectLabel}
             onUpdate={(current, changes) => updateTaskProperties(current, changes)}
+            onStatusChange={(current, status, stageId) => moveTask(current, status, null, false, stageId)}
             onOpenTask={openTaskDetail}
             onOpenWorkspace={openNestedWorkspaceFromDetail}
             onAddRelation={(current, type, relatedTaskId, origin) => (

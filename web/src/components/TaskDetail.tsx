@@ -116,6 +116,7 @@ interface TaskDetailProps {
   onCreateLabel: (label: string) => Promise<void>;
   onDeleteLabel: (label: string) => Promise<void>;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
+  onStatusChange: (task: Task, status: TaskStatus, stageId?: string) => Promise<Task | null>;
   onOpenTask: (task: TaskRelationSummary) => void;
   onOpenWorkspace: (identifier: string) => void;
   onAddRelation: (
@@ -395,6 +396,7 @@ export function TaskDetail({
   onCreateLabel,
   onDeleteLabel,
   onUpdate,
+  onStatusChange,
   onOpenTask,
   onOpenWorkspace,
   onAddRelation,
@@ -578,7 +580,10 @@ export function TaskDetail({
     setSavingProperty(property);
     onError(null);
     try {
-      const saved = await onUpdate(currentTask, changes);
+      const saved = property === "status" && changes.status
+        ? await onStatusChange(currentTask, changes.status, changes.stageId)
+        : await onUpdate(currentTask, changes);
+      if (!saved) return null;
       setCurrentTask(saved);
       setTitle(saved.title);
       setDescription(saved.description);
@@ -787,10 +792,15 @@ export function TaskDetail({
       if (commentAttachmentInputRef.current) commentAttachmentInputRef.current.value = "";
       let relationAnchor = await getTask(currentTask.id);
       if (changeStatusToTodo) {
-        const saved = await onUpdate(relationAnchor, { status: "todo" });
-        setCurrentTask(saved);
-        relationAnchor = saved;
-        setChangeStatusToTodo(false);
+        const todoStageId = workflowStages?.find((stage) => (
+          stage.active && stage.canonicalStatus === "todo" && stage.isDefaultForStatus
+        ))?.stageId;
+        const saved = await onStatusChange(relationAnchor, "todo", todoStageId);
+        if (saved) {
+          setCurrentTask(saved);
+          relationAnchor = saved;
+          setChangeStatusToTodo(false);
+        }
       }
       const savedWithRelations = await addMentionRelations(relationAnchor, commentSegments);
       setCurrentTask(savedWithRelations);

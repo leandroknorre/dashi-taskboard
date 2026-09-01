@@ -145,7 +145,7 @@ test("common issue mutations enter a Linear-style undo queue", () => {
   assert.match(apiSource, /export async function restoreTask/);
 });
 
-test("detail status changes preserve the atomic PATCH transition contract", () => {
+test("detail and board status changes share the controlled transition adapter", () => {
   const updateProperties = appSource.slice(
     appSource.indexOf("async function updateTaskProperties"),
     appSource.indexOf("async function persistProjectLabel"),
@@ -157,13 +157,28 @@ test("detail status changes preserve the atomic PATCH transition contract", () =
 
   assert.match(
     detailSource,
-    /void saveTask\(stage \? \{ status: stage\.canonicalStatus, stageId \} : \{ status: stageId as TaskStatus \}, "status"\)/,
+    /await onStatusChange\(currentTask, changes\.status, changes\.stageId\)/,
   );
+  assert.match(appSource, /onStatusChange=\{\(current, status, stageId\) => moveTask\(current, status, null, false, stageId\)\}/);
   assert.match(updateProperties, /updateTaskRequest\(task, changes\)/);
   assert.doesNotMatch(updateProperties, /taskToDraft\(task\)/);
   assert.match(restoreTaskDetails, /restoreTaskDraftChanges\(snapshot, changed\)/);
   assert.doesNotMatch(restoreTaskDetails, /taskToDraft\(snapshot\)/);
-  assert.match(apiSource, /export async function moveTask[\s\S]*?\/move[\s\S]*?method: "POST"/);
+  assert.match(apiSource, /export async function moveTask[\s\S]*?\/transitions[\s\S]*?\/evidence[\s\S]*?Idempotency-Key/);
+});
+
+test("workflow blockers, authentication, conflicts and outages keep distinct UI actions", () => {
+  const feedback = appSource.slice(
+    appSource.indexOf("function taskMutationActionError"),
+    appSource.indexOf("const pendingAutomationRequestsRef"),
+  );
+
+  assert.match(feedback, /failure\.kind === "blocker"[\s\S]*?control: null/);
+  assert.match(feedback, /failure\.kind === "authentication"[\s\S]*?control: "reauthenticate"/);
+  assert.match(feedback, /failure\.kind === "conflict"[\s\S]*?control: "refresh"/);
+  assert.match(feedback, /failure\.kind === "unavailable"[\s\S]*?control: "retry"/);
+  assert.match(appSource, /bannerControl === "reauthenticate"[\s\S]*?"Sign in again"/);
+  assert.match(appSource, /bannerControl === "refresh"[\s\S]*?"Refresh"[\s\S]*?"Try again"/);
 });
 
 test("issues expose processing conversations without manual binding", () => {

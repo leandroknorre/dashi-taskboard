@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { moveTask, restoreTaskDraftChanges, updateTask } from "./api";
+import {
+  ApiError,
+  classifyTaskMutationFailure,
+  moveTask,
+  restoreTaskDraftChanges,
+  updateTask,
+} from "./api";
 import type { Task, TaskDraft } from "./types";
 
 const task: Task = {
@@ -67,6 +73,36 @@ function requestBody(request: RecordedRequest) {
   return JSON.parse(String(request.init?.body));
 }
 
+function jsonResponse(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function requestPath(request: RecordedRequest) {
+  return new URL(String(request.input), document.baseURI).pathname;
+}
+
+function idempotencyKey(request: RecordedRequest) {
+  return new Headers(request.init?.headers).get("Idempotency-Key");
+}
+
+const completionAction = {
+  actionKey: "complete-review",
+  transitionId: "complete-review",
+  toStageId: "done",
+  toStatus: "done" as const,
+  toTerminalKind: "completed" as const,
+  requiresAcceptance: true,
+};
+
+const acceptanceEvidence = {
+  evidenceId: "11111111-1111-4111-8111-111111111111",
+  gateId: "human-acceptance",
+  type: "human_acceptance",
+};
+
 describe("task mutation payloads", () => {
   it("sends the detail review-to-done transition as one atomic PATCH", async () => {
     const requests = mockFetch();
@@ -111,14 +147,155 @@ describe("task mutation payloads", () => {
     expect(restoreChanges).toEqual({ status: "in_review", stageId: "review" });
   });
 
-  it("keeps board moves on POST /move", async () => {
+  it("uses actions, human evidence, and a transition to complete an issue", async () => {
+    const requests: RecordedRequest[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = { input, init };
+      requests.push(request);
+      if (requestPath(request).endsWith("/transitions") && (init?.method ?? "GET") === "GET") {
+        return jsonResponse({ actions: [completionAction] });
+      }
+      if (requestPath(request).endsWith("/evidence")) {
+        return jsonResponse({ evidence: acceptanceEvidence }, 201);
+      }
+      return jsonResponse({ task: { ...task, status: "done", stageId: "done", version: 13 } });
+    }));
+
+    const moved = await moveTask(task, "done", 40, "done");
+
+    expect(moved.status).toBe("done");
+    expect(requests.map(requestPath)).toEqual([
+      "/api/tasks/task-1/transitions",
+      "/api/tasks/task-1/evidence",
+      "/api/tasks/task-1/transitions",
+    ]);
+    expect(requestBody(requests[1]!)).toEqual({
+      expectedStateVersion: 12,
+      actionKey: "complete-review",
+    });
+    expect(requestBody(requests[2]!)).toEqual({
+      expectedStateVersion: 12,
+      actionKey: "complete-review",
+      gateEvidence: [acceptanceEvidence],
+      sortOrder: 40,
+    });
+    expect(idempotencyKey(requests[1]!)).toMatch(/^task-evidence-/);
+    expect(idempotencyKey(requests[2]!)).toMatch(/^task-transition-/);
+    expect(idempotencyKey(requests[1]!)).not.toBe(idempotencyKey(requests[2]!));
+  });
+
+  it("retries uncertain idempotent writes with the same keys", async () => {
+    const requests: RecordedRequest[] = [];
+    let evidenceAttempts = 0;
+    let transitionAttempts = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = { input, init };
+      requests.push(request);
+      const pathname = requestPath(request);
+      if (pathname.endsWith("/transitions") && (init?.method ?? "GET") === "GET") {
+        return jsonResponse({ actions: [completionAction] });
+      }
+      if (pathname.endsWith("/evidence")) {
+        evidenceAttempts += 1;
+        if (evidenceAttempts === 1) throw new TypeError("connection reset after write");
+        return jsonResponse({ evidence: acceptanceEvidence }, 201);
+      }
+      transitionAttempts += 1;
+      if (transitionAttempts === 1) throw new TypeError("connection reset after transition");
+      return jsonResponse({ task: { ...task, status: "done", stageId: "done", version: 13 } });
+    }));
+
+    await expect(moveTask(task, "done", 40, "done")).resolves.toMatchObject({ status: "done" });
+
+    const evidenceRequests = requests.filter((request) => requestPath(request).endsWith("/evidence"));
+    const transitionRequests = requests.filter((request) => (
+      requestPath(request).endsWith("/transitions") && request.init?.method === "POST"
+    ));
+    expect(evidenceRequests).toHaveLength(2);
+    expect(transitionRequests).toHaveLength(2);
+    expect(idempotencyKey(evidenceRequests[0]!)).toBe(idempotencyKey(evidenceRequests[1]!));
+    expect(idempotencyKey(transitionRequests[0]!)).toBe(idempotencyKey(transitionRequests[1]!));
+  });
+
+  it("preserves the reorder-only /move path without bypassing a stage transition", async () => {
     const requests = mockFetch();
 
-    await moveTask(task, "done", undefined, undefined, undefined, "done");
+    await moveTask(task, "in_review", 22, "review");
 
     expect(requests).toHaveLength(1);
-    expect(new URL(String(requests[0]?.input), document.baseURI).pathname).toBe("/api/tasks/task-1/move");
-    expect(requests[0]?.init?.method).toBe("POST");
-    expect(requestBody(requests[0]!)).toEqual({ version: 12, status: "done", stageId: "done" });
+    expect(requestPath(requests[0]!)).toBe("/api/tasks/task-1/move");
+    expect(requestBody(requests[0]!)).toEqual({
+      version: 12,
+      status: "in_review",
+      stageId: "review",
+      sortOrder: 22,
+    });
+  });
+
+  it("surfaces a transition version conflict without retrying the write", async () => {
+    const requests: RecordedRequest[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = { input, init };
+      requests.push(request);
+      if (requestPath(request).endsWith("/transitions") && (init?.method ?? "GET") === "GET") {
+        return jsonResponse({ actions: [completionAction] });
+      }
+      if (requestPath(request).endsWith("/evidence")) {
+        return jsonResponse({ evidence: acceptanceEvidence }, 201);
+      }
+      return jsonResponse({
+        error: { code: "EXPECTED_STATE_CONFLICT", message: "Task changed" },
+      }, 409);
+    }));
+
+    await expect(moveTask(task, "done", 40, "done")).rejects.toMatchObject({
+      code: "EXPECTED_STATE_CONFLICT",
+      status: 409,
+    });
+    expect(requests.filter((request) => request.init?.method === "POST")).toHaveLength(2);
+  });
+
+  it("recognizes an Access redirect before attempting a mutation", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, {
+      status: 302,
+      headers: { Location: "https://login.example.test/" },
+    })));
+
+    await expect(moveTask(task, "done", 40, "done")).rejects.toMatchObject({
+      code: "ACCESS_AUTHENTICATION_REQUIRED",
+      status: 401,
+    });
+  });
+});
+
+describe("task mutation failures", () => {
+  it("keeps business blockers separate from service availability", () => {
+    const blocker = new ApiError(409, {
+      error: {
+        code: "REQUIRED_DESCENDANT_INCOMPLETE",
+        message: "Required descendants remain open",
+        details: { taskIds: ["child-1", "child-2"] },
+      },
+    });
+
+    expect(classifyTaskMutationFailure(blocker)).toEqual({
+      kind: "blocker",
+      taskIds: ["child-1", "child-2"],
+    });
+    expect(classifyTaskMutationFailure(new ApiError(401, {
+      error: { code: "ACCESS_AUTHENTICATION_REQUIRED" },
+    }))).toEqual({ kind: "authentication" });
+    expect(classifyTaskMutationFailure(new ApiError(403, {
+      error: { code: "HUMAN_ACTOR_REQUIRED" },
+    }))).toEqual({ kind: "authentication" });
+    expect(classifyTaskMutationFailure(new ApiError(409, {
+      error: { code: "EXPECTED_STATE_CONFLICT" },
+    }))).toEqual({ kind: "conflict" });
+    expect(classifyTaskMutationFailure(new ApiError(0, {
+      error: { code: "SERVICE_UNAVAILABLE" },
+    }))).toEqual({ kind: "unavailable" });
+    expect(classifyTaskMutationFailure(new ApiError(409, {
+      error: { code: "ACTION_NOT_FOUND" },
+    }))).toEqual({ kind: "other" });
   });
 });

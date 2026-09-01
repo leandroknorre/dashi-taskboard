@@ -100,7 +100,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   for (let attempt = 0; ; attempt += 1) {
     try {
-      response = await fetch(resolveTaskboardUrl(path), { ...init, headers });
+      response = await fetch(resolveTaskboardUrl(path), { ...init, headers, redirect: "manual" });
       break;
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") throw error;
@@ -129,6 +129,24 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
         },
       });
     }
+  }
+  if (
+    response.type === "opaqueredirect"
+    || response.status === 301
+    || response.status === 302
+    || response.status === 303
+    || response.status === 307
+    || response.status === 308
+  ) {
+    throw new ApiError(401, {
+      error: {
+        code: "ACCESS_AUTHENTICATION_REQUIRED",
+        message: apiText(
+          "Taskboard 登录已过期，请重新登录。",
+          "Your Taskboard sign-in expired. Sign in again.",
+        ),
+      },
+    });
   }
   let body: T & ApiErrorBody;
   try {
@@ -659,25 +677,132 @@ export async function moveTask(
   task: Task,
   status: TaskStatus,
   sortOrder?: number,
-  threadBinding?: CodexThreadBinding | null,
-  threadId?: string,
   stageId?: string,
 ): Promise<Task> {
-  const data = await request<{ task: Task }>(
-    `/api/tasks/${encodeURIComponent(task.id)}/move`,
+  const sameStage = stageId !== undefined
+    ? task.stageId === stageId
+    : task.status === status;
+  if (sameStage) {
+    const data = await request<{ task: Task }>(
+      `/api/tasks/${encodeURIComponent(task.id)}/move`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          version: task.version,
+          status,
+          ...(stageId ? { stageId } : {}),
+          ...(sortOrder === undefined ? {} : { sortOrder }),
+        }),
+      },
+    );
+    return data.task;
+  }
+
+  const { actions } = await request<{ actions: TaskTransitionAction[] }>(
+    `/api/tasks/${encodeURIComponent(task.id)}/transitions`,
+  );
+  const candidates = actions.filter((action) => (
+    stageId !== undefined ? action.toStageId === stageId : action.toStatus === status
+  ));
+  if (candidates.length !== 1) {
+    throw new ApiError(409, {
+      error: {
+        code: candidates.length === 0 ? "ACTION_NOT_FOUND" : "AMBIGUOUS_TRANSITION",
+        message: candidates.length === 0
+          ? apiText(
+              "当前流程不允许移动到所选阶段。",
+              "The current workflow does not allow moving to the selected stage.",
+            )
+          : apiText(
+              "多个流程动作指向所选状态，请选择具体阶段。",
+              "More than one workflow action reaches that status. Choose a specific stage.",
+            ),
+      },
+    });
+  }
+  const action = candidates[0]!;
+  const operationId = crypto.randomUUID();
+  let gateEvidence: unknown[] = [];
+  if (action.requiresAcceptance) {
+    const evidence = await retryIdempotentRequest(() => request<{ evidence: unknown }>(
+      `/api/tasks/${encodeURIComponent(task.id)}/evidence`,
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": `task-evidence-${operationId}` },
+        body: JSON.stringify({
+          expectedStateVersion: task.version,
+          actionKey: action.actionKey,
+        }),
+      },
+    ));
+    gateEvidence = [evidence.evidence];
+  }
+  const data = await retryIdempotentRequest(() => request<{ task: Task }>(
+    `/api/tasks/${encodeURIComponent(task.id)}/transitions`,
     {
       method: "POST",
+      headers: { "Idempotency-Key": `task-transition-${operationId}` },
       body: JSON.stringify({
-        version: task.version,
-        status,
-        ...(stageId ? { stageId } : {}),
+        expectedStateVersion: task.version,
+        actionKey: action.actionKey,
+        gateEvidence,
         ...(sortOrder === undefined ? {} : { sortOrder }),
-        ...(threadBinding === undefined ? {} : { threadBinding }),
-        ...(threadId ? { threadId } : {}),
       }),
     },
-  );
+  ));
   return data.task;
+}
+
+export interface TaskTransitionAction {
+  actionKey: string;
+  transitionId: string;
+  toStageId: string;
+  toStatus: TaskStatus;
+  toTerminalKind: "none" | "completed" | "canceled";
+  requiresAcceptance: boolean;
+}
+
+export type TaskMutationFailure =
+  | { kind: "blocker"; taskIds: string[] }
+  | { kind: "authentication" }
+  | { kind: "conflict" }
+  | { kind: "unavailable" }
+  | { kind: "other" };
+
+export function classifyTaskMutationFailure(error: unknown): TaskMutationFailure {
+  if (!(error instanceof ApiError)) return { kind: "other" };
+  if (error.code === "REQUIRED_DESCENDANT_INCOMPLETE") {
+    const taskIds = error.details && typeof error.details === "object" && "taskIds" in error.details
+      && Array.isArray(error.details.taskIds)
+      ? error.details.taskIds.filter((value): value is string => typeof value === "string")
+      : [];
+    return { kind: "blocker", taskIds };
+  }
+  if (
+    error.code === "ACCESS_AUTHENTICATION_REQUIRED"
+    || error.status === 401
+    || error.status === 403
+  ) return { kind: "authentication" };
+  if (
+    error.code === "VERSION_CONFLICT"
+    || error.code === "EXPECTED_STATE_CONFLICT"
+  ) return { kind: "conflict" };
+  if (
+    error.code === "SERVICE_UNAVAILABLE"
+    || error.status === 0
+    || error.status >= 500
+  ) return { kind: "unavailable" };
+  return { kind: "other" };
+}
+
+async function retryIdempotentRequest<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    const failure = classifyTaskMutationFailure(error);
+    if (failure.kind !== "unavailable") throw error;
+    return operation();
+  }
 }
 
 export async function archiveTask(task: Task, threadId?: string): Promise<Task> {
