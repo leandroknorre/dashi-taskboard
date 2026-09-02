@@ -26,10 +26,12 @@ const BOOLEAN_OPTIONS = new Set(["json", "clear-binding-thread", "help"]);
 const GLOBAL_OPTIONS = new Set(["runtime-file"]);
 
 const COMMAND_OPTIONS = new Map([
-  ["project list", new Set(["json"])],
+  ["project list", new Set(["archived", "json"])],
   ["project create", new Set(["id", "name", "workspace-path", "json"])],
   ["project map", new Set(["workspace-path", "json"])],
   ["project readme", new Set(["content", "file", "if-version", "json"])],
+  ["project archive", new Set(["idempotency-key", "if-version", "json"])],
+  ["project restore", new Set(["idempotency-key", "if-version", "json"])],
   ["cloud login", new Set(["url", "actor-name", "json"])],
   ["cloud status", new Set(["json"])],
   ["cloud logout", new Set(["json"])],
@@ -96,6 +98,10 @@ const COMMAND_OPTIONS = new Map([
   ["issue tree", new Set(["direction", "depth", "json"])],
   ["issue rollup", new Set(["json"])],
   ["issue relation", new Set(["type", "issue", "metadata", "thread-id", "if-version", "json"])],
+  ["source-record adopt", new Set(["project", "idempotency-key", "if-version", "json"])],
+  ["source-record merge", new Set(["issue", "idempotency-key", "if-version", "json"])],
+  ["source-record discard", new Set(["idempotency-key", "if-version", "json"])],
+  ["source-record restore", new Set(["idempotency-key", "if-version", "json"])],
   ["comment list", new Set(["after", "json"])],
   ["comment add", new Set([
     "body",
@@ -122,14 +128,16 @@ const HELP_TEXT = new Map([
 
 Commands:
   context current [--cwd PATH] [--json]
-  project list
+  project list [--archived true|false|all]
   project create --name NAME [--id ID] [--workspace-path PATH]
   project map PROJECT_ID --workspace-path PATH
   project readme get [PROJECT_ID]
   project readme set [PROJECT_ID] (--content TEXT | --file FILE) [--if-version N]
+  project archive|restore PROJECT_ID --idempotency-key KEY [--if-version N]
   cloud login --url URL --actor-name NAME
   cloud status|logout
   issue list|get|create|update|move|transition|archive|restore|tree|rollup|relation
+  source-record adopt|merge|discard|restore SOURCE_RECORD_ID
   comment list ISSUE_ID [--after CURSOR]
   comment add ISSUE_ID (--body TEXT | --body-file FILE) [--thread-id ID]
   comment update COMMENT_ID --body TEXT --if-version N [--thread-id ID]
@@ -191,6 +199,13 @@ Priorities: none, urgent, high, medium, low
 
 Example:
   taskctl issue get LOCAL-275 --json`],
+  ["source-record", `Usage: taskctl source-record ACTION SOURCE_RECORD_ID [options]
+
+Actions:
+  adopt SOURCE_RECORD_ID --project PROJECT_ID --idempotency-key KEY [--if-version N]
+  merge SOURCE_RECORD_ID --issue WORK_CARD_ID --idempotency-key KEY [--if-version N]
+  discard SOURCE_RECORD_ID --idempotency-key KEY [--if-version N]
+  restore SOURCE_RECORD_ID --idempotency-key KEY [--if-version N]`],
   ["comment list", `Usage: taskctl comment list ISSUE_ID [--after CURSOR] [--json]
 
 Options:
@@ -313,7 +328,7 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, cloud login/status/logout, issue list/get/create/update/move/transition/archive/restore/tree/rollup/relation, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme/archive/restore, source-record adopt/merge/discard/restore, cloud login/status/logout, issue list/get/create/update/move/transition/archive/restore/tree/rollup/relation, comment list/add/update/delete, attachment list/download/upload, context current",
     );
   }
   validateOptions(parsed.options, allowedOptions);
@@ -333,7 +348,7 @@ async function execute(parsed, overrides) {
   switch (command) {
     case "project list":
       expectOperandCount(parsed, 0);
-      return api.request("GET", "/api/projects");
+      return listProjects(api, parsed.options);
     case "project create":
       expectOperandCount(parsed, 0);
       return api.request("POST", "/api/projects", {
@@ -360,6 +375,12 @@ async function execute(parsed, overrides) {
       );
     case "project readme":
       return executeProjectReadme(api, parsed, overrides);
+    case "project archive":
+      expectOperandCount(parsed, 1);
+      return mutateProjectDisposition(api, parsed.operands[0], "archive", parsed.options);
+    case "project restore":
+      expectOperandCount(parsed, 1);
+      return mutateProjectDisposition(api, parsed.operands[0], "restore", parsed.options);
     case "cloud login":
       expectOperandCount(parsed, 0);
       return cloudLogin(
@@ -412,6 +433,17 @@ async function execute(parsed, overrides) {
         parsed.operands[1],
         parsed.options,
         overrides,
+      );
+    case "source-record adopt":
+    case "source-record merge":
+    case "source-record discard":
+    case "source-record restore":
+      expectOperandCount(parsed, 1);
+      return mutateSourceRecordCandidate(
+        api,
+        parsed.operands[0],
+        parsed.action,
+        parsed.options,
       );
     case "comment list": {
       expectOperandCount(parsed, 1);
@@ -720,6 +752,50 @@ function guessContentType(filename) {
     default:
       return "application/octet-stream";
   }
+}
+
+async function listProjects(api, options) {
+  if (options.archived !== undefined && !["true", "false", "all"].includes(options.archived)) {
+    throw usageError("--archived must be true, false, or all");
+  }
+  const query = options.archived === undefined
+    ? ""
+    : `?${new URLSearchParams({ archived: options.archived })}`;
+  return api.request("GET", `/api/projects${query}`);
+}
+
+async function mutateProjectDisposition(api, projectId, action, options) {
+  const idempotencyKey = stableIdempotencyKey(options);
+  const version = await resolveProjectVersion(api, projectId, options["if-version"]);
+  return api.request(
+    "POST",
+    `/api/projects/${encodeURIComponent(projectId)}/${action}`,
+    { version },
+    { headers: { "idempotency-key": idempotencyKey } },
+  );
+}
+
+async function mutateSourceRecordCandidate(api, sourceRecordId, action, options) {
+  const idempotencyKey = stableIdempotencyKey(options);
+  const body = {
+    version: await resolveVersion(api, sourceRecordId, options["if-version"]),
+  };
+  if (action === "adopt") body.targetProjectId = requiredOption(options, "project");
+  if (action === "merge") body.targetTaskId = requiredOption(options, "issue");
+  return api.request(
+    "POST",
+    `/api/source-records/${encodeURIComponent(sourceRecordId)}/${action}`,
+    body,
+    { headers: { "idempotency-key": idempotencyKey } },
+  );
+}
+
+function stableIdempotencyKey(options) {
+  const idempotencyKey = requiredOption(options, "idempotency-key").trim();
+  if (!/^[a-z][a-z0-9_-]{0,63}$/.test(idempotencyKey)) {
+    throw usageError("--idempotency-key must be a stable identifier");
+  }
+  return idempotencyKey;
 }
 
 async function executeProjectReadme(api, parsed, overrides) {
@@ -1101,6 +1177,25 @@ async function resolveVersion(api, taskId, rawVersion) {
   const version = response.task?.version;
   if (!Number.isSafeInteger(version) || version < 1) {
     throw new TaskctlError("Taskboard service returned a task without a valid version", {
+      code: "INVALID_RESPONSE",
+      exitCode: 4,
+    });
+  }
+  return version;
+}
+
+async function resolveProjectVersion(api, projectId, rawVersion) {
+  if (rawVersion !== undefined) {
+    const version = Number(rawVersion);
+    if (!Number.isSafeInteger(version) || version < 1) {
+      throw usageError("--if-version must be a positive integer");
+    }
+    return version;
+  }
+  const response = await api.request("GET", `/api/projects/${encodeURIComponent(projectId)}`);
+  const version = response.project?.version;
+  if (!Number.isSafeInteger(version) || version < 1) {
+    throw new TaskctlError("Taskboard service returned a project without a valid version", {
       code: "INVALID_RESPONSE",
       exitCode: 4,
     });

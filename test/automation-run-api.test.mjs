@@ -146,3 +146,56 @@ test("local transition creates a listed run and explicit APIs dispatch and recor
   assert.equal(after.body.run.events.length, 3);
   assert.equal(Object.hasOwn(after.body.run, "leaseToken"), false);
 });
+
+test("archived projects reject automation dispatch and result mutations", async () => {
+  const { app, baseUrl } = await start();
+  const task = createTask(app, "Archive automation guard");
+  const transitions = new TransitionService(app.database);
+  const action = transitions.listActions(task.id).find((candidate) => candidate.toTerminalKind === "none");
+  const created = await request(baseUrl, `/api/tasks/${task.id}/transitions`, {
+    method: "POST",
+    headers: { "idempotency-key": "archive-automation-transition" },
+    body: { expectedStateVersion: task.version, actionKey: action.actionKey, gateEvidence: [] },
+  });
+  const runId = created.body.automationRun.runId;
+  const dispatched = await request(baseUrl, `/api/automation-runs/${runId}/dispatch`, {
+    method: "POST",
+    headers: { ...humanHeaders, "idempotency-key": "archive-automation-dispatch" },
+    body: { expectedVersion: 1, leaseSeconds: 60 },
+  });
+  assert.equal(dispatched.response.status, 200, JSON.stringify(dispatched.body));
+  const before = {
+    run: app.database.database.prepare("SELECT status, version, result_json FROM workflow_automation_runs WHERE run_id = ?").get(runId),
+    events: app.database.database.prepare("SELECT COUNT(*) AS count FROM workflow_automation_run_events WHERE run_id = ?").get(runId).count,
+    outbox: app.database.database.prepare("SELECT COUNT(*) AS count FROM workflow_automation_run_outbox WHERE run_id = ?").get(runId).count,
+  };
+  app.database.database.prepare(`
+    UPDATE projects SET archived_at = ?, version = version + 1 WHERE id = 'automation-api'
+  `).run("2026-09-01T12:00:00.000Z");
+
+  const replayBlocked = await request(baseUrl, `/api/automation-runs/${runId}/dispatch`, {
+    method: "POST",
+    headers: { ...humanHeaders, "idempotency-key": "archive-automation-dispatch" },
+    body: { expectedVersion: 1, leaseSeconds: 60 },
+  });
+  assert.equal(replayBlocked.response.status, 409);
+  assert.equal(replayBlocked.body.error.code, "PROJECT_ARCHIVED");
+
+  const resultBlocked = await request(baseUrl, `/api/automation-runs/${runId}/result`, {
+    method: "POST",
+    headers: { "idempotency-key": "archive-automation-result" },
+    body: {
+      expectedVersion: 2,
+      leaseToken: dispatched.body.leaseToken,
+      status: "succeeded",
+      result: { summary: "must not persist" },
+    },
+  });
+  assert.equal(resultBlocked.response.status, 409);
+  assert.equal(resultBlocked.body.error.code, "PROJECT_ARCHIVED");
+  assert.deepEqual({
+    run: app.database.database.prepare("SELECT status, version, result_json FROM workflow_automation_runs WHERE run_id = ?").get(runId),
+    events: app.database.database.prepare("SELECT COUNT(*) AS count FROM workflow_automation_run_events WHERE run_id = ?").get(runId).count,
+    outbox: app.database.database.prepare("SELECT COUNT(*) AS count FROM workflow_automation_run_outbox WHERE run_id = ?").get(runId).count,
+  }, before);
+});

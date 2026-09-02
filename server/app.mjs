@@ -507,6 +507,42 @@ function parseProjectCreate(body) {
   return { id, name, workspacePath };
 }
 
+function parseIdempotencyKey(value) {
+  if (value === undefined) {
+    throw new ApiError(400, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key header is required");
+  }
+  const key = stringField(value, "Idempotency-Key", { required: true, maxLength: 64 });
+  if (!/^[a-z][a-z0-9_-]{0,63}$/.test(key)) {
+    throw new ApiError(400, "INVALID_FIELD", "Idempotency-Key must be a stable lowercase identifier");
+  }
+  return key;
+}
+
+function parseProjectDisposition(body, idempotencyHeader) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["version"]));
+  return {
+    version: parseVersion(body.version),
+    idempotencyKey: parseIdempotencyKey(idempotencyHeader),
+  };
+}
+
+function parseProjectListFilters(searchParams) {
+  for (const key of searchParams.keys()) {
+    if (key !== "archived") {
+      throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", `Unknown query parameter '${key}'`);
+    }
+    if (searchParams.getAll(key).length !== 1) {
+      throw new ApiError(400, "INVALID_QUERY_PARAMETER", "Query parameter 'archived' cannot be repeated");
+    }
+  }
+  const archived = searchParams.get("archived") ?? "false";
+  if (!["true", "false", "all"].includes(archived)) {
+    throw new ApiError(400, "INVALID_QUERY_PARAMETER", "'archived' must be true, false, or all");
+  }
+  return { archived };
+}
+
 function parseProjectLabel(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set(["label"]));
@@ -744,6 +780,25 @@ function parseSourceRecordIngest(body) {
     throw new ApiError(400, "INVALID_FIELD", "A recurring source_record requires 'dueDate'");
   }
   return task;
+}
+
+function parseSourceCandidateMutation(action, body, idempotencyHeader) {
+  assertPlainObject(body);
+  const allowed = new Set(["version"]);
+  if (action === "adopt") allowed.add("targetProjectId");
+  if (action === "merge") allowed.add("targetTaskId");
+  assertAllowedKeys(body, allowed);
+  const result = {
+    version: parseVersion(body.version),
+    idempotencyKey: parseIdempotencyKey(idempotencyHeader),
+  };
+  if (action === "adopt") {
+    result.targetProjectId = validateProjectId(body.targetProjectId);
+  }
+  if (action === "merge") {
+    result.targetTaskId = stringField(body.targetTaskId, "targetTaskId", { required: true, maxLength: 128 });
+  }
+  return result;
 }
 
 function parseTaskPatch(body) {
@@ -2722,10 +2777,8 @@ export function createTaskboardServer(options = {}) {
 
       if (pathname === "/api/projects") {
         if (request.method === "GET") {
-          if ([...url.searchParams.keys()].length > 0) {
-            throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/projects does not accept query parameters");
-          }
-          const projects = database.listProjects().map((project) => ({
+          const filters = parseProjectListFilters(url.searchParams);
+          const projects = database.listProjects(filters).map((project) => ({
             ...project,
             workspacePath: project.id === DEFAULT_PROJECT_ID
               ? null
@@ -2739,6 +2792,35 @@ export function createTaskboardServer(options = {}) {
           return sendJson(response, 201, { project });
         }
         return methodNotAllowed(response, ["GET", "POST"]);
+      }
+
+      const projectDispositionRoute = pathname.match(/^\/api\/projects\/([^/]+)\/(archive|restore)$/);
+      if (projectDispositionRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Project disposition routes do not accept query parameters");
+        }
+        let projectId;
+        try {
+          projectId = decodeURIComponent(projectDispositionRoute[1]);
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Project id contains invalid encoding");
+        }
+        validateProjectId(projectId);
+        const action = projectDispositionRoute[2];
+        const input = parseProjectDisposition(
+          await readJson(request),
+          requestHeader(request, "idempotency-key"),
+        );
+        const result = database.mutateProjectDisposition(
+          projectId,
+          action,
+          input.version,
+          input.idempotencyKey,
+          actorFromRequest(request),
+        );
+        events.emit(`project.${action === "archive" ? "archived" : "restored"}`, { project: result.project });
+        return sendJson(response, 200, result);
       }
 
       const stageWorkflowRoute = pathname.match(/^\/api\/projects\/([^/]+)\/stage-workflow$/);
@@ -2779,11 +2861,16 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "INVALID_PATH", "Project id contains invalid encoding");
         }
         validateProjectId(projectId);
+        if (request.method === "GET") {
+          const project = database.getProject(projectId);
+          if (!project) throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
+          return sendJson(response, 200, { project });
+        }
         if (request.method === "DELETE") {
           database.deleteProject(projectId);
           return sendEmpty(response, 204);
         }
-        return methodNotAllowed(response, ["DELETE"]);
+        return methodNotAllowed(response, ["GET", "DELETE"]);
       }
 
       const projectLabelsRoute = pathname.match(/^\/api\/projects\/([^/]+)\/labels$/);
@@ -2938,6 +3025,38 @@ export function createTaskboardServer(options = {}) {
           200,
           await scanDevelopmentContexts(workspacePath, codexProcessEnvironment),
         );
+      }
+
+      const sourceCandidateRoute = pathname.match(
+        /^\/api\/source-records\/([^/]+)\/(adopt|merge|discard|restore)$/,
+      );
+      if (sourceCandidateRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Source candidate routes do not accept query parameters");
+        }
+        let id;
+        try {
+          id = decodeURIComponent(sourceCandidateRoute[1]);
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Source record id contains invalid encoding");
+        }
+        if (id.length === 0 || id.length > 128) {
+          throw new ApiError(400, "INVALID_PATH", "Source record id is invalid");
+        }
+        const action = sourceCandidateRoute[2];
+        const input = parseSourceCandidateMutation(
+          action,
+          await readJson(request),
+          requestHeader(request, "idempotency-key"),
+        );
+        const result = database.mutateSourceCandidate(id, action, input, actorFromRequest(request));
+        const eventAction = action === "restore" ? "restored" : result.disposition;
+        events.emit(`source-record.${eventAction}`, { task: result.sourceRecord });
+        if (action === "adopt" && !result.idempotent) {
+          events.emit("task.created", { task: result.workCard });
+        }
+        return sendJson(response, 200, result);
       }
 
       if (pathname === "/api/source-records") {
@@ -3315,12 +3434,12 @@ export function createTaskboardServer(options = {}) {
         if (request.method !== "DELETE") return methodNotAllowed(response, ["DELETE"]);
         const attachment = database.getAttachment(id);
         if (!attachment) throw new ApiError(404, "ATTACHMENT_NOT_FOUND", `Attachment '${id}' does not exist`);
+        database.deleteAttachment(id);
         try {
           await unlink(path.join(resolved.attachmentsDirectory, attachment.id));
         } catch (error) {
           if (error.code !== "ENOENT") throw error;
         }
-        database.deleteAttachment(id);
         const task = database.getTask(attachment.taskId);
         events.emit("attachment.deleted", { attachment, task });
         return sendEmpty(response, 204);
@@ -3412,6 +3531,12 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Transition routes do not accept query parameters");
         }
         if (request.method === "GET") {
+          const task = database.getTask(id);
+          if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+          const project = database.getProject(task.projectId);
+          if (project?.archivedAt != null) {
+            return sendJson(response, 200, { actions: [] });
+          }
           return sendJson(response, 200, {
             actions: transitions.listActions(id).map((action) => ({
               actionKey: action.actionKey,
@@ -3429,6 +3554,7 @@ export function createTaskboardServer(options = {}) {
         if (current.source === "jira") {
           throw new ApiError(409, "LOCAL_TRANSITION_UNAVAILABLE", "Jira-synchronized tasks remain controlled by Jira in this local-only transition phase");
         }
+        database.assertTaskWritable(id);
         const { command, sortOrder } = parseTaskTransition(
           await readJson(request),
           requestHeader(request, "idempotency-key"),
@@ -3505,6 +3631,7 @@ export function createTaskboardServer(options = {}) {
         }
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         if (action === "dispatch") {
+          database.assertTaskWritable(automationRuns.get(runId).taskId);
           const result = automationRuns.dispatch(
             runId,
             parseAutomationRunDispatch(await readJson(request), requestHeader(request, "idempotency-key")),
@@ -3517,6 +3644,7 @@ export function createTaskboardServer(options = {}) {
             idempotent: result.idempotent,
           });
         }
+        database.assertTaskWritable(automationRuns.get(runId).taskId);
         const result = automationRuns.recordResult(
           runId,
           parseAutomationRunResult(await readJson(request), requestHeader(request, "idempotency-key")),
@@ -3557,6 +3685,7 @@ export function createTaskboardServer(options = {}) {
           } = resolveInputThreadBinding(parseTaskPatch(await readJson(request)));
           const current = database.getTask(id);
           if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+          database.assertTaskWritable(id);
           let jiraChanged = false;
           if (current.source !== "jira" && changes.projectId === JIRA_PROJECT_ID) {
             throw new ApiError(
@@ -3695,6 +3824,7 @@ export function createTaskboardServer(options = {}) {
           const move = resolveInputThreadBinding(parseMove(await readJson(request)));
           const current = database.getTask(id);
           if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+          database.assertTaskWritable(id);
           const actor = actorFromRequest(request);
           if (current.source !== "jira") {
             if (current.version !== move.version) {

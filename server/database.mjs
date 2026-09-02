@@ -323,6 +323,8 @@ function taskFromRow(row) {
       ?? (kind === "source_record" ? SOURCE_RECORD_FIELD_OWNERSHIP_JSON : WORK_CARD_FIELD_OWNERSHIP_JSON),
     ),
     candidateState: row.candidate_state ?? null,
+    candidateTargetTaskId: row.candidate_target_task_id ?? null,
+    candidateDispositionAt: row.candidate_disposition_at ?? null,
     source: row.external_source === "jira" ? "jira" : "local",
     externalOrigin: row.external_origin ?? null,
     externalKey: row.external_key ?? null,
@@ -419,6 +421,8 @@ function projectFromRow(row) {
     source: row.id === JIRA_PROJECT_ID ? "jira" : "local",
     labels: JSON.parse(row.labels),
     issueCount: Number(row.issue_count ?? 0),
+    archivedAt: row.archived_at ?? null,
+    version: row.version ?? 1,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -532,6 +536,8 @@ export class TaskboardDatabase {
         workspace_path TEXT,
         labels TEXT NOT NULL DEFAULT '${DEFAULT_PROJECT_LABELS_JSON}',
         next_task_number INTEGER NOT NULL DEFAULT 1 CHECK (next_task_number > 0),
+        archived_at TEXT,
+        version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -579,6 +585,8 @@ export class TaskboardDatabase {
         source_fingerprint TEXT,
         field_ownership TEXT NOT NULL DEFAULT '${WORK_CARD_FIELD_OWNERSHIP_JSON}',
         candidate_state TEXT CHECK (candidate_state IN ('available', 'adopted', 'merged', 'discarded')),
+        candidate_target_task_id TEXT REFERENCES tasks(id),
+        candidate_disposition_at TEXT,
         archived_at TEXT,
         version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
         created_at TEXT NOT NULL,
@@ -748,6 +756,12 @@ export class TaskboardDatabase {
     if (!projectColumns.some((column) => column.name === "workspace_path")) {
       this.database.exec("ALTER TABLE projects ADD COLUMN workspace_path TEXT");
     }
+    if (!projectColumns.some((column) => column.name === "archived_at")) {
+      this.database.exec("ALTER TABLE projects ADD COLUMN archived_at TEXT");
+    }
+    if (!projectColumns.some((column) => column.name === "version")) {
+      this.database.exec("ALTER TABLE projects ADD COLUMN version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0)");
+    }
 
     const taskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
     const hasWorkflowId = taskColumns.some((column) => column.name === "workflow_id");
@@ -845,6 +859,37 @@ export class TaskboardDatabase {
     if (!migratedTaskColumns.some((column) => column.name === "candidate_state")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN candidate_state TEXT CHECK (candidate_state IN ('available', 'adopted', 'merged', 'discarded'))");
     }
+    if (!migratedTaskColumns.some((column) => column.name === "candidate_target_task_id")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN candidate_target_task_id TEXT REFERENCES tasks(id)");
+    }
+    if (!migratedTaskColumns.some((column) => column.name === "candidate_disposition_at")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN candidate_disposition_at TEXT");
+    }
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS source_candidate_requests (
+        idempotency_key TEXT PRIMARY KEY,
+        source_task_id TEXT NOT NULL REFERENCES tasks(id),
+        action TEXT NOT NULL CHECK (action IN ('adopt', 'merge', 'discard', 'restore')),
+        request_fingerprint TEXT NOT NULL,
+        response_json TEXT NOT NULL,
+        actor_type TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        actor_name TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS project_disposition_requests (
+        idempotency_key TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        action TEXT NOT NULL CHECK (action IN ('archive', 'restore')),
+        request_fingerprint TEXT NOT NULL,
+        response_json TEXT NOT NULL,
+        actor_type TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        actor_name TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+    `);
     this.database.exec(`
       DROP INDEX IF EXISTS tasks_external_source_id;
       CREATE UNIQUE INDEX IF NOT EXISTS tasks_external_source_origin_id
@@ -1109,6 +1154,130 @@ export class TaskboardDatabase {
     migrateLocalWorkflowTransitions(this.database);
     migrateLocalHumanAcceptance(this.database);
     migrateLocalAutomationRuns(this.database);
+    this.#migrateArchivedProjectGuards();
+  }
+
+  #migrateArchivedProjectGuards() {
+    this.database.exec(`
+      CREATE TRIGGER IF NOT EXISTS archived_project_tasks_insert
+      BEFORE INSERT ON tasks
+      WHEN EXISTS (
+        SELECT 1 FROM projects WHERE id = NEW.project_id AND archived_at IS NOT NULL
+      )
+      BEGIN SELECT RAISE(ABORT, 'PROJECT_ARCHIVED'); END;
+
+      CREATE TRIGGER IF NOT EXISTS archived_project_tasks_update
+      BEFORE UPDATE ON tasks
+      WHEN EXISTS (
+        SELECT 1 FROM projects WHERE id IN (OLD.project_id, NEW.project_id) AND archived_at IS NOT NULL
+      )
+      BEGIN SELECT RAISE(ABORT, 'PROJECT_ARCHIVED'); END;
+
+      CREATE TRIGGER IF NOT EXISTS archived_project_tasks_delete
+      BEFORE DELETE ON tasks
+      WHEN EXISTS (
+        SELECT 1 FROM projects WHERE id = OLD.project_id AND archived_at IS NOT NULL
+      )
+      BEGIN SELECT RAISE(ABORT, 'PROJECT_ARCHIVED'); END;
+
+      CREATE TRIGGER IF NOT EXISTS archived_project_comments_insert
+      BEFORE INSERT ON comments
+      WHEN EXISTS (
+        SELECT 1 FROM tasks JOIN projects ON projects.id = tasks.project_id
+        WHERE tasks.id = NEW.task_id AND projects.archived_at IS NOT NULL
+      )
+      BEGIN SELECT RAISE(ABORT, 'PROJECT_ARCHIVED'); END;
+
+      CREATE TRIGGER IF NOT EXISTS archived_project_comments_update
+      BEFORE UPDATE ON comments
+      WHEN EXISTS (
+        SELECT 1 FROM tasks JOIN projects ON projects.id = tasks.project_id
+        WHERE tasks.id IN (OLD.task_id, NEW.task_id) AND projects.archived_at IS NOT NULL
+      )
+      BEGIN SELECT RAISE(ABORT, 'PROJECT_ARCHIVED'); END;
+
+      CREATE TRIGGER IF NOT EXISTS archived_project_comments_delete
+      BEFORE DELETE ON comments
+      WHEN EXISTS (
+        SELECT 1 FROM tasks JOIN projects ON projects.id = tasks.project_id
+        WHERE tasks.id = OLD.task_id AND projects.archived_at IS NOT NULL
+      )
+      BEGIN SELECT RAISE(ABORT, 'PROJECT_ARCHIVED'); END;
+
+      CREATE TRIGGER IF NOT EXISTS archived_project_attachments_insert
+      BEFORE INSERT ON attachments
+      WHEN EXISTS (
+        SELECT 1 FROM tasks JOIN projects ON projects.id = tasks.project_id
+        WHERE tasks.id = NEW.task_id AND projects.archived_at IS NOT NULL
+      )
+      BEGIN SELECT RAISE(ABORT, 'PROJECT_ARCHIVED'); END;
+
+      CREATE TRIGGER IF NOT EXISTS archived_project_attachments_update
+      BEFORE UPDATE ON attachments
+      WHEN EXISTS (
+        SELECT 1 FROM tasks JOIN projects ON projects.id = tasks.project_id
+        WHERE tasks.id IN (OLD.task_id, NEW.task_id) AND projects.archived_at IS NOT NULL
+      )
+      BEGIN SELECT RAISE(ABORT, 'PROJECT_ARCHIVED'); END;
+
+      CREATE TRIGGER IF NOT EXISTS archived_project_attachments_delete
+      BEFORE DELETE ON attachments
+      WHEN EXISTS (
+        SELECT 1 FROM tasks JOIN projects ON projects.id = tasks.project_id
+        WHERE tasks.id = OLD.task_id AND projects.archived_at IS NOT NULL
+      )
+      BEGIN SELECT RAISE(ABORT, 'PROJECT_ARCHIVED'); END;
+
+      CREATE TRIGGER IF NOT EXISTS archived_project_relations_insert
+      BEFORE INSERT ON task_relations
+      WHEN EXISTS (
+        SELECT 1 FROM tasks JOIN projects ON projects.id = tasks.project_id
+        WHERE tasks.id IN (NEW.source_task_id, NEW.target_task_id) AND projects.archived_at IS NOT NULL
+      )
+      BEGIN SELECT RAISE(ABORT, 'PROJECT_ARCHIVED'); END;
+
+      CREATE TRIGGER IF NOT EXISTS archived_project_relations_update
+      BEFORE UPDATE ON task_relations
+      WHEN EXISTS (
+        SELECT 1 FROM tasks JOIN projects ON projects.id = tasks.project_id
+        WHERE tasks.id IN (
+          OLD.source_task_id, OLD.target_task_id, NEW.source_task_id, NEW.target_task_id
+        ) AND projects.archived_at IS NOT NULL
+      )
+      BEGIN SELECT RAISE(ABORT, 'PROJECT_ARCHIVED'); END;
+
+      CREATE TRIGGER IF NOT EXISTS archived_project_relations_delete
+      BEFORE DELETE ON task_relations
+      WHEN EXISTS (
+        SELECT 1 FROM tasks JOIN projects ON projects.id = tasks.project_id
+        WHERE tasks.id IN (OLD.source_task_id, OLD.target_task_id) AND projects.archived_at IS NOT NULL
+      )
+      BEGIN SELECT RAISE(ABORT, 'PROJECT_ARCHIVED'); END;
+
+      CREATE TRIGGER IF NOT EXISTS archived_project_automation_runs_insert
+      BEFORE INSERT ON workflow_automation_runs
+      WHEN EXISTS (
+        SELECT 1 FROM tasks JOIN projects ON projects.id = tasks.project_id
+        WHERE tasks.id = NEW.task_id AND projects.archived_at IS NOT NULL
+      )
+      BEGIN SELECT RAISE(ABORT, 'PROJECT_ARCHIVED'); END;
+
+      CREATE TRIGGER IF NOT EXISTS archived_project_automation_runs_update
+      BEFORE UPDATE ON workflow_automation_runs
+      WHEN EXISTS (
+        SELECT 1 FROM tasks JOIN projects ON projects.id = tasks.project_id
+        WHERE tasks.id IN (OLD.task_id, NEW.task_id) AND projects.archived_at IS NOT NULL
+      )
+      BEGIN SELECT RAISE(ABORT, 'PROJECT_ARCHIVED'); END;
+
+      CREATE TRIGGER IF NOT EXISTS archived_project_human_evidence_insert
+      BEFORE INSERT ON workflow_human_evidence
+      WHEN EXISTS (
+        SELECT 1 FROM tasks JOIN projects ON projects.id = tasks.project_id
+        WHERE tasks.id = NEW.task_id AND projects.archived_at IS NOT NULL
+      )
+      BEGIN SELECT RAISE(ABORT, 'PROJECT_ARCHIVED'); END;
+    `);
   }
 
   #migrateStageWorkflows() {
@@ -1206,13 +1375,20 @@ export class TaskboardDatabase {
     }
   }
 
-  listProjects() {
+  listProjects({ archived = "false" } = {}) {
+    const archiveFilter = archived === "true"
+      ? "WHERE projects.archived_at IS NOT NULL"
+      : archived === "all"
+        ? ""
+        : "WHERE projects.archived_at IS NULL";
     return this.database.prepare(`
       SELECT
         projects.id,
         projects.name,
         projects.workspace_path,
         projects.labels,
+        projects.archived_at,
+        projects.version,
         projects.created_at,
         projects.updated_at,
         COUNT(tasks.id) AS issue_count
@@ -1220,11 +1396,14 @@ export class TaskboardDatabase {
       LEFT JOIN tasks
         ON tasks.project_id = projects.id
         AND tasks.archived_at IS NULL
+      ${archiveFilter}
       GROUP BY
         projects.id,
         projects.name,
         projects.workspace_path,
         projects.labels,
+        projects.archived_at,
+        projects.version,
         projects.created_at,
         projects.updated_at
       ORDER BY projects.created_at, projects.id
@@ -1494,6 +1673,8 @@ export class TaskboardDatabase {
         projects.name,
         projects.workspace_path,
         projects.labels,
+        projects.archived_at,
+        projects.version,
         projects.created_at,
         projects.updated_at,
         COUNT(tasks.id) AS issue_count
@@ -1507,13 +1688,126 @@ export class TaskboardDatabase {
         projects.name,
         projects.workspace_path,
         projects.labels,
+        projects.archived_at,
+        projects.version,
         projects.created_at,
         projects.updated_at
     `).get(id);
     return row ? projectFromRow(row) : null;
   }
 
+  mutateProjectDisposition(id, action, expectedVersion, idempotencyKey, actor) {
+    if (action !== "archive" && action !== "restore") {
+      throw new ApiError(400, "INVALID_FIELD", "Project disposition must be archive or restore");
+    }
+    const requestFingerprint = JSON.stringify({
+      projectId: id,
+      action,
+      expectedVersion,
+      actor: { type: actor.type, id: actor.id },
+    });
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const replay = this.database.prepare(`
+        SELECT * FROM project_disposition_requests WHERE idempotency_key = ?
+      `).get(idempotencyKey);
+      if (replay) {
+        if (replay.request_fingerprint !== requestFingerprint) {
+          throw new ApiError(
+            409,
+            "IDEMPOTENCY_CONFLICT",
+            "Idempotency-Key was already used for a different project disposition",
+          );
+        }
+        this.database.exec("COMMIT");
+        return { ...JSON.parse(replay.response_json), idempotent: true };
+      }
+
+      const current = this.getProject(id);
+      if (!current) {
+        throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${id}' does not exist`);
+      }
+      if (current.version !== expectedVersion) {
+        throw new ApiError(409, "VERSION_CONFLICT", "Project changed since it was last read", {
+          expectedVersion,
+          actualVersion: current.version,
+        });
+      }
+      const archive = action === "archive";
+      if (archive && current.archivedAt !== null) {
+        throw new ApiError(409, "PROJECT_ALREADY_ARCHIVED", "Project is already archived");
+      }
+      if (!archive && current.archivedAt === null) {
+        throw new ApiError(409, "PROJECT_NOT_ARCHIVED", "Only archived projects can be restored");
+      }
+      if (archive) {
+        const activeRuns = Number(this.database.prepare(`
+          SELECT COUNT(*) AS count
+          FROM workflow_automation_runs
+          JOIN tasks ON tasks.id = workflow_automation_runs.task_id
+          WHERE tasks.project_id = ?
+            AND workflow_automation_runs.status IN ('pending', 'dispatched')
+        `).get(id).count);
+        if (activeRuns > 0) {
+          throw new ApiError(
+            409,
+            "PROJECT_AUTOMATION_ACTIVE",
+            "Project cannot be archived while automation runs are pending or dispatched",
+            { activeRuns },
+          );
+        }
+      }
+      const timestamp = now();
+      const result = this.database.prepare(`
+        UPDATE projects
+        SET archived_at = ?, version = version + 1, updated_at = ?
+        WHERE id = ? AND version = ?
+      `).run(archive ? timestamp : null, timestamp, id, expectedVersion);
+      if (result.changes !== 1) {
+        const latest = this.getProject(id);
+        throw new ApiError(409, "VERSION_CONFLICT", "Project changed during disposition", {
+          expectedVersion,
+          actualVersion: latest?.version,
+        });
+      }
+      const project = this.getProject(id);
+      const response = {
+        project,
+        disposition: archive ? "archived" : "active",
+        version: project.version,
+        idempotent: false,
+      };
+      this.database.prepare(`
+        INSERT INTO project_disposition_requests (
+          idempotency_key, project_id, action, request_fingerprint, response_json,
+          actor_type, actor_id, actor_name, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        idempotencyKey,
+        id,
+        action,
+        requestFingerprint,
+        JSON.stringify(response),
+        actor.type,
+        actor.id,
+        actor.name,
+        timestamp,
+      );
+      this.database.exec("COMMIT");
+      return response;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  assertProjectWritable(id) {
+    this.#assertProjectWritable(id);
+    return this.getProject(id);
+  }
+
   addProjectLabel(projectId, label) {
+    this.#assertProjectWritable(projectId);
     const project = this.database.prepare("SELECT labels FROM projects WHERE id = ?").get(projectId);
     if (!project) {
       throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
@@ -1528,6 +1822,7 @@ export class TaskboardDatabase {
   }
 
   deleteProjectLabel(projectId, label) {
+    this.#assertProjectWritable(projectId);
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const project = this.database.prepare("SELECT labels FROM projects WHERE id = ?").get(projectId);
@@ -1590,6 +1885,7 @@ export class TaskboardDatabase {
   }
 
   saveProjectSummary(projectId, summary) {
+    this.#assertProjectWritable(projectId);
     const timestamp = now();
     this.database.prepare(`
       INSERT INTO project_summaries (
@@ -1605,6 +1901,7 @@ export class TaskboardDatabase {
   }
 
   saveProjectSummaryError(projectId, error) {
+    this.#assertProjectWritable(projectId);
     const timestamp = now();
     this.database.prepare(`
       INSERT INTO project_summaries (
@@ -1632,6 +1929,7 @@ export class TaskboardDatabase {
   }
 
   saveProjectReadme(projectId, content, expectedVersion) {
+    this.#assertProjectWritable(projectId);
     const timestamp = now();
     this.database.exec("BEGIN IMMEDIATE");
     try {
@@ -1675,6 +1973,7 @@ export class TaskboardDatabase {
   }
 
   createProjectReadmeAttachment(projectId, input) {
+    this.#assertProjectWritable(projectId);
     if (!this.database.prepare("SELECT 1 FROM projects WHERE id = ?").get(projectId)) {
       throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
     }
@@ -2055,6 +2354,7 @@ export class TaskboardDatabase {
   }
 
   saveStageWorkflow(projectId, expectedVersion, definition, removals = []) {
+    this.#assertProjectWritable(projectId);
     const current = this.getStageWorkflow(projectId);
     // Once a project has an immutable workflow revision, changing physical
     // stages through the old editor would either invalidate pinned bindings or
@@ -2148,6 +2448,7 @@ export class TaskboardDatabase {
     }
     if (filters.archived === "false") {
       where.push("archived_at IS NULL");
+      where.push("NOT (kind = 'source_record' AND candidate_state = 'discarded')");
     } else if (filters.archived === "true") {
       where.push("archived_at IS NOT NULL");
     }
@@ -2416,6 +2717,7 @@ export class TaskboardDatabase {
           projects.name,
           projects.labels,
           projects.next_task_number,
+          projects.archived_at,
           (
             SELECT tasks.identifier
             FROM tasks
@@ -2428,6 +2730,12 @@ export class TaskboardDatabase {
       `).get(input.projectId);
       if (!project) {
         throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${input.projectId}' does not exist`);
+      }
+      if (project.archived_at !== null) {
+        throw new ApiError(409, "PROJECT_ARCHIVED", "Archived projects cannot accept new tasks", {
+          projectId: input.projectId,
+          archivedAt: project.archived_at,
+        });
       }
       const stage = this.#resolveStage(input.projectId, input.stageId, input.status);
       input.status = stage.canonical_status;
@@ -2564,6 +2872,7 @@ export class TaskboardDatabase {
     if (current.projectId !== input.projectId) {
       throw new ApiError(409, "SOURCE_RECORD_PROJECT_CONFLICT", "A source_record cannot move projects during ingest");
     }
+    this.#assertProjectWritable(current.projectId);
     const stage = this.#resolveStage(input.projectId, input.stageId, input.status);
     const next = {
       title: input.title,
@@ -2634,6 +2943,155 @@ export class TaskboardDatabase {
     return { task: this.getTask(current.id), created: false, idempotent: false };
   }
 
+  mutateSourceCandidate(id, action, input, actor) {
+    if (!["adopt", "merge", "discard", "restore"].includes(action)) {
+      throw new ApiError(400, "INVALID_FIELD", "Unknown source_record disposition action");
+    }
+    const requestFingerprint = JSON.stringify({
+      sourceTaskId: id,
+      action,
+      expectedVersion: input.version,
+      targetProjectId: input.targetProjectId ?? null,
+      targetTaskId: input.targetTaskId ?? null,
+      actor: { type: actor.type, id: actor.id },
+    });
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const replay = this.database.prepare(`
+        SELECT * FROM source_candidate_requests WHERE idempotency_key = ?
+      `).get(input.idempotencyKey);
+      if (replay) {
+        if (replay.request_fingerprint !== requestFingerprint) {
+          throw new ApiError(
+            409,
+            "IDEMPOTENCY_CONFLICT",
+            "Idempotency-Key was already used for a different source_record decision",
+          );
+        }
+        this.database.exec("COMMIT");
+        return { ...JSON.parse(replay.response_json), idempotent: true };
+      }
+
+      const source = this.#requireTask(id);
+      if (source.kind !== "source_record") {
+        throw new ApiError(409, "SOURCE_RECORD_REQUIRED", "Candidate decisions require a source_record");
+      }
+      this.#assertProjectWritable(source.projectId);
+      if (source.archivedAt !== null) {
+        throw new ApiError(409, "TASK_ARCHIVED", "Archived source_records cannot be dispositioned");
+      }
+
+      let workCard = null;
+      let semanticRepeat = false;
+      if (action === "adopt" && source.candidateState === "adopted") {
+        workCard = source.candidateTargetTaskId
+          ? this.getTask(source.candidateTargetTaskId)
+          : null;
+        if (!workCard || workCard.kind !== "work_card") {
+          throw new ApiError(409, "SOURCE_RECORD_TARGET_MISSING", "Adopted source_record has no recoverable work_card target");
+        }
+        if (workCard.projectId !== input.targetProjectId) {
+          throw new ApiError(409, "SOURCE_RECORD_ALREADY_RESOLVED", "source_record was adopted into a different project", {
+            targetTaskId: workCard.id,
+            targetProjectId: workCard.projectId,
+          });
+        }
+        semanticRepeat = true;
+      } else if (action === "merge" && source.candidateState === "merged") {
+        if (source.candidateTargetTaskId !== input.targetTaskId) {
+          throw new ApiError(409, "SOURCE_RECORD_ALREADY_RESOLVED", "source_record was merged into a different work_card", {
+            targetTaskId: source.candidateTargetTaskId,
+          });
+        }
+        workCard = this.getTask(source.candidateTargetTaskId);
+        if (!workCard || workCard.kind !== "work_card") {
+          throw new ApiError(409, "SOURCE_RECORD_TARGET_MISSING", "Merged source_record has no recoverable work_card target");
+        }
+        semanticRepeat = true;
+      } else if (action === "discard" && source.candidateState === "discarded") {
+        semanticRepeat = true;
+      } else if (action === "restore" && source.candidateState === "available") {
+        semanticRepeat = true;
+      }
+
+      const disposition = {
+        adopt: "adopted",
+        merge: "merged",
+        discard: "discarded",
+        restore: "pending",
+      }[action];
+      if (semanticRepeat) {
+        const response = this.#sourceCandidateResponse(source, workCard, disposition, true);
+        this.#storeSourceCandidateRequest(input.idempotencyKey, id, action, requestFingerprint, response, actor, now());
+        this.database.exec("COMMIT");
+        return response;
+      }
+
+      this.#requireVersion(source, input.version);
+      if (source.candidateState !== "available" && action !== "restore") {
+        throw new ApiError(409, "SOURCE_RECORD_ALREADY_RESOLVED", "source_record already has a terminal candidate disposition", {
+          candidateState: source.candidateState,
+          targetTaskId: source.candidateTargetTaskId,
+        });
+      }
+      if (action === "restore" && source.candidateState !== "discarded") {
+        throw new ApiError(409, "SOURCE_RECORD_NOT_DISCARDED", "Only discarded source_records can be restored");
+      }
+
+      const timestamp = now();
+      let nextState;
+      let targetTaskId = null;
+      let dispositionAt = timestamp;
+      if (action === "adopt") {
+        workCard = this.#createAdoptedWorkCardInsideTransaction(source, input.targetProjectId, actor, timestamp);
+        nextState = "adopted";
+        targetTaskId = workCard.id;
+      } else if (action === "merge") {
+        workCard = this.#requireTask(input.targetTaskId);
+        this.#assertTaskWritable(workCard);
+        if (workCard.archivedAt !== null) {
+          throw new ApiError(409, "TASK_ARCHIVED", "Cannot merge a source_record into an archived work_card");
+        }
+        nextState = "merged";
+        targetTaskId = workCard.id;
+      } else if (action === "discard") {
+        nextState = "discarded";
+      } else {
+        nextState = "available";
+        dispositionAt = null;
+      }
+
+      const updated = this.database.prepare(`
+        UPDATE tasks
+        SET candidate_state = ?, candidate_target_task_id = ?, candidate_disposition_at = ?,
+          version = version + 1, updated_at = ?
+        WHERE id = ? AND version = ? AND kind = 'source_record'
+      `).run(nextState, targetTaskId, dispositionAt, timestamp, source.id, source.version);
+      if (updated.changes !== 1) this.#throwMissingOrConflict(source.id, source.version);
+      this.#recordTaskActivity(source.id, actor, [
+        { field: "candidateState", before: source.candidateState, after: nextState },
+        { field: "candidateTargetTaskId", before: source.candidateTargetTaskId, after: targetTaskId },
+        { field: "candidateDispositionAt", before: source.candidateDispositionAt, after: dispositionAt },
+      ], timestamp);
+      const refreshedSource = this.getTask(source.id);
+      const response = this.#sourceCandidateResponse(refreshedSource, workCard, disposition, false);
+      this.#storeSourceCandidateRequest(
+        input.idempotencyKey,
+        source.id,
+        action,
+        requestFingerprint,
+        response,
+        actor,
+        timestamp,
+      );
+      this.database.exec("COMMIT");
+      return response;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   assertTaskWritable(id) {
     const task = this.#requireTask(id);
     this.#assertTaskWritable(task);
@@ -2652,10 +3110,16 @@ export class TaskboardDatabase {
     }
     const activityChanges = taskFieldChanges(current, changes);
     const targetProject = Object.hasOwn(changes, "projectId")
-      ? this.database.prepare("SELECT id, name, workspace_path, labels FROM projects WHERE id = ?").get(changes.projectId)
+      ? this.database.prepare("SELECT id, name, workspace_path, labels, archived_at FROM projects WHERE id = ?").get(changes.projectId)
       : null;
     if (Object.hasOwn(changes, "projectId") && !targetProject) {
       throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${changes.projectId}' does not exist`);
+    }
+    if (targetProject?.archived_at !== null && targetProject?.archived_at !== undefined) {
+      throw new ApiError(409, "PROJECT_ARCHIVED", "Archived projects cannot accept task mutations", {
+        projectId: targetProject.id,
+        archivedAt: targetProject.archived_at,
+      });
     }
     const projectChanged = Boolean(targetProject && targetProject.id !== current.projectId);
     if (projectChanged) {
@@ -3614,6 +4078,136 @@ export class TaskboardDatabase {
     }
   }
 
+  #createAdoptedWorkCardInsideTransaction(source, targetProjectId, actor, timestamp) {
+    const project = this.database.prepare(`
+      SELECT
+        projects.id,
+        projects.name,
+        projects.labels,
+        projects.next_task_number,
+        projects.archived_at,
+        (
+          SELECT tasks.identifier
+          FROM tasks
+          WHERE tasks.project_id = projects.id
+          ORDER BY tasks.created_at, tasks.id
+          LIMIT 1
+        ) AS first_identifier
+      FROM projects
+      WHERE projects.id = ?
+    `).get(targetProjectId);
+    if (!project) {
+      throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${targetProjectId}' does not exist`);
+    }
+    if (project.archived_at !== null) {
+      throw new ApiError(409, "PROJECT_ARCHIVED", "Archived projects cannot accept adopted work_cards", {
+        projectId: targetProjectId,
+        archivedAt: project.archived_at,
+      });
+    }
+    const stage = this.#resolveStage(targetProjectId, undefined, "backlog");
+    const prefix = projectPrefix(project);
+    const maximum = this.database.prepare(`
+      SELECT MAX(CAST(substr(identifier, ?) AS INTEGER)) AS number
+      FROM tasks
+      WHERE identifier GLOB ?
+    `).get(prefix.length + 2, `${prefix}-[0-9]*`).number;
+    const number = Math.max(project.next_task_number, maximum === null ? 1 : maximum + 1);
+    const identifier = `${prefix}-${number}`;
+    const id = randomUUID();
+    const row = this.database.prepare(`
+      SELECT MIN(sort_order) AS minimum
+      FROM tasks
+      WHERE project_id = ? AND stage_id = ? AND archived_at IS NULL
+    `).get(targetProjectId, stage.id);
+    const sortOrder = row.minimum === null ? 1000 : row.minimum - 1000;
+    ensureLocalWorkflowTransitionForProject(this.database, targetProjectId, timestamp);
+    this.database.prepare(`
+      UPDATE projects SET next_task_number = ?, labels = ?, updated_at = ? WHERE id = ?
+    `).run(
+      number + 1,
+      JSON.stringify([...new Set([...JSON.parse(project.labels), ...source.labels])]),
+      timestamp,
+      targetProjectId,
+    );
+    this.database.prepare(`
+      INSERT INTO tasks (
+        id, identifier, project_id, title, description, status, stage_id, priority, labels,
+        sort_order, thread_id, thread_codex_project_id, thread_codex_project_kind,
+        thread_codex_host_id, thread_workspace_path,
+        creator_type, creator_id, creator_name, creator_avatar_url,
+        assignee_type, assignee_id, assignee_name, assignee_avatar_url,
+        git_branch, worktree_path, worktree_branch,
+        start_date, due_date, recurrence_interval, recurrence_unit,
+        external_source, external_origin, external_id, external_key, external_url,
+        kind, source_version, source_fingerprint, field_ownership, candidate_state,
+        archived_at, version, created_at, updated_at
+      ) VALUES (
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL,
+        ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?,
+        NULL, NULL, NULL, NULL, NULL, 'work_card', NULL, NULL, ?, NULL,
+        NULL, 1, ?, ?
+      )
+    `).run(
+      id,
+      identifier,
+      targetProjectId,
+      source.title,
+      source.description,
+      stage.canonical_status,
+      stage.id,
+      source.priority,
+      JSON.stringify(source.labels),
+      sortOrder,
+      actor.type,
+      actor.id,
+      actor.name,
+      actor.avatarUrl,
+      actor.type,
+      actor.id,
+      actor.name,
+      actor.avatarUrl,
+      source.startDate,
+      source.dueDate,
+      source.recurrence?.interval ?? null,
+      source.recurrence?.unit ?? null,
+      WORK_CARD_FIELD_OWNERSHIP_JSON,
+      timestamp,
+      timestamp,
+    );
+    return this.getTask(id);
+  }
+
+  #sourceCandidateResponse(sourceRecord, workCard, disposition, idempotent) {
+    return {
+      sourceRecord,
+      ...(workCard ? { workCard } : {}),
+      targetTaskId: workCard?.id ?? null,
+      disposition,
+      version: sourceRecord.version,
+      idempotent,
+    };
+  }
+
+  #storeSourceCandidateRequest(idempotencyKey, sourceTaskId, action, fingerprint, response, actor, timestamp) {
+    this.database.prepare(`
+      INSERT INTO source_candidate_requests (
+        idempotency_key, source_task_id, action, request_fingerprint, response_json,
+        actor_type, actor_id, actor_name, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      idempotencyKey,
+      sourceTaskId,
+      action,
+      fingerprint,
+      JSON.stringify(response),
+      actor.type,
+      actor.id,
+      actor.name,
+      timestamp,
+    );
+  }
+
   #recordTaskActivity(taskId, actor, changes, timestamp) {
     if (changes.length === 0) return;
     this.database.prepare(`
@@ -3663,6 +4257,24 @@ export class TaskboardDatabase {
         409,
         "SOURCE_RECORD_READ_ONLY",
         "source_record items are projections and can only change through the dedicated ingest lifecycle",
+      );
+    }
+    this.#assertProjectWritable(task.projectId);
+  }
+
+  #assertProjectWritable(projectId) {
+    const project = this.database.prepare(`
+      SELECT id, archived_at FROM projects WHERE id = ?
+    `).get(projectId);
+    if (!project) {
+      throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
+    }
+    if (project.archived_at !== null) {
+      throw new ApiError(
+        409,
+        "PROJECT_ARCHIVED",
+        "Archived projects are read-only until they are restored",
+        { projectId, archivedAt: project.archived_at },
       );
     }
   }

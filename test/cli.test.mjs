@@ -79,6 +79,63 @@ test("project list uses the default local service and adds schemaVersion", async
   assert.equal(calls[0].init.headers["x-taskboard-client"], "taskctl");
 });
 
+test("project list and disposition expose archived filtering, version, and idempotency", async () => {
+  const calls = [];
+  const listed = await run(["project", "list", "--archived", "all"], async (url, init) => {
+    calls.push({ url, init });
+    return response({ projects: [] });
+  });
+  assert.equal(listed.exitCode, 0);
+  assert.equal(calls[0].url.searchParams.get("archived"), "all");
+
+  const archived = await run([
+    "project", "archive", "legacy-project", "--if-version", "3", "--idempotency-key", "archive_legacy_one",
+  ], async (url, init) => {
+    calls.push({ url, init });
+    return response({ project: { id: "legacy-project", version: 4 }, disposition: "archived", version: 4 });
+  });
+  assert.equal(archived.exitCode, 0);
+  assert.equal(calls[1].url.pathname, "/api/projects/legacy-project/archive");
+  assert.equal(calls[1].init.headers["idempotency-key"], "archive_legacy_one");
+  assert.deepEqual(JSON.parse(calls[1].init.body), { version: 3 });
+});
+
+test("source-record lifecycle CLI sends one versioned idempotent decision contract", async () => {
+  const cases = [
+    {
+      argv: ["source-record", "adopt", "SRC/1", "--project", "work", "--if-version", "2", "--idempotency-key", "adopt_src_one"],
+      action: "adopt",
+      body: { version: 2, targetProjectId: "work" },
+    },
+    {
+      argv: ["source-record", "merge", "SRC/1", "--issue", "WORK/9", "--if-version", "2", "--idempotency-key", "merge_src_one"],
+      action: "merge",
+      body: { version: 2, targetTaskId: "WORK/9" },
+    },
+    {
+      argv: ["source-record", "discard", "SRC/1", "--if-version", "2", "--idempotency-key", "discard_src_one"],
+      action: "discard",
+      body: { version: 2 },
+    },
+    {
+      argv: ["source-record", "restore", "SRC/1", "--if-version", "3", "--idempotency-key", "restore_src_one"],
+      action: "restore",
+      body: { version: 3 },
+    },
+  ];
+  for (const fixture of cases) {
+    let call;
+    const result = await run(fixture.argv, async (url, init) => {
+      call = { url, init };
+      return response({ sourceRecord: { id: "SRC/1" }, disposition: fixture.action, version: fixture.body.version + 1 });
+    });
+    assert.equal(result.exitCode, 0, fixture.action);
+    assert.equal(call.url.pathname, `/api/source-records/SRC%2F1/${fixture.action}`);
+    assert.deepEqual(JSON.parse(call.init.body), fixture.body);
+    assert.equal(call.init.headers["idempotency-key"], fixture.argv.at(-1));
+  }
+});
+
 test("CODEX_TASKBOARD_URL overrides the service origin", async () => {
   let requestedUrl;
   const result = await run(
