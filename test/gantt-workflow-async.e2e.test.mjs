@@ -190,7 +190,7 @@ async function startDelayedProxy(targetOrigin) {
         response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
         upstreamResponse.pipe(response);
       };
-      if (request.method === "GET" && target.pathname === "/api/projects/alpha/stage-workflow") {
+      if (request.method === "GET" && target.pathname === "/api/projects/alpha/workflow-authoring") {
         delayedWorkflowResponses += 1;
         const timer = setTimeout(() => {
           delayedForwards.delete(timer);
