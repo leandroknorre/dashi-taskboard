@@ -336,6 +336,8 @@ export interface Project {
   source: "local" | "jira";
   labels: string[];
   issueCount: number;
+  archivedAt: string | null;
+  version: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -610,6 +612,7 @@ export interface WorkflowStage {
   active: boolean;
   isDefaultForStatus: boolean;
   terminalKind: "none" | "done" | "canceled";
+  legacy?: boolean;
 }
 
 export interface StageWorkflowDefinition {
@@ -622,6 +625,49 @@ export interface StageWorkflowRecord {
   definition: StageWorkflowDefinition;
   version: number;
   updatedAt: string | null;
+}
+
+export interface WorkflowAuthoringStage {
+  stageId: string | null;
+  canonicalStatus: TaskStatus;
+  name: string;
+  boardVisible: boolean;
+  order: number;
+  active: boolean;
+  isDefaultForStatus: boolean;
+  terminalKind: "none" | "done" | "canceled";
+}
+
+export interface WorkflowAuthoringDefinition {
+  schemaVersion: 2;
+  stages: WorkflowAuthoringStage[];
+}
+
+export interface LegacyOccupiedStage {
+  stageId: string;
+  canonicalStatus: TaskStatus;
+  name: string;
+  terminalKind: "none" | "done" | "canceled";
+  taskCount: number;
+}
+
+export interface WorkflowAuthoringRecord {
+  projectId: string;
+  workflowId: string;
+  revisionId: string | null;
+  revision: number;
+  definition: WorkflowAuthoringDefinition;
+  legacyOccupiedStages: LegacyOccupiedStage[];
+  projectUpdatedAt: string;
+}
+
+export interface WorkflowAuthoringValidation {
+  valid: true;
+  projectId: string;
+  expectedRevisionId: string | null;
+  nextRevision: number;
+  definition: WorkflowAuthoringDefinition;
+  legacyOccupiedStages: LegacyOccupiedStage[];
 }
 
 export interface TaskEvent {

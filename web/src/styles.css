@@ -5106,7 +5106,8 @@ kbd {
   font-size: 11px;
 }
 
-.project-create-dialog label {
+.project-create-dialog label,
+.project-rename-dialog label {
   display: grid;
   gap: 6px;
   margin-top: 16px;
@@ -5114,7 +5115,8 @@ kbd {
   font-size: 11px;
 }
 
-.project-create-dialog input {
+.project-create-dialog input,
+.project-rename-dialog input {
   width: 100%;
   height: 32px;
   padding: 0 9px;
@@ -5126,7 +5128,8 @@ kbd {
   font: inherit;
 }
 
-.project-create-dialog input:focus {
+.project-create-dialog input:focus,
+.project-rename-dialog input:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 2px var(--accent-soft);
 }
@@ -11099,6 +11102,8 @@ kbd {
 .issue-list-status-icon .taskboard-icon { width: 14px; height: 14px; }
 .issue-list-group-header strong { font-size: 11px; font-weight: 580; }
 .issue-list-group-header span { color: var(--text-tertiary); font-size: 10px; }
+.issue-list-group.is-legacy .issue-list-group-header { border: 1px dashed var(--border-strong); }
+.issue-list-group-header .issue-list-legacy-badge { padding: 1px 4px; border: 1px solid currentColor; border-radius: 999px; font-size: 8px; font-weight: 600; text-transform: uppercase; }
 
 .issue-list-group.status-backlog { --status-color: var(--status-backlog); }
 .issue-list-group.status-todo { --status-color: var(--status-todo); }
@@ -11904,6 +11909,7 @@ kbd {
 .board-workflow-header { display: flex; justify-content: space-between; gap: 16px; }
 .board-workflow-header h2, .board-workflow-header p { margin: 0; }
 .board-workflow-header p { margin-top: 6px; color: var(--text-secondary, #687184); }
+.board-workflow-header .board-workflow-revision { color: var(--accent); font-weight: 550; }
 .board-workflow-body {
   display: flex;
   flex: 1 1 auto;
@@ -11937,6 +11943,15 @@ kbd {
 .board-workflow-stage input, .board-workflow-stage select, .board-workflow-remap select { min-width: 0; }
 .board-workflow-visibility { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
 .board-workflow-remap { display: grid; grid-template-columns: minmax(0, 1fr) 200px; gap: 8px; align-items: center; }
+.board-workflow-legacy { display: grid; gap: 5px; padding: 10px; border: 1px dashed var(--border-strong); border-radius: 8px; }
+.board-workflow-legacy h3, .board-workflow-legacy p { margin: 0; }
+.board-workflow-legacy h3 { color: var(--text-primary); font-size: 11px; }
+.board-workflow-legacy > div { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; }
+.board-workflow-legacy > div > span { display: inline-flex; align-items: center; gap: 5px; padding: 4px 7px; border-radius: 6px; background: var(--surface-muted); color: var(--text-secondary); font-size: 10px; }
+.board-workflow-legacy small, .column-legacy-badge { padding: 1px 4px; border: 1px solid currentColor; border-radius: 999px; color: var(--text-tertiary); font-size: 8px; font-weight: 600; text-transform: uppercase; }
+.board-column.is-legacy { opacity: .82; }
+.board-column.is-legacy .column-header { background: color-mix(in srgb, var(--text-tertiary) 10%, transparent); color: var(--text-secondary); }
+.column-legacy-badge { flex: 0 0 auto; }
 .board-workflow-actions { display: flex; flex: 0 0 auto; justify-content: flex-end; gap: 8px; margin: 0; }
 @media (max-width: 719px) {
   .board-workflow-stage { min-width: 0; grid-template-columns: auto minmax(0, 1fr) auto; }

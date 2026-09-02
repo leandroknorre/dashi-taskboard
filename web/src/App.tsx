@@ -29,7 +29,7 @@ import {
   getHostRuntime,
   getNestedWorkspace,
   getTaskRollup,
-  getStageWorkflow,
+  getWorkflowAuthoring,
   getJiraConnection,
   getTaskboardRevision,
   getTaskboardMetadata,
@@ -81,12 +81,14 @@ import {
 import { LinearIcon } from "./components/LinearIcon";
 import {
   DeleteIcon,
+  EditIcon,
   MoreIcon,
   PlusIcon,
   RefreshIcon,
   RelationIcon,
 } from "./components/SemanticIcons";
 import { ProjectAutomationMenu } from "./components/ProjectAutomationMenu";
+import { ProjectRenameDialog } from "./components/ProjectRenameDialog";
 import { TaskboardIcon } from "./components/TaskboardIcon";
 import { TaskContextMenu } from "./components/TaskContextMenu";
 import { TaskDetail } from "./components/TaskDetail";
@@ -152,7 +154,7 @@ import {
   type IssueRelationType,
   type JiraConnection,
   type Project,
-  type StageWorkflowRecord,
+  type WorkflowAuthoringRecord,
   type Task,
   type TaskboardMetadata,
   type NestedWorkspace,
@@ -165,6 +167,7 @@ import {
   descriptorFromProjectTasks,
   type WorkspaceNavigationTarget,
 } from "./workspaceDescriptor";
+import { workflowDisplayStages } from "./workflowAuthoring";
 // The poller stays in ESM JavaScript so its lifecycle can be tested directly with node:test.
 // @ts-expect-error The module's option contract is enforced by its focused node tests.
 import { createRevisionPoller, createRevisionWebSocketClient, getRevisionPollingInterval, getRevisionWebSocketConfig } from "./revisionPolling.mjs";
@@ -252,6 +255,7 @@ interface ProjectChoice {
   issueCount: number;
   inCodex: boolean;
   persisted: boolean;
+  renamable: boolean;
   codexIdentity: CodexProjectIdentity | null;
 }
 
@@ -878,12 +882,13 @@ export function App() {
   const [jiraSyncing, setJiraSyncing] = useState(false);
   const [jiraError, setJiraError] = useState<string | null>(null);
   const [pendingProjectDelete, setPendingProjectDelete] = useState<ProjectChoice | null>(null);
+  const [projectRenameTarget, setProjectRenameTarget] = useState<Project | null>(null);
   const [projectDeleteIssueCount, setProjectDeleteIssueCount] = useState<number | null>(null);
   const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
   const [deviceWorkspacePaths, setDeviceWorkspacePaths] = useState(readDeviceWorkspacePaths);
   const [projectCodexIdentities, setProjectCodexIdentities] = useState(readProjectCodexIdentities);
   const [projectAutomations, setProjectAutomations] = useState(readProjectAutomations);
-  const [stageWorkflow, setStageWorkflow] = useState<StageWorkflowRecord | null>(null);
+  const [stageWorkflow, setStageWorkflow] = useState<WorkflowAuthoringRecord | null>(null);
   const [workflowDialogOpen, setWorkflowDialogOpen] = useState(false);
   const [automationPending, setAutomationPending] = useState(false);
   const [automationError, setAutomationError] = useState<string | null>(null);
@@ -1035,7 +1040,7 @@ export function App() {
       return;
     }
     const controller = new AbortController();
-    void getStageWorkflow(selectedProject.id, controller.signal).then((workflow) => {
+    void getWorkflowAuthoring(selectedProject.id, controller.signal).then((workflow) => {
       if (!controller.signal.aborted) setStageWorkflow(workflow);
     }).catch(() => {
       if (!controller.signal.aborted) setStageWorkflow(null);
@@ -1253,14 +1258,16 @@ export function App() {
     for (const project of hostContext?.projects ?? []) {
       if (!project.id || !project.name || seen.has(project.id)) continue;
       seen.add(project.id);
+      const persisted = persistedById.get(project.id);
       choices.push({
         id: project.id,
         name: project.id === GLOBAL_PROJECT_ID
           ? text("临时任务", "Temporary tasks")
-          : persistedById.get(project.id)?.name ?? project.name,
-        issueCount: persistedById.get(project.id)?.issueCount ?? 0,
+          : persisted?.name ?? project.name,
+        issueCount: persisted?.issueCount ?? 0,
         inCodex: true,
-        persisted: persistedById.has(project.id),
+        persisted: Boolean(persisted),
+        renamable: persisted?.source === "local" && project.id !== GLOBAL_PROJECT_ID,
         codexIdentity: project.workspacePath && project.projectKind && project.hostId
           ? {
               codexProjectId: project.id,
@@ -1281,6 +1288,7 @@ export function App() {
         issueCount: project.issueCount,
         inCodex: false,
         persisted: true,
+        renamable: project.source === "local" && project.id !== GLOBAL_PROJECT_ID,
         codexIdentity: projectCodexIdentities[project.id] ?? null,
       });
     }
@@ -2562,10 +2570,12 @@ export function App() {
     ) as Record<TaskStatus, Task[]>;
   }, [filteredTasks]);
 
-  const workflowBoardStages = stageWorkflow?.definition.stages
-    .filter((stage) => stage.active && stage.boardVisible)
-    .sort((left, right) => left.order - right.order) ?? [];
-  const mainBoardItems = workflowBoardStages.length
+  const workflowStages = useMemo(() => workflowDisplayStages(stageWorkflow), [stageWorkflow]);
+  const hasMaterializedWorkflow = workflowStages.length > 0;
+  const workflowBoardStages = workflowStages.filter((stage) => (
+    stage.legacy || (stage.active && stage.boardVisible)
+  ));
+  const mainBoardItems = hasMaterializedWorkflow
     ? workflowBoardStages.map((stage) => stage.stageId)
     : boardDisplaySettings.mainStatuses;
   const mainColumnCount = Math.max(mainBoardItems.length, 1);
@@ -2576,7 +2586,7 @@ export function App() {
   // Stage placement/order comes from the project workflow. The older display
   // settings still control card content, but must not render a second copy of
   // canonical-status columns alongside custom stages.
-  const otherTaskTabs = workflowBoardStages.length
+  const otherTaskTabs = hasMaterializedWorkflow
     ? []
     : boardDisplaySettings.sidebarStatuses;
   const otherTaskTabsKey = otherTaskTabs.join(",");
@@ -3777,6 +3787,25 @@ export function App() {
     }
   }
 
+  function requestProjectRename(choice: ProjectChoice) {
+    const project = projects.find((candidate) => candidate.id === choice.id);
+    if (!project || !choice.renamable) return;
+    setProjectMenuOpen(false);
+    setProjectContextMenu(null);
+    setProjectRenameTarget(project);
+  }
+
+  function finishProjectRename(project: Project) {
+    setProjects((current) => current.map((candidate) => (
+      candidate.id === project.id ? project : candidate
+    )));
+    setProjectRenameTarget(null);
+    setAnnouncement(text(
+      `已将项目重命名为“${project.name}”`,
+      `Renamed project to “${project.name}”`,
+    ));
+  }
+
   function requestProjectDelete(project: ProjectChoice) {
     setProjectMenuOpen(false);
     setProjectContextMenu(null);
@@ -3922,7 +3951,7 @@ export function App() {
                           role="menuitemradio"
                           aria-checked={project.id === selectedProjectId}
                           disabled={openingProjectId !== null}
-                          onContextMenu={project.id.startsWith("temp-") ? (event) => {
+                          onContextMenu={project.renamable || project.id.startsWith("temp-") ? (event) => {
                             event.preventDefault();
                             setProjectContextMenu({
                               project,
@@ -3942,6 +3971,21 @@ export function App() {
                       </Fragment>
                     ))}
                     <div className="project-menu-divider" role="separator" />
+                    {selectedProject?.source === "local" && selectedProject.id !== GLOBAL_PROJECT_ID && (
+                      <button
+                        type="button"
+                        role="menuitem"
+                        disabled={openingProjectId !== null}
+                        onClick={() => {
+                          setProjectMenuOpen(false);
+                          setProjectContextMenu(null);
+                          setProjectRenameTarget(selectedProject);
+                        }}
+                      >
+                        <EditIcon className="project-avatar" color="currentColor" size={16} />
+                        <span>{text("重命名当前项目", "Rename current project")}</span>
+                      </button>
+                    )}
                     <button
                       type="button"
                       role="menuitem"
@@ -4191,7 +4235,7 @@ export function App() {
             tasks={tasks.filter((task) => task.projectId === detailTask.projectId)}
             referenceTasks={referenceTasks.filter((task) => task.projectId === detailTask.projectId)}
             currentUser={currentUser}
-            workflowStages={stageWorkflow?.definition.stages}
+            workflowStages={workflowStages}
             availableLabels={availableLabels}
             developmentScan={developmentScan}
             developmentScanLoading={developmentScanLoading}
@@ -4256,7 +4300,7 @@ export function App() {
                       zoom={ganttZoom}
                       hideCompleted={ganttHideCompleted}
                       todayRequest={ganttTodayRequest}
-                      workflowStages={stageWorkflow?.definition.stages}
+                      workflowStages={workflowStages}
                       restoreViewport={workspaceGanttRestore}
                       onRestoreViewport={acknowledgeWorkspaceGanttRestore}
                       onOpenTask={openTaskOrWorkspace}
@@ -4325,7 +4369,9 @@ export function App() {
                               currentUser={currentUser}
                               showCover={boardDisplaySettings.cover}
                               showBody={boardDisplaySettings.body}
-                              createEnabled={!isJiraProject}
+                              createEnabled={!isJiraProject && !workflowStage?.legacy}
+                              dropEnabled={!workflowStage?.legacy}
+                              legacy={workflowStage?.legacy}
                               onCreateLabel={persistProjectLabel}
                               onCreate={(initialStatus, stageId) => setEditor({ task: null, status: initialStatus, stageId })}
                               onEdit={openTaskOrWorkspace}
@@ -4413,7 +4459,7 @@ export function App() {
             tasks={filteredTasks}
             presentations={taskPresentations}
             currentUser={currentUser}
-            workflowStages={stageWorkflow?.definition.stages}
+            workflowStages={workflowStages}
             hasActiveFilters={hasActiveTaskFilters}
             onOpenTask={openTaskOrWorkspace}
             onOpenTaskDetail={openTaskDetail}
@@ -4430,7 +4476,7 @@ export function App() {
               zoom={ganttZoom}
               hideCompleted={ganttHideCompleted}
               todayRequest={ganttTodayRequest}
-              workflowStages={stageWorkflow?.definition.stages}
+              workflowStages={workflowStages}
               restoreViewport={workspaceGanttRestore}
               onRestoreViewport={acknowledgeWorkspaceGanttRestore}
               onOpenTask={openTaskOrWorkspace}
@@ -4501,7 +4547,9 @@ export function App() {
                         currentUser={currentUser}
                         showCover={boardDisplaySettings.cover}
                         showBody={boardDisplaySettings.body}
-                        createEnabled={!isJiraProject}
+                        createEnabled={!isJiraProject && !workflowStage?.legacy}
+                        dropEnabled={!workflowStage?.legacy}
+                        legacy={workflowStage?.legacy}
                         onCreateLabel={persistProjectLabel}
                         onCreate={(initialStatus, stageId) => setEditor({ task: null, status: initialStatus, stageId })}
                         onEdit={openTaskOrWorkspace}
@@ -4586,16 +4634,37 @@ export function App() {
           )}
           style={{ left: projectContextMenu.x, top: projectContextMenu.y }}
         >
-          <button
-            className="context-menu-item is-danger"
-            type="button"
-            role="menuitem"
-            onClick={() => requestProjectDelete(projectContextMenu.project)}
-          >
-            <span className="context-menu-icon" aria-hidden="true"><DeleteIcon color="currentColor" /></span>
-            <span className="context-menu-label">{text("删除项目", "Delete project")}</span>
-          </button>
+          {projectContextMenu.project.renamable && (
+            <button
+              className="context-menu-item"
+              type="button"
+              role="menuitem"
+              onClick={() => requestProjectRename(projectContextMenu.project)}
+            >
+              <span className="context-menu-icon" aria-hidden="true"><EditIcon color="currentColor" /></span>
+              <span className="context-menu-label">{text("重命名项目", "Rename project")}</span>
+            </button>
+          )}
+          {projectContextMenu.project.id.startsWith("temp-") && (
+            <button
+              className="context-menu-item is-danger"
+              type="button"
+              role="menuitem"
+              onClick={() => requestProjectDelete(projectContextMenu.project)}
+            >
+              <span className="context-menu-icon" aria-hidden="true"><DeleteIcon color="currentColor" /></span>
+              <span className="context-menu-label">{text("删除项目", "Delete project")}</span>
+            </button>
+          )}
         </div>
+      )}
+
+      {projectRenameTarget && (
+        <ProjectRenameDialog
+          project={projectRenameTarget}
+          onClose={() => setProjectRenameTarget(null)}
+          onSaved={finishProjectRename}
+        />
       )}
 
       {jiraDialogOpen && (
@@ -4803,7 +4872,7 @@ export function App() {
             : newTaskDraft.draft}
           labels={projects.find((project) => project.id === editorProjectId)?.labels ?? []}
           currentUser={currentUser}
-          workflowStages={stageWorkflow?.definition.stages}
+          workflowStages={workflowStages}
           developmentScan={developmentScan}
           developmentScanLoading={developmentScanLoading}
           onCreateLabel={(label) => persistProjectLabel(label, editorProjectId ?? selectedProjectId)}
@@ -4826,7 +4895,7 @@ export function App() {
           task={contextMenuTask}
           position={{ x: contextMenu.x, y: contextMenu.y }}
           labels={availableLabels}
-          workflowStages={stageWorkflow?.definition.stages}
+          workflowStages={workflowStages}
           onClose={closeContextMenu}
           onEdit={openTaskDetail}
           onStatusChange={(task, status, stageId) => void moveTask(task, status, null, false, stageId)}

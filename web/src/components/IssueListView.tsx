@@ -56,8 +56,8 @@ export function IssueListView({
   }
 
   const orderedStages = useMemo(() => workflowStages?.length
-    ? [...workflowStages].filter((stage) => stage.active).sort((left, right) => left.order - right.order)
-    : TASK_STATUSES.map((status, order) => ({ stageId: status, canonicalStatus: status, name: taskStatusLabel(language, status), order, boardVisible: true, active: true, isDefaultForStatus: true, terminalKind: "none" as const })),
+    ? [...workflowStages].filter((stage) => stage.active || stage.legacy).sort((left, right) => left.order - right.order)
+    : TASK_STATUSES.map((status, order) => ({ stageId: status, canonicalStatus: status, name: taskStatusLabel(language, status), order, boardVisible: true, active: true, isDefaultForStatus: true, terminalKind: "none" as const, legacy: false })),
   [language, workflowStages]);
 
   function toggleStatus(status: string) {
@@ -78,11 +78,12 @@ export function IssueListView({
           const isCollapsed = collapsed.has(stage.stageId);
           const statusLabel = stage.name || taskStatusLabel(language, status);
           return (
-            <section className={`issue-list-group status-${status}`} key={stage.stageId}>
+            <section className={`issue-list-group status-${status}${stage.legacy ? " is-legacy" : ""}`} key={stage.stageId}>
               <button className="issue-list-group-header" type="button" onClick={() => toggleStatus(stage.stageId)} aria-expanded={!isCollapsed}>
                 <LinearIcon name={isCollapsed ? "chevronRight" : "chevronDown"} />
                 <span className="issue-list-status-icon"><StatusIcon status={status} color="currentColor" size={14} /></span>
                 <strong>{statusLabel}</strong>
+                {stage.legacy && <span className="issue-list-legacy-badge">{text("旧版", "Legacy")}</span>}
                 <span>{statusTasks.length}</span>
               </button>
               {!isCollapsed && (

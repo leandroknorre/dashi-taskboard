@@ -40,6 +40,8 @@ interface BoardColumnProps {
   showCover: boolean;
   showBody: boolean;
   createEnabled?: boolean;
+  dropEnabled?: boolean;
+  legacy?: boolean;
   onCreateLabel: (label: string, projectId?: string) => Promise<void>;
   onCreate: (status: TaskStatus, stageId?: string) => void;
   onEdit: (task: Task) => void;
@@ -74,6 +76,8 @@ export function BoardColumn({
   showCover,
   showBody,
   createEnabled = true,
+  dropEnabled = true,
+  legacy = false,
   onCreateLabel,
   onCreate,
   onEdit,
@@ -112,6 +116,7 @@ export function BoardColumn({
   }
 
   function handleDrop(event: DragEvent<HTMLElement>) {
+    if (!dropEnabled) return;
     event.preventDefault();
     const taskId =
       event.dataTransfer.getData("application/x-taskboard-task") ||
@@ -131,18 +136,23 @@ export function BoardColumn({
     return shift;
   }
 
+  const headingId = `column-${stageId ?? status}`;
+
   return (
     <section
-      className={`board-column status-${status}${isDropTarget ? " is-drop-target" : ""}`}
-      aria-labelledby={`column-${status}`}
-      onDragEnter={() => onDragEnter(status, stageId)}
+      className={`board-column status-${status}${isDropTarget && dropEnabled ? " is-drop-target" : ""}${legacy ? " is-legacy" : ""}`}
+      aria-labelledby={headingId}
+      aria-disabled={!dropEnabled || undefined}
+      onDragEnter={dropEnabled ? () => onDragEnter(status, stageId) : undefined}
       onDragOver={(event) => {
+        if (!dropEnabled) return;
         event.preventDefault();
         event.dataTransfer.dropEffect = "move";
         onDragEnter(status, stageId);
         setDropBeforeTaskId(findDropBefore(event.currentTarget, event.clientY));
       }}
       onDragLeave={(event) => {
+        if (!dropEnabled) return;
         if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) {
           setDropBeforeTaskId(undefined);
         }
@@ -154,11 +164,12 @@ export function BoardColumn({
           <span className={`column-status-icon status-icon-${details.tone}`}>
             <StatusIcon status={status} color="var(--column-status-color)" size={14} />
           </span>
-          <h2 id={`column-${status}`}>
+          <h2 id={headingId}>
             {label}{tasks.length > 0 ? ` ${tasks.length}` : ""}
           </h2>
+          {legacy && <span className="column-legacy-badge">{text("旧版", "Legacy")}</span>}
         </div>
-        {createEnabled && (
+        {createEnabled && dropEnabled && (
           <div className="column-actions">
             <button
               type="button"

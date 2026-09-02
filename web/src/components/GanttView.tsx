@@ -18,6 +18,7 @@ interface GanttGroupDefinition {
   englishLabel: string;
   statuses: Task["status"][];
   defaultOpen: boolean;
+  legacy?: boolean;
 }
 
 interface TaskboardGanttTask extends GanttTask {
@@ -152,9 +153,10 @@ export const GanttView = forwardRef<GanttViewport, GanttViewProps>(function Gant
     [hideCompleted, tasks],
   );
   const ganttGroups = useMemo(() => workflowStages?.length
-    ? workflowStages.filter((stage) => stage.active).sort((left, right) => left.order - right.order).map((stage) => ({
+    ? workflowStages.filter((stage) => stage.active || stage.legacy).sort((left, right) => left.order - right.order).map((stage) => ({
       id: stage.stageId, stageId: stage.stageId, label: stage.name, chineseLabel: "", englishLabel: "",
       statuses: [stage.canonicalStatus], defaultOpen: stage.canonicalStatus !== "done" && stage.canonicalStatus !== "canceled",
+      legacy: stage.legacy,
     }))
     : GANTT_GROUPS,
   [workflowStages]);
@@ -411,7 +413,10 @@ export const GanttView = forwardRef<GanttViewport, GanttViewProps>(function Gant
       if (!instance.isTaskExists(id)) continue;
       const task = instance.getTask(id) as TaskboardGanttTask & { $open?: boolean };
       const open = task.$open;
-      const label = group.label || i18nRef.current.text(group.chineseLabel, group.englishLabel);
+      const baseLabel = group.label || i18nRef.current.text(group.chineseLabel, group.englishLabel);
+      const label = group.legacy
+        ? `${baseLabel} · ${i18nRef.current.text("旧版", "Legacy")}`
+        : baseLabel;
       task.text = label;
       task.taskboardTitle = label;
       task.$open = open;
@@ -444,7 +449,10 @@ export const GanttView = forwardRef<GanttViewport, GanttViewProps>(function Gant
 
     for (const group of ganttGroups) {
       const groupId = `gantt-group-${group.id}`;
-      const groupLabel = group.label || i18nRef.current.text(group.chineseLabel, group.englishLabel);
+      const baseLabel = group.label || i18nRef.current.text(group.chineseLabel, group.englishLabel);
+      const groupLabel = group.legacy
+        ? `${baseLabel} · ${i18nRef.current.text("旧版", "Legacy")}`
+        : baseLabel;
       const groupTasks = visibleTasks
         .filter((task) => group.stageId ? task.stageId === group.stageId : group.statuses.includes(task.status))
         .sort((left, right) => Number(Boolean(right.startDate && right.dueDate)) - Number(Boolean(left.startDate && left.dueDate)));

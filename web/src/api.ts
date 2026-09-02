@@ -28,6 +28,9 @@ import type {
   TaskRollup,
   StageWorkflowDefinition,
   StageWorkflowRecord,
+  WorkflowAuthoringDefinition,
+  WorkflowAuthoringRecord,
+  WorkflowAuthoringValidation,
   TaskChangeActivity,
   TaskboardMetadata,
   TaskDraft,
@@ -642,6 +645,58 @@ export function saveStageWorkflow(
     `/api/projects/${encodeURIComponent(projectId)}/stage-workflow`,
     { method: "PUT", body: JSON.stringify({ definition, version, removals }) },
   );
+}
+
+export function getWorkflowAuthoring(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<WorkflowAuthoringRecord> {
+  return request<{ workflow: WorkflowAuthoringRecord }>(
+    `/api/projects/${encodeURIComponent(projectId)}/workflow-authoring`,
+    { signal },
+  ).then((data) => data.workflow);
+}
+
+export function validateWorkflowAuthoring(
+  projectId: string,
+  expectedRevisionId: string | null,
+  definition: WorkflowAuthoringDefinition,
+): Promise<WorkflowAuthoringValidation> {
+  return request<{ validation: WorkflowAuthoringValidation }>(
+    `/api/projects/${encodeURIComponent(projectId)}/workflow-authoring/validate`,
+    {
+      method: "POST",
+      body: JSON.stringify({ expectedRevisionId, definition }),
+    },
+  ).then((data) => data.validation);
+}
+
+export function publishWorkflowAuthoring(
+  projectId: string,
+  expectedRevisionId: string | null,
+  definition: WorkflowAuthoringDefinition,
+): Promise<WorkflowAuthoringRecord> {
+  return request<{ workflow: WorkflowAuthoringRecord }>(
+    `/api/projects/${encodeURIComponent(projectId)}/workflow-authoring/publish`,
+    {
+      method: "POST",
+      body: JSON.stringify({ expectedRevisionId, definition }),
+    },
+  ).then((data) => data.workflow);
+}
+
+export async function renameProject(
+  project: Project,
+  name: string,
+): Promise<Project> {
+  const data = await request<{ project: Project }>(
+    `/api/projects/${encodeURIComponent(project.id)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ name, expectedUpdatedAt: project.updatedAt }),
+    },
+  );
+  return data.project;
 }
 
 export async function updateTask(task: Task, draft: Partial<TaskDraft>, threadId?: string): Promise<Task> {

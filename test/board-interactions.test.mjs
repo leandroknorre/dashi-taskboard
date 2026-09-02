@@ -4,10 +4,13 @@ import { test } from "node:test";
 
 const appSource = await readFile(new URL("../web/src/App.tsx", import.meta.url), "utf8");
 const boardColumnSource = await readFile(new URL("../web/src/components/BoardColumn.tsx", import.meta.url), "utf8");
+const boardWorkflowSource = await readFile(new URL("../web/src/components/BoardWorkflowDialog.tsx", import.meta.url), "utf8");
 const apiSource = await readFile(new URL("../web/src/api.ts", import.meta.url), "utf8");
 const styles = await readFile(new URL("../web/src/styles.css", import.meta.url), "utf8");
 const detailSource = await readFile(new URL("../web/src/components/TaskDetail.tsx", import.meta.url), "utf8");
 const editorSource = await readFile(new URL("../web/src/components/TaskEditor.tsx", import.meta.url), "utf8");
+const ganttSource = await readFile(new URL("../web/src/components/GanttView.tsx", import.meta.url), "utf8");
+const issueListSource = await readFile(new URL("../web/src/components/IssueListView.tsx", import.meta.url), "utf8");
 const labelPickerSource = await readFile(new URL("../web/src/components/LabelPicker.tsx", import.meta.url), "utf8");
 const contextMenuSource = await readFile(new URL("../web/src/components/TaskContextMenu.tsx", import.meta.url), "utf8");
 const cardSource = await readFile(new URL("../web/src/components/TaskCard.tsx", import.meta.url), "utf8");
@@ -183,6 +186,37 @@ test("workflow blockers, authentication, conflicts and outages keep distinct UI 
     /bannerControl === "reauthenticate"[\s\S]*?setConnection\("reconnecting"\)[\s\S]*?invalidateCloudData\(\)/,
   );
   assert.match(appSource, /bannerControl === "refresh"[\s\S]*?"Refresh"[\s\S]*?"Try again"/);
+});
+
+test("versioned workflow authoring retires old columns without legacy remap writes", () => {
+  assert.match(boardWorkflowSource, /getWorkflowAuthoring/);
+  assert.match(boardWorkflowSource, /validateWorkflowAuthoring[\s\S]*?publishWorkflowAuthoring/);
+  assert.match(boardWorkflowSource, /record\.revisionId === null/);
+  assert.doesNotMatch(boardWorkflowSource, /saveStageWorkflow|stage-workflow|remaps|destinationStageId/);
+  assert.match(appSource, /workflowDisplayStages\(stageWorkflow\)/);
+  assert.match(appSource, /hasMaterializedWorkflow[\s\S]*?workflowBoardStages\.map/);
+  assert.match(appSource, /dropEnabled=\{!workflowStage\?\.legacy\}/);
+  assert.match(boardColumnSource, /if \(!dropEnabled\) return/);
+  assert.match(boardColumnSource, /createEnabled && dropEnabled/);
+});
+
+test("legacy stages remain read projections but never become movement targets", () => {
+  assert.match(issueListSource, /stage\.active \|\| stage\.legacy/);
+  assert.match(ganttSource, /stage\.active \|\| stage\.legacy/);
+  assert.match(editorSource, /\.filter\(\(stage\) => stage\.active\)/);
+  assert.match(detailSource, /workflowStages\?\.filter\(\(stage\) => stage\.active\)/);
+  assert.match(contextMenuSource, /workflowStages\?\.filter\(\(stage\) => stage\.active\)/);
+});
+
+test("project rename replaces metadata without navigating away from the selected id", () => {
+  const renameHandler = appSource.slice(
+    appSource.indexOf("function finishProjectRename"),
+    appSource.indexOf("function requestProjectDelete"),
+  );
+  assert.match(renameHandler, /setProjects[\s\S]*?candidate\.id === project\.id \? project : candidate/);
+  assert.doesNotMatch(renameHandler, /changeProject|setSelectedProjectId|history\.|location\./);
+  assert.match(appSource, /<ProjectRenameDialog[\s\S]*?onSaved=\{finishProjectRename\}/);
+  assert.match(appSource, /role="menuitem"[\s\S]*?Rename current project/);
 });
 
 test("issues expose processing conversations without manual binding", () => {

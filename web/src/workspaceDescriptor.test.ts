@@ -9,6 +9,8 @@ const project: Project = {
   source: "local",
   labels: [],
   issueCount: 4,
+  archivedAt: null,
+  version: 1,
   createdAt: "2026-08-25T00:00:00.000Z",
   updatedAt: "2026-08-25T00:00:00.000Z",
 };

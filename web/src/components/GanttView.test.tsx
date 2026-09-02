@@ -192,6 +192,48 @@ describe("GanttView workflow stages", () => {
     }));
   });
 
+  it("keeps a card grouped under its occupied legacy stage", async () => {
+    const legacyStage: WorkflowStage = {
+      ...workflowStages[0]!,
+      stageId: "legacy-stage",
+      name: "Old review",
+      active: false,
+      legacy: true,
+    };
+    render(
+      <GanttView
+        tasks={[task("legacy-issue", "Legacy card", "legacy-stage")]}
+        presentations={emptyPresentations}
+        hasActiveFilters={false}
+        zoom="week"
+        hideCompleted={false}
+        todayRequest={0}
+        workflowStages={[legacyStage]}
+        onOpenTask={noop}
+        onOpenTaskDetail={noop}
+        onUpdate={async (current) => current}
+      />,
+    );
+
+    await waitFor(() => expect(gantt.instance.parse).toHaveBeenCalled());
+    expect(screen.getByTestId("gantt-rendered-groups").textContent).toContain("Old review · Legacy");
+    expect(gantt.instance.parse).toHaveBeenLastCalledWith(expect.objectContaining({
+      data: expect.arrayContaining([
+        expect.objectContaining({
+          id: "gantt-group-legacy-stage",
+          readonly: true,
+          taskboardGroup: true,
+          taskboardCount: 1,
+        }),
+        expect.objectContaining({
+          id: "legacy-issue",
+          parent: "gantt-group-legacy-stage",
+          taskboardTitle: "Legacy card",
+        }),
+      ]),
+    }));
+  });
+
   it("restores a virtualized 60-card Gantt viewport after parsing", async () => {
     const onRestoreViewport = vi.fn();
     const cards = Array.from({ length: 60 }, (_, index) => task(
