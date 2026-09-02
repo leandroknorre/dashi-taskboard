@@ -426,25 +426,32 @@ export class TransitionService {
     }
   }
 
-  publishRevision({ projectId, definition, bindings, rules }) {
+  publishRevision({ projectId, definition, bindings, rules }, { transaction = true } = {}) {
     let normalized;
     try {
       normalized = normalizeWorkflowRevision(definition);
     } catch (error) {
       throw apiError(error);
     }
-    this.database.exec("BEGIN IMMEDIATE");
+    if (transaction) this.database.exec("BEGIN IMMEDIATE");
     try {
-      const workflow = this.database.prepare(`
+      let workflow = this.database.prepare(`
         SELECT * FROM workflow_definitions WHERE project_id = ?
       `).get(projectId);
-      if (!workflow || workflow.workflow_id !== normalized.workflowId) {
+      if (workflow && workflow.workflow_id !== normalized.workflowId) {
         throw new ApiError(404, "WORKFLOW_NOT_FOUND", "Workflow definition does not match the project");
       }
-      const previous = this.database.prepare(`
-        SELECT definition_json FROM workflow_revisions WHERE revision_id = ?
-      `).get(workflow.current_revision_id);
-      assertWorkflowRevisionPublication(JSON.parse(previous.definition_json), normalized);
+      const project = this.database.prepare("SELECT id FROM projects WHERE id = ?").get(projectId);
+      if (!project) throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
+      const previous = workflow
+        ? this.database.prepare(`
+            SELECT definition_json FROM workflow_revisions WHERE revision_id = ?
+          `).get(workflow.current_revision_id)
+        : null;
+      if (workflow && !previous) {
+        throw new ApiError(409, "WORKFLOW_REVISION_MISSING", "The current workflow revision is unavailable");
+      }
+      assertWorkflowRevisionPublication(previous ? JSON.parse(previous.definition_json) : null, normalized);
       const transitionIds = new Set(normalized.transitions.map((transition) => transition.transitionId));
       const stageIds = new Set(normalized.stages.map((stage) => stage.stageId));
       if (!Array.isArray(bindings) || !Array.isArray(rules)) {
@@ -459,7 +466,31 @@ export class TransitionService {
       if (rules.some((rule) => !transitionIds.has(rule.transitionId) || !stageIds.has(rule.fromContractStageId) || !stageIds.has(rule.toContractStageId))) {
         throw new ApiError(400, "INVALID_FIELD", "A rule does not match the immutable revision definition");
       }
+      for (const binding of bindings) {
+        const stage = this.database.prepare(`
+          SELECT project_id, canonical_status, terminal_kind FROM workflow_stages WHERE id = ?
+        `).get(binding.taskStageId);
+        const expectedTerminalKind = stage?.terminal_kind === "done"
+          ? "completed"
+          : stage?.terminal_kind;
+        if (
+          !stage
+          || stage.project_id !== projectId
+          || stage.canonical_status !== binding.canonicalStatus
+          || expectedTerminalKind !== binding.terminalKind
+        ) {
+          throw new ApiError(400, "INVALID_FIELD", "A binding does not match a physical stage in this project");
+        }
+      }
       const timestamp = this.clock();
+      if (!workflow) {
+        this.database.prepare(`
+          INSERT INTO workflow_definitions (
+            workflow_id, project_id, current_revision_id, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?)
+        `).run(normalized.workflowId, projectId, normalized.revisionId, timestamp, timestamp);
+        workflow = { workflow_id: normalized.workflowId };
+      }
       this.database.prepare(`
         INSERT INTO workflow_revisions (revision_id, workflow_id, revision, definition_json, immutable, created_at)
         VALUES (?, ?, ?, ?, 1, ?)
@@ -488,10 +519,10 @@ export class TransitionService {
       this.database.prepare(`
         UPDATE workflow_definitions SET current_revision_id = ?, updated_at = ? WHERE workflow_id = ?
       `).run(normalized.revisionId, timestamp, normalized.workflowId);
-      this.database.exec("COMMIT");
+      if (transaction) this.database.exec("COMMIT");
       return normalized;
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      if (transaction) this.database.exec("ROLLBACK");
       throw apiError(error);
     }
   }

@@ -38,6 +38,7 @@ import { createJiraIntegration } from "./jira-integration.mjs";
 import { ProjectSummaryService } from "./project-summary.mjs";
 import { TransitionService } from "./transition-service.mjs";
 import { HumanAcceptanceService } from "./human-acceptance-service.mjs";
+import { WorkflowAuthoringService } from "./workflow-authoring-service.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const execFileAsync = promisify(execFile);
@@ -932,6 +933,31 @@ function parseStageWorkflowSave(body) {
     ),
     version: parseVersion(body.version),
     removals: body.removals ?? [],
+  };
+}
+
+function parseWorkflowAuthoring(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["expectedRevisionId", "definition"]));
+  return {
+    expectedRevisionId: stringField(body.expectedRevisionId, "expectedRevisionId", {
+      required: true,
+      nullable: true,
+      maxLength: 64,
+    }),
+    definition: body.definition,
+  };
+}
+
+function parseProjectRename(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["name", "expectedUpdatedAt"]));
+  return {
+    name: stringField(body.name, "name", { required: true, maxLength: 120 }),
+    expectedUpdatedAt: stringField(body.expectedUpdatedAt, "expectedUpdatedAt", {
+      required: true,
+      maxLength: 64,
+    }),
   };
 }
 
@@ -1911,6 +1937,7 @@ export function createTaskboardServer(options = {}) {
   const humanAcceptanceProvider = options.humanAcceptanceProvider ?? null;
   const preauthenticateHumanAcceptanceRequest = options.preauthenticateHumanAcceptanceRequest ?? null;
   const transitions = new TransitionService(database, { humanAcceptanceProvider });
+  const workflowAuthoring = new WorkflowAuthoringService(database, transitions);
   const humanAcceptance = new HumanAcceptanceService(database, {
     provider: humanAcceptanceProvider,
   });
@@ -2849,6 +2876,37 @@ export function createTaskboardServer(options = {}) {
         return methodNotAllowed(response, ["GET", "PUT"]);
       }
 
+      const workflowAuthoringRoute = pathname.match(
+        /^\/api\/projects\/([^/]+)\/workflow-authoring(?:\/(validate|publish))?$/,
+      );
+      if (workflowAuthoringRoute) {
+        assertNoQuery(url.searchParams, "Workflow authoring routes");
+        let projectId;
+        try {
+          projectId = decodeURIComponent(workflowAuthoringRoute[1]);
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Project id contains invalid encoding");
+        }
+        validateProjectId(projectId);
+        const action = workflowAuthoringRoute[2];
+        if (!action) {
+          if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+          return sendJson(response, 200, { workflow: workflowAuthoring.get(projectId) });
+        }
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const input = parseWorkflowAuthoring(await readJson(request));
+        if (action === "validate") {
+          return sendJson(response, 200, { validation: workflowAuthoring.validate(projectId, input) });
+        }
+        const workflow = workflowAuthoring.publish(projectId, input);
+        events.emit("workflow.published", {
+          projectId,
+          revisionId: workflow.revisionId,
+          revision: workflow.revision,
+        });
+        return sendJson(response, 201, { workflow });
+      }
+
       const projectRoute = pathname.match(/^\/api\/projects\/([^/]+)$/);
       if (projectRoute) {
         if ([...url.searchParams.keys()].length > 0) {
@@ -2866,11 +2924,19 @@ export function createTaskboardServer(options = {}) {
           if (!project) throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
           return sendJson(response, 200, { project });
         }
+        if (request.method === "PATCH") {
+          const project = workflowAuthoring.renameProject(
+            projectId,
+            parseProjectRename(await readJson(request)),
+          );
+          events.emit("project.renamed", { project });
+          return sendJson(response, 200, { project });
+        }
         if (request.method === "DELETE") {
           database.deleteProject(projectId);
           return sendEmpty(response, 204);
         }
-        return methodNotAllowed(response, ["GET", "DELETE"]);
+        return methodNotAllowed(response, ["GET", "PATCH", "DELETE"]);
       }
 
       const projectLabelsRoute = pathname.match(/^\/api\/projects\/([^/]+)\/labels$/);
@@ -4210,6 +4276,7 @@ export function createTaskboardServer(options = {}) {
 
   return {
     database,
+    workflowAuthoring,
     aiChat,
     server,
     options: resolved,
