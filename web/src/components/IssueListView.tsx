@@ -3,12 +3,13 @@ import { assigneeTargetForActor } from "../actors";
 import { taskPriorityLabel, taskStatusLabel, useTaskboardI18n } from "../i18n";
 import { labelPresentation } from "../labels";
 import type { TaskCardPresentation } from "../taskConversations";
-import { TASK_PRIORITIES, TASK_STATUSES, type ActorIdentity, type Task, type TaskDraft, type TaskStatus, type WorkflowStage } from "../types";
+import { isSourceRecord, TASK_PRIORITIES, TASK_STATUSES, type ActorIdentity, type Task, type TaskDraft, type TaskStatus, type WorkflowStage } from "../types";
 import { ActorAvatar } from "./ActorAvatar";
 import { LinearIcon } from "./LinearIcon";
 import { DueDateIcon, PriorityIcon, StatusIcon } from "./SemanticIcons";
 import { TaskConversationMenu } from "./TaskConversationMenu";
 import { TaskPropertyPicker } from "./TaskPropertyPicker";
+import { SourceRecordBadge } from "./SourceRecordBadge";
 
 const COLLAPSED_BY_DEFAULT = new Set<TaskStatus>(["backlog", "done", "canceled"]);
 
@@ -89,9 +90,10 @@ export function IssueListView({
                   {statusTasks.length ? statusTasks.map((task) => {
                     const assigneeTarget = assigneeTargetForActor(task.assignee, currentUser) ?? "current-user";
                     const displayIdentifier = task.externalKey ?? task.identifier;
+                    const sourceRecord = isSourceRecord(task);
                     return (
                       <div
-                        className={`issue-list-row${presentations[task.id]?.unread ? " is-unread" : ""}`}
+                        className={`issue-list-row${sourceRecord ? " is-source-record" : ""}${presentations[task.id]?.unread ? " is-unread" : ""}`}
                         role="button"
                         tabIndex={0}
                         key={task.id}
@@ -103,6 +105,7 @@ export function IssueListView({
                         <span className="issue-list-title-cell">
                           <small>{displayIdentifier}</small>
                           <strong>{task.title}</strong>
+                          {sourceRecord && <SourceRecordBadge item={task} compact />}
                           {presentations[task.id]?.unread && <span className="task-unread-dot" aria-label={text("有未读更新", "Unread updates")} />}
                           <button
                             className="issue-list-detail"
@@ -118,7 +121,7 @@ export function IssueListView({
                           </button>
                         </span>
                         <span className="issue-list-metadata" aria-label={text("议题属性", "Issue properties")}>
-                          <span className="issue-list-priority-control" onClick={stopRow} onKeyDown={stopRow}>
+                          {!sourceRecord && <span className="issue-list-priority-control" onClick={stopRow} onKeyDown={stopRow}>
                             <TaskPropertyPicker
                               value={task.priority}
                               options={TASK_PRIORITIES.map((priority) => ({
@@ -134,7 +137,7 @@ export function IssueListView({
                               onOpenChange={(open) => setPriorityMenuTaskId(open ? task.id : null)}
                               onChange={(priority) => void onUpdate(task, { priority }).catch(() => {})}
                             />
-                          </span>
+                          </span>}
                           <span className="issue-list-labels">
                             {task.labels.slice(0, 2).map((label) => {
                               const presentation = labelPresentation(label, language);
@@ -147,7 +150,7 @@ export function IssueListView({
                             })}
                             {task.labels.length > 2 && <b>+{task.labels.length - 2}</b>}
                           </span>
-                          {task.dueDate && (
+                          {!sourceRecord && task.dueDate && (
                             <label className="issue-list-date" onClick={stopRow}>
                               <DueDateIcon color="currentColor" size={12} />
                               <span>{calendarDate(task.dueDate, locale)}</span>
@@ -166,7 +169,7 @@ export function IssueListView({
                             conversations={presentations[task.id]?.conversations ?? []}
                             onOpenConversation={onOpenConversation}
                           />
-                          <label className="issue-list-assignee" title={task.assignee.name} onClick={stopRow}>
+                          {!sourceRecord && <label className="issue-list-assignee" title={task.assignee.name} onClick={stopRow}>
                             <ActorAvatar actor={task.assignee} />
                             <select
                               aria-label={text(`${displayIdentifier} 负责人`, `${displayIdentifier} assignee`)}
@@ -177,7 +180,7 @@ export function IssueListView({
                               <option value="current-user">{currentUser.name}</option>
                               <option value="codex-agent">Codex Agent</option>
                             </select>
-                          </label>
+                          </label>}
                         </span>
                         <time
                           dateTime={task.createdAt}

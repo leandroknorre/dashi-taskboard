@@ -38,6 +38,7 @@ import {
   listDeviceWorkspaces,
   listProjects,
   listTasks,
+  mutateSourceRecord as mutateSourceRecordRequest,
   moveTask as moveTaskRequest,
   publishHostRuntime,
   removeTaskRelation,
@@ -50,6 +51,8 @@ import {
   syncJiraConnection,
   uploadAttachment,
   updateTask as updateTaskRequest,
+  type SourceRecordAction,
+  type SourceRecordMutationResult,
 } from "./api";
 import {
   actorKey,
@@ -136,6 +139,7 @@ import {
   writeTaskFilters,
 } from "./taskFilters";
 import {
+  isSourceRecord,
   TASK_STATUSES,
   type ActorIdentity,
   type AiChatModel,
@@ -1307,6 +1311,7 @@ export function App() {
   });
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
   function openTaskContextMenu(task: Task, position: { x: number; y: number }) {
+    if (isSourceRecord(task)) return;
     if (
       isAllProjects
       && (!embedded || window.parent === window)
@@ -1676,7 +1681,7 @@ export function App() {
 
   function openTaskOrWorkspace(task: Pick<Task, "identifier" | "projectId">) {
     const fullTask = tasksRef.current.find((candidate) => candidate.identifier === task.identifier);
-    if (fullTask?.relations.subIssues.length) {
+    if (fullTask && !isSourceRecord(fullTask) && fullTask.relations.subIssues.length) {
       openNestedWorkspace(fullTask.identifier);
       return;
     }
@@ -3154,6 +3159,50 @@ export function App() {
     }
   }
 
+  async function applySourceRecordAction(
+    task: Task,
+    action: SourceRecordAction,
+    targetTaskId?: string,
+  ): Promise<SourceRecordMutationResult> {
+    setActionError(null);
+    try {
+      const result = await mutateSourceRecordRequest(
+        task,
+        action,
+        action === "adopt"
+          ? { targetProjectId: task.projectId }
+          : action === "merge"
+            ? { targetTaskId }
+            : undefined,
+      );
+      setTasks((current) => sortTasks([
+        ...current.filter((candidate) => (
+          candidate.id !== result.sourceRecord.id
+          && candidate.id !== result.workCard?.id
+        )),
+        result.sourceRecord,
+        ...(result.workCard ? [result.workCard] : []),
+      ]));
+      setAnnouncement(text(
+        action === "adopt" ? "引用已采用为可编辑工作卡。"
+          : action === "merge" ? "引用已链接到现有工作卡。"
+            : action === "discard" ? "引用已从默认候选列表中隐藏。"
+              : "引用已恢复为待处理候选。",
+        action === "adopt" ? "Reference adopted as an editable work card."
+          : action === "merge" ? "Reference linked to the existing work card."
+            : action === "discard" ? "Reference hidden from the default candidate list."
+              : "Reference restored as a pending candidate.",
+      ));
+      return result;
+    } catch (error) {
+      const failure = classifyTaskMutationFailure(error);
+      if (failure.kind === "conflict" && taskScopeProjectId) {
+        void refreshTasks(taskScopeProjectId, { quiet: true });
+      }
+      throw error;
+    }
+  }
+
   async function persistProjectLabel(label: string, projectId = selectedProjectId) {
     setActionError(null);
     try {
@@ -4152,6 +4201,7 @@ export function App() {
             onDeleteLabel={removeProjectLabel}
             onUpdate={(current, changes) => updateTaskProperties(current, changes)}
             onStatusChange={(current, status, stageId) => moveTask(current, status, null, false, stageId)}
+            onSourceRecordAction={applySourceRecordAction}
             onOpenTask={openTaskDetail}
             onOpenWorkspace={openNestedWorkspaceFromDetail}
             onAddRelation={(current, type, relatedTaskId, origin) => (

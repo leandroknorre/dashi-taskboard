@@ -20,6 +20,8 @@ import {
   uploadAttachment,
   uploadCommentAttachment,
   updateComment,
+  type SourceRecordAction,
+  type SourceRecordMutationResult,
 } from "../api";
 import {
   taskPriorityLabel,
@@ -27,7 +29,7 @@ import {
   useTaskboardI18n,
   type TaskboardLanguage,
 } from "../i18n";
-import { TASK_PRIORITIES, TASK_STATUSES } from "../types";
+import { isSourceRecord, TASK_PRIORITIES, TASK_STATUSES } from "../types";
 import type {
   ActorIdentity,
   Attachment,
@@ -99,6 +101,8 @@ import { postEmbeddedHostMessage } from "../embeddedHost.mjs";
 import copyIdIcon from "../assets/figma-taskboard/copy-id.svg";
 import copyLinkIcon from "../assets/figma-taskboard/copy-link.svg";
 import { DescriptionDocument } from "./DescriptionDocument";
+import { SourceRecordBadge } from "./SourceRecordBadge";
+import { SourceRecordDetail } from "./SourceRecordDetail";
 
 type TaskDetailError = string | readonly [string, string];
 
@@ -117,6 +121,11 @@ interface TaskDetailProps {
   onDeleteLabel: (label: string) => Promise<void>;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
   onStatusChange: (task: Task, status: TaskStatus, stageId?: string) => Promise<Task | null>;
+  onSourceRecordAction: (
+    task: Task,
+    action: SourceRecordAction,
+    targetTaskId?: string,
+  ) => Promise<SourceRecordMutationResult>;
   onOpenTask: (task: TaskRelationSummary) => void;
   onOpenWorkspace: (identifier: string) => void;
   onAddRelation: (
@@ -382,7 +391,7 @@ function ConversationLink({
   );
 }
 
-export function TaskDetail({
+function EditableTaskDetail({
   task,
   tasks,
   referenceTasks,
@@ -458,6 +467,9 @@ export function TaskDetail({
   const commentInlineImages = inlineMediaImages(commentSegments);
   const editingDraft = serializeInlineMedia(editingSegments);
   const displayIdentifier = currentTask.externalKey ?? currentTask.identifier;
+  const originSourceRecord = referenceTasks.find((candidate) => (
+    isSourceRecord(candidate) && candidate.candidateTargetTaskId === currentTask.id
+  )) ?? null;
   const editingInlineImages = inlineMediaImages(editingSegments);
 
   useEffect(() => {
@@ -1135,6 +1147,15 @@ export function TaskDetail({
                           onOpenTask={onOpenTask}
                         />
                       : text("添加描述…", "Add description…")}
+                  </div>
+                )}
+                {originSourceRecord && (
+                  <div className="source-record-origin" role="note">
+                    <SourceRecordBadge item={originSourceRecord} />
+                    <span>{text("此工作卡采用自", "This work card was adopted from")}</span>
+                    <button type="button" onClick={() => onOpenTask(originSourceRecord)}>
+                      {originSourceRecord.externalKey ?? originSourceRecord.identifier} — {originSourceRecord.title}
+                    </button>
                   </div>
                 )}
                 {(currentTask.threadBinding || currentTask.legacyLocalThreadId) && (
@@ -1969,4 +1990,21 @@ export function TaskDetail({
       )}
     </section>
   );
+}
+
+export function TaskDetail(props: TaskDetailProps) {
+  if (isSourceRecord(props.task)) {
+    return (
+      <SourceRecordDetail
+        task={props.task}
+        tasks={props.tasks}
+        referenceTasks={props.referenceTasks}
+        onAction={props.onSourceRecordAction}
+        onOpenTask={props.onOpenTask}
+        onCopy={props.onCopy}
+        onError={props.onError}
+      />
+    );
+  }
+  return <EditableTaskDetail {...props} />;
 }

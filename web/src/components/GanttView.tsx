@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Gantt, type GanttStatic, type Task as GanttTask } from "dhtmlx-gantt";
 import "../vendor/dhtmlxgantt.css";
-import type { Task, TaskDraft, WorkflowStage } from "../types";
+import { isSourceRecord, type Task, type TaskDraft, type WorkflowStage } from "../types";
 import type { TaskCardPresentation } from "../taskConversations";
 import { useTaskboardI18n } from "../i18n";
 import { LinearIcon } from "./LinearIcon";
@@ -30,6 +30,8 @@ interface TaskboardGanttTask extends GanttTask {
   taskboardAssigneeInitial: string;
   taskboardGroup: boolean;
   taskboardCount: number;
+  taskboardSourceRecord: boolean;
+  taskboardSourceLabel: string;
 }
 
 interface GanttViewProps {
@@ -189,7 +191,10 @@ export const GanttView = forwardRef<GanttViewport, GanttViewProps>(function Gant
           if (task.taskboardGroup) {
             return `<div class="gantt-grid-group"><strong>${escapeHtml(task.taskboardTitle)}</strong><span>${task.taskboardCount}</span></div>`;
           }
-          return `<div class="gantt-grid-issue" title="${escapeHtml(i18nRef.current.text("双击打开详情", "Double-click for details"))}"><strong>${escapeHtml(task.taskboardTitle)}</strong>${task.taskboardUnread ? `<i class="task-unread-dot" aria-label="${escapeHtml(i18nRef.current.text("有未读更新", "Unread updates"))}"></i>` : ""}</div>`;
+          const sourceBadge = task.taskboardSourceRecord
+            ? `<small class="gantt-source-record-badge">${escapeHtml(task.taskboardSourceLabel)}</small>`
+            : "";
+          return `<div class="gantt-grid-issue" title="${escapeHtml(i18nRef.current.text("双击打开详情", "Double-click for details"))}"><strong>${escapeHtml(task.taskboardTitle)}</strong>${sourceBadge}${task.taskboardUnread ? `<i class="task-unread-dot" aria-label="${escapeHtml(i18nRef.current.text("有未读更新", "Unread updates"))}"></i>` : ""}</div>`;
         },
       },
     ];
@@ -203,7 +208,7 @@ export const GanttView = forwardRef<GanttViewport, GanttViewProps>(function Gant
     instance.templates.grid_blank = () => "";
     instance.templates.task_class = (_start, _end, item) => {
       const task = item as TaskboardGanttTask;
-      return task.taskboardGroup ? "gantt-group-task" : `gantt-status-${task.taskboardStatus}`;
+      return task.taskboardGroup ? "gantt-group-task" : `gantt-status-${task.taskboardStatus}${task.taskboardSourceRecord ? " is-source-record" : ""}`;
     };
     instance.templates.task_text = (start, end, item) => {
       const task = item as TaskboardGanttTask;
@@ -217,12 +222,15 @@ export const GanttView = forwardRef<GanttViewport, GanttViewProps>(function Gant
         : task.taskboardAssigneeAvatarUrl
         ? `<img src="${escapeHtml(task.taskboardAssigneeAvatarUrl)}" alt="">`
         : `<span>${escapeHtml(task.taskboardAssigneeInitial)}</span>`;
-      return `<span class="gantt-bar-content" title="${escapeHtml(i18nRef.current.text("双击打开详情", "Double-click for details"))}"><i class="gantt-bar-assignee${task.taskboardAssigneeType === "agent" ? " is-agent" : ""}" title="${escapeHtml(task.taskboardAssigneeName)}">${avatar}</i><span class="gantt-bar-copy"><strong>${escapeHtml(task.taskboardTitle)}</strong><small>${dateLabel}</small></span></span>`;
+      const sourceLabel = task.taskboardSourceRecord
+        ? `<small class="gantt-source-record-badge">${escapeHtml(task.taskboardSourceLabel)}</small>`
+        : "";
+      return `<span class="gantt-bar-content" title="${escapeHtml(i18nRef.current.text("双击打开详情", "Double-click for details"))}"><i class="gantt-bar-assignee${task.taskboardAssigneeType === "agent" ? " is-agent" : ""}" title="${escapeHtml(task.taskboardAssigneeName)}">${avatar}</i><span class="gantt-bar-copy"><strong>${escapeHtml(task.taskboardTitle)}</strong><small>${dateLabel}</small>${sourceLabel}</span></span>`;
     };
     const rowClass = (item: GanttTask) => {
       const task = item as TaskboardGanttTask;
       if (task.taskboardGroup) return `is-group gantt-status-${task.taskboardStatus}`;
-      return `gantt-status-${task.taskboardStatus}${task.taskboardUnread ? " is-unread" : ""}`;
+      return `gantt-status-${task.taskboardStatus}${task.taskboardSourceRecord ? " is-source-record" : ""}${task.taskboardUnread ? " is-unread" : ""}`;
     };
     instance.templates.grid_row_class = (_start, _end, item) => rowClass(item);
     instance.templates.task_row_class = (_start, _end, item) => rowClass(item);
@@ -294,12 +302,16 @@ export const GanttView = forwardRef<GanttViewport, GanttViewProps>(function Gant
     instance.attachEvent("onAfterTaskUpdate", (id, item) => {
       const ganttTask = item as TaskboardGanttTask;
       const task = tasksRef.current.find((candidate) => candidate.id === String(id));
-      if (!task || ganttTask.taskboardGroup || item.unscheduled) return true;
+      if (!task || ganttTask.taskboardGroup || item.unscheduled || isSourceRecord(task)) return true;
       const startDate = dateValue(item.start_date as Date);
       const dueDate = dateValue(addDays(item.end_date as Date, -1));
       if (task.startDate === startDate && task.dueDate === dueDate) return true;
       void onUpdateRef.current(task, { startDate, dueDate }).catch(() => {});
       return true;
+    });
+    instance.attachEvent("onBeforeTaskDrag", (id) => {
+      const task = tasksRef.current.find((candidate) => candidate.id === String(id));
+      return task ? !isSourceRecord(task) : true;
     });
     let pendingTaskClickTimer: number | null = null;
     const clearPendingTaskClick = () => {
@@ -457,11 +469,17 @@ export const GanttView = forwardRef<GanttViewport, GanttViewProps>(function Gant
         taskboardAssigneeInitial: "",
         taskboardGroup: true,
         taskboardCount: groupTasks.length,
+        taskboardSourceRecord: false,
+        taskboardSourceLabel: "",
       } as TaskboardGanttTask);
 
       for (const task of groupTasks) {
         const isScheduled = Boolean(task.startDate && task.dueDate);
         const itemProgress = taskProgress(task, presentations[task.id]);
+        const sourceRecord = isSourceRecord(task);
+        const sourceMeta = [task.sourceSystem, task.externalVersion ? `v${task.externalVersion}` : null]
+          .filter(Boolean)
+          .join(" · ");
         data.push({
           id: task.id,
           parent: groupId,
@@ -473,6 +491,7 @@ export const GanttView = forwardRef<GanttViewport, GanttViewProps>(function Gant
             end_date: addDays(localDate(task.dueDate!), 1),
           } : { unscheduled: true }),
           progress: itemProgress,
+          readonly: sourceRecord,
           taskboardStatus: task.status,
           taskboardTitle: task.title,
           taskboardUnread: presentations[task.id]?.unread ?? false,
@@ -482,6 +501,10 @@ export const GanttView = forwardRef<GanttViewport, GanttViewProps>(function Gant
           taskboardAssigneeInitial: Array.from(task.assignee.name.trim())[0] ?? "·",
           taskboardGroup: false,
           taskboardCount: 0,
+          taskboardSourceRecord: sourceRecord,
+          taskboardSourceLabel: sourceRecord
+            ? `${i18nRef.current.text("只读引用", "Referência somente leitura")}${sourceMeta ? ` · ${sourceMeta}` : ""}`
+            : "",
         } as TaskboardGanttTask);
       }
     }

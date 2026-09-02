@@ -220,4 +220,54 @@ describe("GanttView workflow stages", () => {
     expect(gantt.instance.getScrollState()).toEqual({ x: 0, y: 3247 });
     expect(onRestoreViewport).toHaveBeenCalledOnce();
   });
+
+  it("renders source records as read-only and refuses date drag updates", async () => {
+    const onUpdate = vi.fn(async (current: Task) => current);
+    const reference = task("source-1", "Paperclip reference", "stage-9");
+    Object.assign(reference, {
+      kind: "source_record" as const,
+      readOnly: true,
+      sourceSystem: "paperclip",
+      externalVersion: "17",
+      startDate: "2026-09-01",
+      dueDate: "2026-09-02",
+    });
+
+    render(
+      <GanttView
+        tasks={[reference]}
+        presentations={emptyPresentations}
+        hasActiveFilters={false}
+        zoom="week"
+        hideCompleted={false}
+        todayRequest={0}
+        workflowStages={workflowStages}
+        onOpenTask={noop}
+        onOpenTaskDetail={noop}
+        onUpdate={onUpdate}
+      />,
+    );
+
+    await waitFor(() => expect(gantt.instance.parse).toHaveBeenCalled());
+    expect(gantt.instance.parse).toHaveBeenLastCalledWith(expect.objectContaining({
+      data: expect.arrayContaining([
+        expect.objectContaining({
+          id: "source-1",
+          readonly: true,
+          taskboardSourceRecord: true,
+          taskboardSourceLabel: "Referência somente leitura · paperclip · v17",
+        }),
+      ]),
+    }));
+
+    const beforeDrag = gantt.instance.attachEvent.mock.calls.find(([name]) => name === "onBeforeTaskDrag")?.[1];
+    const afterUpdate = gantt.instance.attachEvent.mock.calls.find(([name]) => name === "onAfterTaskUpdate")?.[1];
+    expect(beforeDrag?.("source-1")).toBe(false);
+    expect(afterUpdate?.("source-1", {
+      ...gantt.instance.getTask("source-1"),
+      start_date: new Date("2026-09-03T00:00:00"),
+      end_date: new Date("2026-09-05T00:00:00"),
+    })).toBe(true);
+    expect(onUpdate).not.toHaveBeenCalled();
+  });
 });

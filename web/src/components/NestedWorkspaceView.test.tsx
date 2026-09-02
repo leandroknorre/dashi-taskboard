@@ -76,6 +76,48 @@ function renderWorkspace(view: "overview" | "board" | "list" | "tree" | "mindmap
 }
 
 describe("NestedWorkspaceView", () => {
+  it.each(["board", "list", "tree", "mindmap", "timeline"] as const)(
+    "marks source records as read-only in the %s projection",
+    (view) => {
+      const reference = {
+        ...workspace.children.items[0],
+        id: "source-record",
+        identifier: "SRC-1",
+        title: "Paperclip reference",
+        kind: "source_record" as const,
+        readOnly: true,
+        sourceSystem: "paperclip",
+        externalVersion: "17",
+      };
+      const sourceWorkspace: WorkspaceDescriptor = {
+        ...workspace,
+        children: { items: [reference], nextCursor: null },
+        descendants: { items: [reference], nextCursor: null },
+        hierarchy: { items: [reference], nextCursor: null },
+      };
+      render(
+        <TaskboardLanguageProvider language="en">
+          <NestedWorkspaceView
+            workspace={sourceWorkspace}
+            rollup={rollup}
+            view={view}
+            descendants={false}
+            loadingMore={false}
+            onViewChange={vi.fn()}
+            onDescendantsChange={vi.fn()}
+            onLoadMore={vi.fn()}
+            onOpenTask={vi.fn()}
+            onOpenTaskDetail={vi.fn()}
+            onOpenWorkspace={vi.fn()}
+          />
+        </TaskboardLanguageProvider>,
+      );
+
+      expect(screen.getByText("Referência somente leitura")).toBeTruthy();
+      expect(screen.getByText("paperclip · v17")).toBeTruthy();
+    },
+  );
+
   it("shows the manual purpose, rollup provenance and freshness in overview", () => {
     const { onOpenTask, onOpenWorkspace } = renderWorkspace();
     expect(screen.getByText("Ship the public workspace.")).toBeTruthy();

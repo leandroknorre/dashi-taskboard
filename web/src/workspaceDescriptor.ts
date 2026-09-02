@@ -22,6 +22,10 @@ export interface WorkspaceRoot {
   /** A project root has no persisted task stage. */
   status: TaskStatus | null;
   macroBucket: WorkspaceMacroBucket | null;
+  kind?: "work_card" | "source_record";
+  readOnly?: boolean;
+  sourceSystem?: string | null;
+  externalVersion?: string | null;
   target: WorkspaceNavigationTarget | null;
 }
 
@@ -70,6 +74,10 @@ function workspaceItemFromTask(
     status: task.status,
     macroBucket: macroBucketForStatus(task.status),
     priority: task.priority,
+    kind: task.kind,
+    readOnly: task.readOnly,
+    sourceSystem: task.sourceSystem,
+    externalVersion: task.externalVersion,
     archivedAt: task.archivedAt,
     parentId,
     depth,
@@ -104,6 +112,10 @@ export function descriptorFromNestedWorkspace(
       description: root.description,
       status: root.status,
       macroBucket: root.macroBucket,
+      kind: root.kind,
+      readOnly: root.readOnly,
+      sourceSystem: root.sourceSystem,
+      externalVersion: root.externalVersion,
       target: { kind: "task", identifier: root.identifier },
     },
     breadcrumb: [

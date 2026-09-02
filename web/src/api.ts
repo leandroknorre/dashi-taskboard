@@ -827,6 +827,37 @@ export async function restoreTask(task: Task, threadId?: string): Promise<Task> 
   return data.task;
 }
 
+export type SourceRecordAction = "adopt" | "merge" | "discard" | "restore";
+
+export interface SourceRecordMutationResult {
+  sourceRecord: Task;
+  workCard?: Task;
+  targetTaskId: string | null;
+  disposition: "adopted" | "merged" | "discarded" | "pending";
+  version: number;
+  idempotent: boolean;
+}
+
+export async function mutateSourceRecord(
+  task: Task,
+  action: SourceRecordAction,
+  target?: { targetProjectId?: string; targetTaskId?: string },
+): Promise<SourceRecordMutationResult> {
+  const idempotencyKey = `source-record-${action}-${crypto.randomUUID()}`;
+  return retryIdempotentRequest(() => request<SourceRecordMutationResult>(
+    `/api/source-records/${encodeURIComponent(task.id)}/${action}`,
+    {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify({
+        version: task.version,
+        ...(action === "adopt" ? { targetProjectId: target?.targetProjectId } : {}),
+        ...(action === "merge" ? { targetTaskId: target?.targetTaskId } : {}),
+      }),
+    },
+  ));
+}
+
 export async function deleteArchivedTask(task: Task): Promise<void> {
   await request(`/api/tasks/${encodeURIComponent(task.id)}`, {
     method: "DELETE",

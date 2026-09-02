@@ -374,6 +374,8 @@ export interface TaskRelationSummary {
   title: string;
   status: TaskStatus;
   priority: TaskPriority;
+  kind?: "work_card" | "source_record";
+  readOnly?: boolean;
   assignee: ActorIdentity;
   archivedAt: string | null;
 }
@@ -426,6 +428,17 @@ export interface Task {
   startDate: string | null;
   dueDate: string | null;
   recurrence: Recurrence | null;
+  /** Persisted item semantics. Older local databases omit these fields and remain work cards. */
+  kind?: "work_card" | "source_record";
+  readOnly?: boolean;
+  sourceSystem?: string | null;
+  externalId?: string | null;
+  externalVersion?: string | null;
+  sourceFingerprint?: string | null;
+  fieldOwnership?: Record<string, "source" | "local">;
+  candidateState?: "available" | "adopted" | "merged" | "discarded" | null;
+  candidateTargetTaskId?: string | null;
+  candidateDispositionAt?: string | null;
   source: "local" | "jira";
   externalOrigin?: string | null;
   externalKey?: string | null;
@@ -447,6 +460,10 @@ export interface NestedWorkspaceItem {
   status: TaskStatus;
   macroBucket: "planned" | "ready" | "active" | "review" | "blocked" | "closed";
   priority: TaskPriority;
+  kind?: "work_card" | "source_record";
+  readOnly?: boolean;
+  sourceSystem?: string | null;
+  externalVersion?: string | null;
   archivedAt: string | null;
   parentId: string | null;
   depth: number;
@@ -456,6 +473,12 @@ export interface NestedWorkspaceItem {
   dueDate: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export function isSourceRecord(
+  task: Pick<Task, "kind" | "readOnly"> | Pick<NestedWorkspaceItem, "kind" | "readOnly">,
+): boolean {
+  return task.kind === "source_record" || task.readOnly === true;
 }
 
 export interface NestedWorkspaceOverview extends Omit<Task, "relations" | "conversationRefs" | "participants" | "previewImage" | "activityKey" | "activityUpdatedAt"> {

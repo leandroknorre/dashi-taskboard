@@ -87,4 +87,29 @@ describe("descriptorFromProjectTasks", () => {
       path: ["project:alpha", "vision", "program"],
     });
   });
+
+  it("preserves source-record metadata for every project projection", () => {
+    const reference = task("reference", "Paperclip reference", 0, null);
+    Object.assign(reference, {
+      kind: "source_record" as const,
+      readOnly: true,
+      sourceSystem: "paperclip",
+      externalVersion: "17",
+    });
+
+    const descriptor = descriptorFromProjectTasks(project, [reference]);
+
+    expect(descriptor.children.items[0]).toMatchObject({
+      kind: "source_record",
+      readOnly: true,
+      sourceSystem: "paperclip",
+      externalVersion: "17",
+    });
+    expect(descriptor.hierarchy?.items[0]).toMatchObject({
+      kind: "source_record",
+      readOnly: true,
+      sourceSystem: "paperclip",
+      externalVersion: "17",
+    });
+  });
 });

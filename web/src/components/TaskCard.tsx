@@ -4,6 +4,7 @@ import remarkParse from "remark-parse";
 import { unified } from "unified";
 import { resolvePersistedAttachmentUrl } from "../api";
 import {
+  isSourceRecord,
   TASK_PRIORITIES,
   type ActorIdentity,
   type AssigneeTarget,
@@ -26,6 +27,7 @@ import { TaskPropertyPicker } from "./TaskPropertyPicker";
 import { TaskConversationMenu } from "./TaskConversationMenu";
 import completeIcon from "../assets/figma-taskboard/card-complete.svg";
 import processingAnimation from "../assets/figma-taskboard/loading-16.svg";
+import { SourceRecordBadge } from "./SourceRecordBadge";
 
 interface TaskCardProps {
   task: Task;
@@ -409,6 +411,7 @@ export function TaskCard({
 }: TaskCardProps) {
   const { locale, text } = useTaskboardI18n();
   const displayIdentifier = task.externalKey ?? task.identifier;
+  const sourceRecord = isSourceRecord(task);
   const [propertyMenu, setPropertyMenu] = useState<"priority" | "labels" | "assignee" | null>(null);
   const [savingProperty, setSavingProperty] = useState<"priority" | "labels" | "dueDate" | "assignee" | null>(null);
   const creator: ActorIdentity = {
@@ -417,12 +420,12 @@ export function TaskCard({
     name: task.creatorName,
     avatarUrl: task.creatorAvatarUrl,
   };
-  const processingCard = task.status === "in_progress";
-  const supportsConversation = task.status === "in_progress"
+  const processingCard = !sourceRecord && task.status === "in_progress";
+  const supportsConversation = !sourceRecord && (task.status === "in_progress"
     || task.status === "in_review"
     || task.status === "blocked"
     || task.status === "done"
-    || task.status === "canceled";
+    || task.status === "canceled");
   const showsConversation = supportsConversation && presentation.conversations.length > 0;
   const showsInlineParticipants = variant === "main"
     && task.participants.length > 0;
@@ -445,18 +448,23 @@ export function TaskCard({
 
   return (
     <article
-      className={`task-card task-card-${variant} status-${task.status}${processingCard ? " is-processing-card" : ""}${processingCard && presentation.processing.running ? " is-running-card" : ""}${image ? " has-media" : ""}${presentation.unread ? " is-unread" : ""}${isDragging ? " is-dragging" : ""}${dragShift ? " is-drag-shifted" : ""}${isMoving ? " is-moving" : ""}${isSettling ? " is-settling" : ""}${isContextMenuOpen ? " is-context-open" : ""}${propertyMenu ? " is-property-menu-open" : ""}`}
+      className={`task-card task-card-${variant} status-${task.status}${sourceRecord ? " is-source-record" : ""}${processingCard ? " is-processing-card" : ""}${processingCard && presentation.processing.running ? " is-running-card" : ""}${image ? " has-media" : ""}${presentation.unread ? " is-unread" : ""}${isDragging ? " is-dragging" : ""}${dragShift ? " is-drag-shifted" : ""}${isMoving ? " is-moving" : ""}${isSettling ? " is-settling" : ""}${isContextMenuOpen ? " is-context-open" : ""}${propertyMenu ? " is-property-menu-open" : ""}`}
       style={dragShift ? { transform: `translate3d(0, ${dragShift}px, 0)` } : undefined}
-      draggable={!isMoving}
+      draggable={!sourceRecord && !isMoving}
       aria-labelledby={`task-${task.id}-title`}
       data-task-id={task.id}
       data-drag-shift={dragShift || undefined}
       onContextMenu={(event) => {
         event.preventDefault();
         event.stopPropagation();
+        if (sourceRecord) return;
         onContextMenu(task, { x: event.clientX, y: event.clientY });
       }}
       onDragStart={(event) => {
+        if (sourceRecord) {
+          event.preventDefault();
+          return;
+        }
         event.dataTransfer.effectAllowed = "move";
         event.dataTransfer.setData("text/plain", task.id);
         event.dataTransfer.setData("application/x-taskboard-task", task.id);
@@ -474,9 +482,10 @@ export function TaskCard({
       <div className="card-topline">
         <span className="card-reference">
           <span className="task-identifier">ID: {displayIdentifier}</span>
+          {sourceRecord && <SourceRecordBadge item={task} compact />}
         </span>
         {presentation.unread && <span className="task-unread-dot" aria-label={text("有未读更新", "Unread updates")} />}
-        {task.status === "in_review" && onComplete && (
+        {!sourceRecord && task.status === "in_review" && onComplete && (
           <button
             className="task-card-complete"
             type="button"
@@ -491,7 +500,7 @@ export function TaskCard({
             <span>{text("完成", "Complete")}</span>
           </button>
         )}
-        {variant === "sidebar" && (
+        {!sourceRecord && variant === "sidebar" && (
           <span className="sidebar-card-creator">
             <AssigneeControl
               task={task}
@@ -523,7 +532,7 @@ export function TaskCard({
               <span>{projectName}</span>
             </span>
           )}
-          {!processingCard && task.priority !== "none" && (
+          {!sourceRecord && !processingCard && task.priority !== "none" && (
             <PriorityControl
               task={task}
               disabled={propertyDisabled}
@@ -532,7 +541,7 @@ export function TaskCard({
               onChange={(priority) => updateProperty({ priority }, "priority")}
             />
           )}
-          {!processingCard && task.labels.length > 0 && (
+          {!sourceRecord && !processingCard && task.labels.length > 0 && (
             <LabelPicker
               availableLabels={availableLabels}
               selectedLabels={task.labels}
@@ -546,7 +555,7 @@ export function TaskCard({
               onCreateLabel={onCreateLabel}
             />
           )}
-          {!processingCard && (
+          {!sourceRecord && !processingCard && (
             <DueDateControl
               task={task}
               disabled={propertyDisabled}
@@ -556,7 +565,7 @@ export function TaskCard({
               }, "dueDate")}
             />
           )}
-          {!processingCard && showsInlineParticipants && (
+          {!sourceRecord && !processingCard && showsInlineParticipants && (
             <AssigneeControl
               task={task}
               participants={task.participants}
@@ -567,8 +576,8 @@ export function TaskCard({
               onChange={(assigneeTarget) => updateProperty({ assigneeTarget }, "assignee")}
             />
           )}
-          {!processingCard && showsConversation && <span className="card-properties-spacer" aria-hidden="true" />}
-          {!processingCard && showsConversation && (
+          {!sourceRecord && !processingCard && showsConversation && <span className="card-properties-spacer" aria-hidden="true" />}
+          {!sourceRecord && !processingCard && showsConversation && (
             <TaskConversationMenu
               conversations={presentation.conversations}
               onOpenConversation={onOpenConversation}

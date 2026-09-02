@@ -1,9 +1,10 @@
 import { useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type PointerEvent, type ReactNode, type WheelEvent } from "react";
-import type { NestedWorkspaceItem, TaskRollup } from "../types";
+import { isSourceRecord, type NestedWorkspaceItem, type TaskRollup } from "../types";
 import type { WorkspaceRootExtra, WorkspaceView } from "../issueRoute";
 import type { WorkspaceDescriptor, WorkspaceNavigationTarget, WorkspaceRoot } from "../workspaceDescriptor";
 import { useTaskboardI18n } from "../i18n";
 import { StatusIcon } from "./SemanticIcons";
+import { SourceRecordBadge } from "./SourceRecordBadge";
 
 interface NestedWorkspaceViewProps {
   workspace: WorkspaceDescriptor;
@@ -65,6 +66,7 @@ function WorkspaceItemButton({
         <span className="nested-workspace-item-copy">
           <small>{item.identifier}</small>
           <strong>{item.title}</strong>
+          {isSourceRecord(item) && <SourceRecordBadge item={item} compact />}
         </span>
         <StatusChip item={item} />
       </button>
@@ -176,7 +178,7 @@ function WorkspaceTree({
   );
 }
 
-type MindMapNode = Omit<Pick<NestedWorkspaceItem, "id" | "identifier" | "projectId" | "title" | "status" | "macroBucket" | "parentId" | "depth" | "path">, "status" | "macroBucket"> & {
+type MindMapNode = Omit<Pick<NestedWorkspaceItem, "id" | "identifier" | "projectId" | "title" | "status" | "macroBucket" | "parentId" | "depth" | "path" | "kind" | "readOnly" | "sourceSystem" | "externalVersion">, "status" | "macroBucket"> & {
   status: NestedWorkspaceItem["status"] | null;
   macroBucket: NestedWorkspaceItem["macroBucket"] | null;
   target: WorkspaceNavigationTarget | null;
@@ -202,6 +204,10 @@ function WorkspaceMindMap({
     parentId: null,
     depth: 0,
     path: [workspace.root.id],
+    kind: workspace.root.kind,
+    readOnly: workspace.root.readOnly,
+    sourceSystem: workspace.root.sourceSystem,
+    externalVersion: workspace.root.externalVersion,
     target: workspace.root.target,
   }), [text, workspace.root]);
   const nodes = useMemo(() => [
@@ -285,6 +291,7 @@ function WorkspaceMindMap({
               >
                 <small>{node.identifier}</small>
                 <strong>{node.title}</strong>
+                {isSourceRecord(node) && <SourceRecordBadge item={node} compact />}
                 {node.status && node.macroBucket && <span>{node.status.replace(/_/g, " ")} · {MACRO_BUCKET_LABELS[node.macroBucket]}</span>}
               </button>
             );
@@ -347,6 +354,7 @@ function WorkspaceTimeline({
                     {!scheduled && ` · ${text("未安排日期", "No scheduled date")}`}
                   </time>
                   <span className="workspace-timeline-copy"><small>{item.identifier}</small><strong>{item.title}</strong></span>
+                  {isSourceRecord(item) && <SourceRecordBadge item={item} compact />}
                   <StatusChip item={item} />
                   <span className="workspace-timeline-bucket">{MACRO_BUCKET_LABELS[item.macroBucket]}</span>
                 </button>

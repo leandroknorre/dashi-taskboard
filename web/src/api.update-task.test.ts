@@ -3,6 +3,7 @@ import {
   ApiError,
   classifyTaskMutationFailure,
   moveTask,
+  mutateSourceRecord,
   restoreTaskDraftChanges,
   updateTask,
 } from "./api";
@@ -104,6 +105,51 @@ const acceptanceEvidence = {
 };
 
 describe("task mutation payloads", () => {
+  it("sends source-record candidate actions with version and a stable idempotency key", async () => {
+    const sourceRecord: Task = {
+      ...task,
+      id: "source-1",
+      identifier: "SRC-1",
+      kind: "source_record",
+      readOnly: true,
+      candidateState: "available",
+      sourceSystem: "paperclip",
+      externalId: "AUT-1",
+      externalVersion: "7",
+      version: 4,
+    };
+    const requests: RecordedRequest[] = [];
+    let attempts = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push({ input, init });
+      attempts += 1;
+      if (attempts === 1) throw new TypeError("connection reset after write");
+      return jsonResponse({
+        sourceRecord: { ...sourceRecord, candidateState: "adopted", version: 5 },
+        workCard: { ...task, id: "work-2", identifier: "TASK-2" },
+        targetTaskId: "work-2",
+        disposition: "adopted",
+        version: 5,
+        idempotent: false,
+      });
+    }));
+
+    await expect(mutateSourceRecord(sourceRecord, "adopt", { targetProjectId: "project-1" }))
+      .resolves.toMatchObject({ disposition: "adopted", targetTaskId: "work-2" });
+
+    expect(requests).toHaveLength(2);
+    expect(requests.map(requestPath)).toEqual([
+      "/api/source-records/source-1/adopt",
+      "/api/source-records/source-1/adopt",
+    ]);
+    expect(requests.map(requestBody)).toEqual([
+      { version: 4, targetProjectId: "project-1" },
+      { version: 4, targetProjectId: "project-1" },
+    ]);
+    expect(idempotencyKey(requests[0]!)).toMatch(/^source-record-adopt-/);
+    expect(idempotencyKey(requests[1]!)).toBe(idempotencyKey(requests[0]!));
+  });
+
   it("sends the detail review-to-done transition as one atomic PATCH", async () => {
     const requests = mockFetch();
 
