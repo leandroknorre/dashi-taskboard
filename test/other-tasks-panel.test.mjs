@@ -27,8 +27,10 @@ test("the issue workspace keeps display settings for cards while project workflo
   assert.deepEqual(statusList("MAIN_STATUSES"), ["todo", "in_progress", "blocked", "in_review"]);
   assert.deepEqual(statusList("SECONDARY_STATUSES"), ["backlog", "done", "canceled"]);
   assert.match(statusSource, /satisfies readonly TaskStatus\[\]/);
-  assert.match(appSource, /const workflowBoardStages = stageWorkflow\?\.definition\.stages/);
-  assert.match(appSource, /const mainBoardItems = workflowBoardStages\.length[\s\S]*?workflowBoardStages\.map\(\(stage\) => stage\.stageId\)[\s\S]*?: boardDisplaySettings\.mainStatuses/);
+  assert.match(appSource, /const workflowStages = useMemo\(\(\) => workflowDisplayStages\(stageWorkflow\), \[stageWorkflow\]\)/);
+  assert.match(appSource, /const hasMaterializedWorkflow = workflowStages\.length > 0/);
+  assert.match(appSource, /const workflowBoardStages = workflowStages\.filter\(\(stage\) => \([\s\S]*?stage\.legacy \|\| \(stage\.active && stage\.boardVisible\)[\s\S]*?\)\)/);
+  assert.match(appSource, /const mainBoardItems = hasMaterializedWorkflow[\s\S]*?workflowBoardStages\.map\(\(stage\) => stage\.stageId\)[\s\S]*?: boardDisplaySettings\.mainStatuses/);
   assert.match(appSource, /mainBoardItems\.map\(\(item\) => \{[\s\S]*?workflowStage = workflowBoardStages\.find/);
   assert.match(appSource, /mainBoardItems\.map\(\(item\) => \([\s\S]*?className="loading-column"/);
   assert.match(boardColumnSource, /todo: \{ label: "等待认领", tone: "todo" \}/);
@@ -40,7 +42,7 @@ test("the issue workspace keeps display settings for cards while project workflo
 test("other tasks is a closed-by-default non-modal panel with archived issues", () => {
   assert.match(appSource, /useState\(false\)/);
   assert.match(appSource, /useState<OtherTaskTab>\("backlog"\)/);
-  assert.match(appSource, /const otherTaskTabs = workflowBoardStages\.length[\s\S]*?: boardDisplaySettings\.sidebarStatuses/);
+  assert.match(appSource, /const otherTaskTabs = hasMaterializedWorkflow[\s\S]*?\? \[\][\s\S]*?: boardDisplaySettings\.sidebarStatuses/);
   assert.match(appSource, /className=\{`other-tasks-trigger\$\{otherTasksOpen \? " is-open" : ""\}`\}/);
   assert.match(appSource, /aria-controls="other-tasks-panel"/);
   assert.match(appSource, /aria-expanded=\{otherTasksOpen\}/);
