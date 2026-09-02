@@ -191,7 +191,7 @@ async function stop(child) {
   await stopChild(child, { timeoutMs: teardownTimeoutMs, name: "Chrome" });
 }
 
-async function startReadOnlyProxy(targetOrigin) {
+async function startReadOnlyProxy(targetOrigin, workflowAuthoringByProject = {}) {
   const methods = [];
   const rejected = [];
   const requests = [];
@@ -205,13 +205,23 @@ async function startReadOnlyProxy(targetOrigin) {
   const proxy = createServer((request, response) => {
     methods.push(request.method);
     requests.push({ method: request.method, url: request.url ?? "/" });
+    const target = new URL(request.url ?? "/", targetOrigin);
+    const workflowAuthoringRoute = target.pathname.match(/^\/api\/projects\/([^/]+)\/workflow-authoring$/);
+    if (request.method === "GET" && workflowAuthoringRoute) {
+      const projectId = decodeURIComponent(workflowAuthoringRoute[1]);
+      const workflow = workflowAuthoringByProject[projectId];
+      if (workflow) {
+        request.resume();
+        response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ workflow }));
+        return;
+      }
+    }
     if (request.method !== "GET") {
       rejected.push(`${request.method} ${request.url}`);
       response.writeHead(405, { "Content-Type": "application/json" }).end('{"error":"read-only proxy"}');
       request.resume();
       return;
     }
-    const target = new URL(request.url ?? "/", targetOrigin);
     const upstream = httpRequest(target, { method: "GET", headers: { ...request.headers, host: target.host } }, (upstreamResponse) => {
       response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
       upstreamResponse.pipe(response);
@@ -268,6 +278,7 @@ function seedWorkspace(directory) {
   ).task;
   try {
     database.createProject({ id: "alpha", name: "Alpha", workspacePath: null });
+    database.createProject({ id: "empty", name: "Empty project", workspacePath: null });
     // Project creation now publishes the immutable default workflow before
     // any task is accepted. This fixture deliberately uses that public,
     // already-pinned workflow instead of trying to author physical stages.
@@ -295,11 +306,48 @@ function seedWorkspace(directory) {
     const deepTwo = relate(create("Deep descendant two", "todo", todo.stageId), deepOne);
     const deepThree = relate(create("Deep descendant three", "done", stageFor("done").stageId), deepTwo);
     const ignored = relate(create("Non-rollup descendant", "todo", todo.stageId), root, { required: false, rollup: false });
+    const taskCount = database.database.prepare(
+      "SELECT COUNT(*) AS count FROM tasks WHERE project_id = ? AND stage_id = ?",
+    ).get("alpha", todo.stageId).count;
+    const workflowAuthoring = {
+      alpha: {
+        projectId: "alpha",
+        workflowId: "workflow-alpha",
+        revisionId: "revision-alpha-2",
+        revision: 2,
+        definition: {
+          schemaVersion: 2,
+          stages: workflow.definition.stages.map((stage) => stage.stageId === todo.stageId
+            ? { ...stage, stageId: "replacement-todo-stage" }
+            : stage),
+        },
+        legacyOccupiedStages: [{
+          stageId: todo.stageId,
+          canonicalStatus: todo.canonicalStatus,
+          name: "Retired inbox",
+          terminalKind: todo.terminalKind,
+          taskCount,
+        }],
+        projectUpdatedAt: "2026-09-01T12:00:00.000Z",
+      },
+      empty: (() => {
+        const emptyWorkflow = database.getStageWorkflow("empty");
+        return {
+          projectId: "empty",
+          workflowId: "workflow-empty",
+          revisionId: "revision-empty-1",
+          revision: 1,
+          definition: emptyWorkflow.definition,
+          legacyOccupiedStages: [],
+          projectUpdatedAt: "2026-09-01T12:00:00.000Z",
+        };
+      })(),
+    };
     const snapshot = {
       tasks: database.database.prepare("SELECT * FROM tasks ORDER BY id").all(),
       relations: database.database.prepare("SELECT * FROM task_relations ORDER BY relation_type, source_task_id, target_task_id").all(),
     };
-    return { vision, root, program, direct, deepThree, ignored, snapshot };
+    return { vision, root, program, direct, deepThree, ignored, snapshot, workflowAuthoring };
   } finally { database.close(); }
 }
 
@@ -338,7 +386,7 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     const fixture = seedWorkspace(directory);
     app = createTaskboardServer({ dataDirectory: directory });
     const address = await app.listen({ host: "127.0.0.1", port: 0 });
-    proxy = await startReadOnlyProxy(`http://127.0.0.1:${address.port}`);
+    proxy = await startReadOnlyProxy(`http://127.0.0.1:${address.port}`, fixture.workflowAuthoring);
     const profile = path.join(directory, "chrome");
     child = spawn(chrome, ["--headless=new", "--disable-background-networking", "--disable-gpu", "--no-first-run", "--no-sandbox", "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
     stderrCapture = captureStderrTail(child.stderr);
@@ -361,6 +409,32 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
       "false",
       "Fresh deep links must not open the project menu over workspace tabs",
     );
+
+    await cdp.send("Page.navigate", { url: `${proxy.origin}/?project=empty` });
+    await eventually(() => cdp.evaluate(`(() => {
+      const url = new URL(location.href);
+      return url.searchParams.get("workspaceRoot") === "empty"
+        && url.searchParams.get("view") === "overview"
+        && document.querySelector("#nested-workspace-panel-overview") instanceof HTMLElement;
+    })()`), "Empty project did not canonicalize to its active root workspace");
+    const workflowControl = await eventually(() => cdp.evaluate(`(() => {
+      const controls = [...document.querySelectorAll("button[data-workflow-configure]")];
+      if (controls.length !== 1 || !(controls[0] instanceof HTMLButtonElement)) return null;
+      const bounds = controls[0].getBoundingClientRect();
+      const x = bounds.left + bounds.width / 2;
+      const y = bounds.top + bounds.height / 2;
+      const target = document.elementFromPoint(x, y);
+      return { x, y, hitsControl: target instanceof Element && target.closest("button[data-workflow-configure]") === controls[0] };
+    })()`), "Canonical empty root did not expose exactly one workflow configuration control");
+    assert.equal(workflowControl.hitsControl, true, "Workflow configuration must be the physical hit target");
+    await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x: workflowControl.x, y: workflowControl.y, button: "left", clickCount: 1 });
+    await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: workflowControl.x, y: workflowControl.y, button: "left", clickCount: 1 });
+    await eventually(() => cdp.evaluate(`document.querySelector(".board-workflow-dialog[role=dialog]") instanceof HTMLElement`), "Real root workflow control did not open the authoring dialog");
+    await cdp.evaluate(`document.querySelector(".board-workflow-dialog .dialog-close")?.click(); true`);
+    await eventually(() => cdp.evaluate(`document.querySelector(".board-workflow-dialog") === null`), "Workflow authoring dialog did not close");
+
+    await cdp.send("Page.navigate", { url: `${proxy.origin}/?project=alpha&workspaceRoot=alpha&view=overview` });
+    await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-overview") instanceof HTMLElement`), "Root Overview did not recover after the empty-project workflow check");
 
     async function selectWorkspaceTab(label) {
       // URL navigation commits before the asynchronously-loaded workspace toolbar
@@ -428,8 +502,24 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
 
     await selectWorkspaceTab("List");
 
+    const legacyRootList = await cdp.evaluate(`(() => {
+      const panel = document.querySelector("#nested-workspace-panel-list");
+      const group = panel?.querySelector(".issue-list-group.is-legacy");
+      return {
+        stage: group?.querySelector(".issue-list-group-header")?.textContent ?? "",
+        badge: group?.querySelector(".issue-list-legacy-badge")?.textContent?.trim() ?? null,
+        card: group?.textContent?.includes("Vision") ?? false,
+        movementControl: group?.querySelector('[draggable="true"], .column-add, .board-column-add, [aria-label*="status" i], [aria-label*="move" i], [aria-label*="create issue" i]') !== null,
+      };
+    })()`);
+    assert.equal(legacyRootList.stage.includes("Retired inbox"), true, "Root List must name the occupied retired stage");
+    assert.equal(legacyRootList.badge, "Legacy", "Root List must mark the retired stage as Legacy");
+    assert.equal(legacyRootList.card, true, "Root List must keep the card occupying the retired stage visible");
+    assert.equal(legacyRootList.movementControl, false, "A retired List stage must not expose create or movement controls");
+
     const visionDetail = await cdp.evaluate(`(() => {
-      const button = [...document.querySelectorAll(".nested-workspace-item-detail")].find((node) => node.textContent?.includes("Details"));
+      const row = [...document.querySelectorAll("#nested-workspace-panel-list .issue-list-row")].find((node) => node.textContent?.includes("Vision"));
+      const button = row?.querySelector(".issue-list-detail");
       if (!(button instanceof HTMLButtonElement)) return false;
       button.click();
       return true;
@@ -440,8 +530,8 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-list")?.textContent?.includes("Vision")`), "Back did not restore the root List workspace");
 
     const openedVisionFromList = await cdp.evaluate(`(() => {
-      const item = [...document.querySelectorAll(".nested-workspace-item")].find((node) => node.textContent?.includes("Vision"));
-      if (!(item instanceof HTMLButtonElement)) return false;
+      const item = [...document.querySelectorAll("#nested-workspace-panel-list .issue-list-row")].find((node) => node.textContent?.includes("Vision"));
+      if (!(item instanceof HTMLElement)) return false;
       item.click();
       return true;
     })()`);

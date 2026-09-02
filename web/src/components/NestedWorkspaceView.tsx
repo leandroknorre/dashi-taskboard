@@ -29,6 +29,8 @@ interface NestedWorkspaceViewProps {
    * scrolling. Task workspaces deliberately retain the macro-bucket Board.
    */
   projectBoardContent?: ReactNode;
+  /** Physical workflow projection used by the project root List. */
+  projectListContent?: ReactNode;
 }
 
 const MACRO_BUCKET_LABELS: Record<NestedWorkspaceItem["macroBucket"], string> = {
@@ -385,6 +387,7 @@ export function NestedWorkspaceView({
   onProjectExtraChange,
   projectExtraContent,
   projectBoardContent,
+  projectListContent,
 }: NestedWorkspaceViewProps) {
   const { text } = useTaskboardI18n();
   const page = descendants ? workspace.descendants ?? workspace.children : workspace.children;
@@ -397,6 +400,9 @@ export function NestedWorkspaceView({
   const showingProjectBoard = workspace.kind === "project"
     && view === "board"
     && projectBoardContent !== undefined;
+  const showingProjectList = workspace.kind === "project"
+    && view === "list"
+    && projectListContent !== undefined;
   const panelId = showingProjectExtra
     ? `nested-workspace-panel-extra-${activeProjectExtra}`
     : `nested-workspace-panel-${view}`;
@@ -476,6 +482,7 @@ export function NestedWorkspaceView({
       >
         {showingProjectExtra ? projectExtraContent
           : showingProjectBoard ? projectBoardContent
+          : showingProjectList ? projectListContent
           : view === "overview" ? <WorkspaceOverview workspace={workspace} rollup={rollup} />
           : view === "mindmap" ? <WorkspaceMindMap workspace={workspace} items={hierarchyItems} onOpenTask={onOpenTask} onOpenWorkspace={onOpenWorkspace} />
           : items.length === 0 ? <p className="nested-workspace-empty">{text("没有可显示的子项。", "No child items to show.")}</p>

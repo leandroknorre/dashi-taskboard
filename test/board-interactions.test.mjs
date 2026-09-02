@@ -5,6 +5,7 @@ import { test } from "node:test";
 const appSource = await readFile(new URL("../web/src/App.tsx", import.meta.url), "utf8");
 const boardColumnSource = await readFile(new URL("../web/src/components/BoardColumn.tsx", import.meta.url), "utf8");
 const boardWorkflowSource = await readFile(new URL("../web/src/components/BoardWorkflowDialog.tsx", import.meta.url), "utf8");
+const nestedWorkspaceSource = await readFile(new URL("../web/src/components/NestedWorkspaceView.tsx", import.meta.url), "utf8");
 const apiSource = await readFile(new URL("../web/src/api.ts", import.meta.url), "utf8");
 const styles = await readFile(new URL("../web/src/styles.css", import.meta.url), "utf8");
 const detailSource = await readFile(new URL("../web/src/components/TaskDetail.tsx", import.meta.url), "utf8");
@@ -200,9 +201,24 @@ test("versioned workflow authoring retires old columns without legacy remap writ
   assert.match(boardColumnSource, /createEnabled && dropEnabled/);
 });
 
+test("the canonical local project root exposes one guarded workflow authoring control", () => {
+  const guard = appSource.slice(
+    appSource.indexOf("const canConfigureWorkflow"),
+    appSource.indexOf("const appShellStyle"),
+  );
+
+  assert.match(guard, /selectedProject\.source === "local"/);
+  assert.match(guard, /selectedProject\.id !== GLOBAL_PROJECT_ID/);
+  assert.match(guard, /selectedProject\.archivedAt === null/);
+  assert.match(guard, /workspaceIdentifier === null && workspaceRootProjectId === selectedProject\.id/);
+  assert.equal((appSource.match(/data-workflow-configure/g) ?? []).length, 1);
+});
+
 test("legacy stages remain read projections but never become movement targets", () => {
   assert.match(issueListSource, /stage\.active \|\| stage\.legacy/);
   assert.match(ganttSource, /stage\.active \|\| stage\.legacy/);
+  assert.match(nestedWorkspaceSource, /showingProjectList \? projectListContent/);
+  assert.match(appSource, /projectListContent=\{[\s\S]*?<IssueListView[\s\S]*?tasks=\{rootWorkspaceBoardTasks\}[\s\S]*?workflowStages=\{workflowStages\}/);
   assert.match(editorSource, /\.filter\(\(stage\) => stage\.active\)/);
   assert.match(detailSource, /workflowStages\?\.filter\(\(stage\) => stage\.active\)/);
   assert.match(contextMenuSource, /workflowStages\?\.filter\(\(stage\) => stage\.active\)/);

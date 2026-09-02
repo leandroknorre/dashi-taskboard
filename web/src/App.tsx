@@ -3863,6 +3863,17 @@ export function App() {
     : selectedProject?.id === GLOBAL_PROJECT_ID
       ? text("临时任务", "Temporary tasks")
       : selectedProject?.name ?? text("任务面板", "Taskboard");
+  const canConfigureWorkflow = Boolean(
+    selectedProject
+    && selectedProject.source === "local"
+    && selectedProject.id !== GLOBAL_PROJECT_ID
+    && selectedProject.archivedAt === null
+    && !detailTask
+    && (
+      (workspaceIdentifier === null && workspaceRootProjectId === selectedProject.id)
+      || (!workspaceActive && boardView === "issues")
+    )
+  );
   const appShellStyle = embedded
     ? { "--codex-titlebar-left-inset": `${hostContext?.titlebarLeftInset ?? 0}px` } as CSSProperties
     : undefined;
@@ -4028,6 +4039,18 @@ export function App() {
                 onChange={(options) => void saveProjectAutomation(options)}
               />
             )}
+            {canConfigureWorkflow && (
+              <button
+                className="icon-button"
+                type="button"
+                data-workflow-configure
+                onClick={() => setWorkflowDialogOpen(true)}
+                aria-label={text("配置流程", "Configure workflow")}
+                title={text("配置流程", "Configure workflow")}
+              >
+                <LinearIcon name="displayOptions" />
+              </button>
+            )}
             {isJiraProject && (
               <button
                 className="icon-button"
@@ -4166,17 +4189,6 @@ export function App() {
                 onChange={updateProjectBoardDisplaySettings}
                 onReset={resetProjectBoardDisplaySettings}
               />
-            )}
-            {boardView === "issues" && selectedProject && !isAllProjects && !isJiraProject && (
-              <button
-                className="icon-button"
-                type="button"
-                onClick={() => setWorkflowDialogOpen(true)}
-                aria-label={text("配置流程", "Configure workflow")}
-                title={text("配置流程", "Configure workflow")}
-              >
-                <LinearIcon name="displayOptions" />
-              </button>
             )}
             {boardView === "issues" && otherTasksAvailable && (
               <button
@@ -4390,6 +4402,20 @@ export function App() {
                     </div>
                   )}
                 </div>
+              )}
+              projectListContent={activeWorkspaceDescriptor.kind !== "project" ? undefined : (
+                <IssueListView
+                  scrollRef={issueListRef}
+                  tasks={rootWorkspaceBoardTasks}
+                  presentations={taskPresentations}
+                  currentUser={currentUser}
+                  workflowStages={workflowStages}
+                  hasActiveFilters={hasActiveTaskFilters}
+                  onOpenTask={openTaskOrWorkspace}
+                  onOpenTaskDetail={openTaskDetail}
+                  onOpenConversation={openTaskConversation}
+                  onUpdate={updateTaskProperties}
+                />
               )}
             />
           ) : <div className="board-view-loading">{text("正在打开工作区…", "Opening workspace…")}</div>
