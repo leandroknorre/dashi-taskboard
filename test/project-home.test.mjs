@@ -14,7 +14,7 @@ const labelsSource = await readFile(new URL("../web/src/labels.ts", import.meta.
 test("the project switcher merges live Codex projects with persisted Taskboard projects", () => {
   assert.match(appSource, /hostContext\?\.projects \?\? \[\]/);
   assert.match(appSource, /persistedById/);
-  assert.match(appSource, /name: project\.id === GLOBAL_PROJECT_ID\s*\? text\("临时任务", "Temporary tasks"\)\s*: persistedById\.get\(project\.id\)\?\.name \?\? project\.name/);
+  assert.match(appSource, /const persisted = persistedById\.get\(project\.id\);[\s\S]*?name: project\.id === GLOBAL_PROJECT_ID\s*\? text\("临时任务", "Temporary tasks"\)\s*: persisted\?\.name \?\? project\.name/);
   assert.match(appSource, /for \(const project of projects\) \{[\s\S]*?inCodex: false,[\s\S]*?persisted: true/);
   assert.match(appSource, /projectMenuChoices\.map\(\(project\) => \(/);
   assert.match(appSource, /createProjectRequest/);
