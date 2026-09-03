@@ -1913,6 +1913,55 @@ test("Codex-hosted user mutations persist the current account identity and avata
   assert.equal(comment.authorAvatarUrl, "https://example.com/test-user.png");
 });
 
+test("a Cloudflare Access proxy email resolves the actor, and only wins over the client's own local-user identity", async () => {
+  const baseUrl = await startServer();
+  const proxyHeader = { "cf-access-authenticated-user-email": "leandro@desantanna.com.br" };
+
+  const noExplicitIdentityResult = await request(baseUrl, "/api/tasks", {
+    method: "POST",
+    headers: proxyHeader,
+    body: { title: "No explicit identity headers" },
+  });
+  assert.equal(noExplicitIdentityResult.response.status, 201);
+  assert.equal(noExplicitIdentityResult.body.task.creatorId, "leandro@desantanna.com.br");
+  assert.equal(noExplicitIdentityResult.body.task.creatorName, "leandro@desantanna.com.br");
+
+  const explicitLocalUserResult = await request(baseUrl, "/api/tasks", {
+    method: "POST",
+    headers: {
+      ...proxyHeader,
+      "x-taskboard-user-id": "local-user",
+      "x-taskboard-user-name": encodeURIComponent("本地用户"),
+    },
+    body: { title: "Explicit local-user identity from the web client" },
+  });
+  assert.equal(explicitLocalUserResult.response.status, 201);
+  assert.equal(explicitLocalUserResult.body.task.creatorId, "leandro@desantanna.com.br");
+  assert.equal(explicitLocalUserResult.body.task.creatorName, "leandro@desantanna.com.br");
+
+  const explicitOtherIdentityResult = await request(baseUrl, "/api/tasks", {
+    method: "POST",
+    headers: {
+      ...proxyHeader,
+      "x-taskboard-user-id": "outro-id",
+      "x-taskboard-user-name": "Outro%20Id",
+    },
+    body: { title: "Explicit non-default identity still wins" },
+  });
+  assert.equal(explicitOtherIdentityResult.response.status, 201);
+  assert.equal(explicitOtherIdentityResult.body.task.creatorId, "outro-id");
+  assert.equal(explicitOtherIdentityResult.body.task.creatorName, "Outro Id");
+
+  const invalidEmailResult = await request(baseUrl, "/api/tasks", {
+    method: "POST",
+    headers: { "cf-access-authenticated-user-email": "x<script>@y.z" },
+    body: { title: "Invalid proxy email falls back to local-user" },
+  });
+  assert.equal(invalidEmailResult.response.status, 201);
+  assert.equal(invalidEmailResult.body.task.creatorId, "local-user");
+  assert.equal(invalidEmailResult.body.task.creatorName, "本地用户");
+});
+
 test("issue attachments can be uploaded, listed, opened, downloaded, and deleted", async () => {
   const baseUrl = await startServer();
   const createTaskResult = await request(baseUrl, "/api/tasks", {

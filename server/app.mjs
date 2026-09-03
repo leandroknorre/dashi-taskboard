@@ -627,7 +627,7 @@ function requestHeader(request, name) {
   return Array.isArray(value) ? value[0] : value;
 }
 
-const PROXY_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PROXY_EMAIL_PATTERN = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
 
 /**
  * Production sits behind cloudflared, which forwards Cloudflare Access
@@ -652,11 +652,20 @@ function actorFromRequest(request) {
   const rawId = requestHeader(request, "x-taskboard-user-id");
   const rawName = requestHeader(request, "x-taskboard-user-name");
   const rawAvatarUrl = requestHeader(request, "x-taskboard-user-avatar");
-  if (rawId === undefined && rawName === undefined && rawAvatarUrl === undefined) {
+  const hasExplicitIdentity = rawId !== undefined || rawName !== undefined || rawAvatarUrl !== undefined;
+
+  // The web client always sends its own `local-user` identity by default (it
+  // never guesses an authenticated identity itself), so that explicit value
+  // is treated the same as "no explicit identity" here: a proxy-verified
+  // email, when present, wins over both. Any OTHER explicit id (taskctl's
+  // Codex Agent identity, a real Codex-hosted account) still wins outright.
+  if (!hasExplicitIdentity || rawId === "local-user") {
     const proxyEmail = proxyAuthenticatedEmail(request);
     if (proxyEmail) {
       return { type: "user", id: proxyEmail, name: proxyEmail, avatarUrl: null };
     }
+  }
+  if (!hasExplicitIdentity) {
     return { type: "user", id: "local-user", name: "本地用户", avatarUrl: null };
   }
   if (rawId === undefined || rawName === undefined) {

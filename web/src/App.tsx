@@ -2115,13 +2115,17 @@ export function App() {
   }, [embedded, host]);
 
   useEffect(() => {
+    // Display-only: the server resolves the real actor from the Cloudflare
+    // Access proxy header on every mutation (see actorFromRequest), so this
+    // is never fed back into `setCurrentUserActor` — doing so would make the
+    // client start sending the email as `X-Taskboard-User-Id`, which the
+    // server's explicit-identity path rejects (id must be a plain slug).
     let disposed = false;
     void (async () => {
       try {
         const user = await getLocalWhoami();
-        if (disposed || user.id === "local-user") return;
+        if (disposed || user.id === "local-user" || hostContextRef.current?.user) return;
         setLocalWhoamiUser(user);
-        if (!hostContextRef.current?.user) setCurrentUserActor(user);
       } catch {}
     })();
     return () => {
