@@ -266,6 +266,11 @@ export async function getHostRuntime(signal?: AbortSignal): Promise<HostContext 
   };
 }
 
+export async function getLocalWhoami(signal?: AbortSignal): Promise<ActorIdentity> {
+  const data = await request<{ user: ActorIdentity }>("/api/local/whoami", { signal });
+  return data.user;
+}
+
 export async function getCodexThreadProgress(
   threadIds: string[],
   signal?: AbortSignal,

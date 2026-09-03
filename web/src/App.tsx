@@ -27,6 +27,7 @@ import {
   getAiChatCatalog,
   getCodexThreadProgress,
   getHostRuntime,
+  getLocalWhoami,
   getNestedWorkspace,
   getTaskRollup,
   getWorkflowAuthoring,
@@ -760,6 +761,7 @@ export function App() {
   const undoShortcut = navigator.userAgent.includes("Macintosh") ? "⌘Z" : "Ctrl+Z";
   const [theme, setTheme] = useState<Theme>(getInitialTheme);
   const [hostContext, setHostContext] = useState<HostContext | null>(null);
+  const [localWhoamiUser, setLocalWhoamiUser] = useState<ActorIdentity | null>(null);
   const language = resolveTaskboardLanguage(
     hostContext?.language ?? query.get("lang") ?? navigator.language,
   );
@@ -927,6 +929,8 @@ export function App() {
   const textRef = useRef(text);
   textRef.current = text;
   setApiText(text);
+  const hostContextRef = useRef(hostContext);
+  hostContextRef.current = hostContext;
   function errorMessage(error: unknown): string {
     if (error instanceof ApiError) return error.message;
     if (error instanceof Error) return error.message;
@@ -1097,7 +1101,7 @@ export function App() {
   useLayoutEffect(() => {
     if (selectedProject) rememberProjectOpen(selectedProject.id);
   }, [rememberProjectOpen, selectedProject]);
-  const currentUser = hostContext?.user ?? {
+  const currentUser = hostContext?.user ?? localWhoamiUser ?? {
     ...DEFAULT_USER_ACTOR,
     name: text("本地用户", "Local user"),
   };
@@ -2109,6 +2113,21 @@ export function App() {
       pendingAutomationRequestsRef.current.clear();
     };
   }, [embedded, host]);
+
+  useEffect(() => {
+    let disposed = false;
+    void (async () => {
+      try {
+        const user = await getLocalWhoami();
+        if (disposed || user.id === "local-user") return;
+        setLocalWhoamiUser(user);
+        if (!hostContextRef.current?.user) setCurrentUserActor(user);
+      } catch {}
+    })();
+    return () => {
+      disposed = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (host !== "workbuddy") return;

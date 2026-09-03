@@ -627,6 +627,23 @@ function requestHeader(request, name) {
   return Array.isArray(value) ? value[0] : value;
 }
 
+const PROXY_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/**
+ * Production sits behind cloudflared, which forwards Cloudflare Access
+ * requests to this origin with `Cf-Access-Authenticated-User-Email` set to
+ * the verified identity. `x-taskboard-proxy-user-email` is accepted too, so
+ * a local reverse proxy can be exercised the same way in dev/tests.
+ */
+function proxyAuthenticatedEmail(request) {
+  const raw = requestHeader(request, "cf-access-authenticated-user-email")
+    ?? requestHeader(request, "x-taskboard-proxy-user-email");
+  if (typeof raw !== "string") return null;
+  const value = raw.trim();
+  if (value.length === 0 || value.length > 254 || !PROXY_EMAIL_PATTERN.test(value)) return null;
+  return value;
+}
+
 function actorFromRequest(request) {
   if (request.headers["x-taskboard-client"] === "taskctl") {
     return CODEX_AGENT_ACTOR;
@@ -636,6 +653,10 @@ function actorFromRequest(request) {
   const rawName = requestHeader(request, "x-taskboard-user-name");
   const rawAvatarUrl = requestHeader(request, "x-taskboard-user-avatar");
   if (rawId === undefined && rawName === undefined && rawAvatarUrl === undefined) {
+    const proxyEmail = proxyAuthenticatedEmail(request);
+    if (proxyEmail) {
+      return { type: "user", id: proxyEmail, name: proxyEmail, avatarUrl: null };
+    }
     return { type: "user", id: "local-user", name: "本地用户", avatarUrl: null };
   }
   if (rawId === undefined || rawName === undefined) {
@@ -2429,6 +2450,14 @@ export function createTaskboardServer(options = {}) {
           [threadId, await readCodexSessionState(threadId)]
         )));
         return sendJson(response, 200, { progress: Object.fromEntries(entries) });
+      }
+
+      if (pathname === "/api/local/whoami") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/local/whoami takes no query parameters");
+        }
+        return sendJson(response, 200, { user: actorFromRequest(request) });
       }
 
       if (pathname === "/api/local/host-runtime") {
