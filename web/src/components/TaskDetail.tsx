@@ -50,6 +50,7 @@ import type {
 } from "../types";
 import {
   CODEX_AGENT_ACTOR,
+  SESSION_AGENT_ACTORS,
   actorKey,
   assigneeTargetForActor,
 } from "../actors";
@@ -1026,7 +1027,7 @@ function EditableTaskDetail({
   ) {
     developmentOptions.unshift(currentTask.developmentContext);
   }
-  const assigneeOptions = [currentTask.assignee, currentUser, CODEX_AGENT_ACTOR]
+  const assigneeOptions = [currentTask.assignee, currentUser, ...SESSION_AGENT_ACTORS]
     .filter((actor, index, actors) => (
       actors.findIndex((candidate) => actorKey(candidate) === actorKey(actor)) === index
     ));

@@ -1900,6 +1900,33 @@ test("Codex-hosted user mutations persist the current account identity and avata
   assert.equal(invalidAssigneeResult.response.status, 400);
   assert.equal(invalidAssigneeResult.body.error.code, "INVALID_FIELD");
 
+  const assignedToDsadvResult = await request(baseUrl, `/api/tasks/${task.id}`, {
+    method: "PATCH",
+    headers: userHeaders,
+    body: {
+      version: updatedByCodexResult.body.task.version,
+      assigneeTarget: "dsadv-agent",
+    },
+  });
+  assert.equal(assignedToDsadvResult.response.status, 200);
+  assert.deepEqual(assignedToDsadvResult.body.task.assignee, {
+    type: "agent",
+    id: "dsadv-agent",
+    name: "Sessão dSAdv",
+    avatarUrl: null,
+  });
+
+  const unknownAgentResult = await request(baseUrl, `/api/tasks/${task.id}`, {
+    method: "PATCH",
+    headers: userHeaders,
+    body: {
+      version: assignedToDsadvResult.body.task.version,
+      assigneeTarget: "unknown-agent",
+    },
+  });
+  assert.equal(unknownAgentResult.response.status, 400);
+  assert.equal(unknownAgentResult.body.error.code, "INVALID_FIELD");
+
   const createCommentResult = await request(baseUrl, `/api/tasks/${task.id}/comments`, {
     method: "POST",
     headers: userHeaders,

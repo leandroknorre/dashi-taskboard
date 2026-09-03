@@ -68,6 +68,25 @@ const CODEX_AGENT_ACTOR = {
   name: "Codex Agent",
   avatarUrl: null,
 };
+// Non-human assignees a card can be dispatched to besides Codex: each one
+// routes the task to a specific pillar/session rather than a person, and
+// its id doubles as the `assigneeTarget` value the client sends.
+const SESSION_AGENTS = [
+  { id: "claude-agent", name: "Claude ad hoc" },
+  { id: "dsadv-agent", name: "Sessão dSAdv" },
+  { id: "automatix-agent", name: "Sessão Automatix" },
+  { id: "lknorre-agent", name: "Sessão Pessoal/UDV" },
+  { id: "bicicleta-agent", name: "Sessão Infra (bicicleta)" },
+  { id: "coordenadora-agent", name: "Coordenadora" },
+  { id: "dashi-agent", name: "Sessão Dashi" },
+];
+const SESSION_AGENT_ACTORS = new Map([
+  [CODEX_AGENT_ACTOR.id, CODEX_AGENT_ACTOR],
+  ...SESSION_AGENTS.map((agent) => [
+    agent.id,
+    { type: "agent", id: agent.id, name: agent.name, avatarUrl: null },
+  ]),
+]);
 const CONTENT_TYPES = new Map([
   [".css", "text/css; charset=utf-8"],
   [".html", "text/html; charset=utf-8"],
@@ -727,15 +746,16 @@ function explicitHumanActorFromRequest(request) {
 
 function parseAssigneeTarget(value) {
   if (value === undefined) return undefined;
-  if (value !== "current-user" && value !== "codex-agent") {
-    throw new ApiError(400, "INVALID_FIELD", "'assigneeTarget' must be current-user or codex-agent");
+  if (value !== "current-user" && !SESSION_AGENT_ACTORS.has(value)) {
+    throw new ApiError(400, "INVALID_FIELD", "'assigneeTarget' must be current-user or a known agent id");
   }
   return value;
 }
 
 function resolveAssignee(target, actor) {
   if (target === undefined) return actor;
-  if (target === "codex-agent") return CODEX_AGENT_ACTOR;
+  const agentActor = SESSION_AGENT_ACTORS.get(target);
+  if (agentActor) return agentActor;
   if (actor.type !== "user") {
     throw new ApiError(400, "INVALID_FIELD", "'current-user' requires a user request identity");
   }

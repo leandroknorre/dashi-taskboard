@@ -21,7 +21,7 @@ import {
   type WorkflowStage,
 } from "../types";
 import {
-  CODEX_AGENT_ACTOR,
+  SESSION_AGENT_ACTORS,
   actorKey,
   assigneeTargetForActor,
 } from "../actors";
@@ -300,7 +300,7 @@ export function TaskEditor({
         : subIssueIds,
   );
 
-  const assigneeOptions = [task?.assignee, currentUser, CODEX_AGENT_ACTOR]
+  const assigneeOptions = [task?.assignee, currentUser, ...SESSION_AGENT_ACTORS]
     .filter((actor): actor is ActorIdentity => actor !== undefined)
     .filter((actor, index, actors) => (
       actors.findIndex((candidate) => actorKey(candidate) === actorKey(actor)) === index

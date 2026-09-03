@@ -14,7 +14,7 @@ import {
 } from "../types";
 import { labelPresentation } from "../labels";
 import { taskPriorityLabel, useTaskboardI18n } from "../i18n";
-import { CODEX_AGENT_ACTOR, actorKey, assigneeTargetForActor } from "../actors";
+import { SESSION_AGENT_ACTORS, actorKey, assigneeTargetForActor } from "../actors";
 import type {
   TaskCardPresentation,
   TaskConversationItem,
@@ -356,7 +356,7 @@ function AssigneeControl({
 }) {
   const { text } = useTaskboardI18n();
   const displayIdentifier = task.externalKey ?? task.identifier;
-  const options = [task.assignee, currentUser, CODEX_AGENT_ACTOR]
+  const options = [task.assignee, currentUser, ...SESSION_AGENT_ACTORS]
     .filter((actor, index, actors) => (
       actors.findIndex((candidate) => actorKey(candidate) === actorKey(actor)) === index
     ));

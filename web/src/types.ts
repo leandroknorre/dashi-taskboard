@@ -12,7 +12,16 @@ export const TASK_PRIORITIES = ["none", "urgent", "high", "medium", "low"] as co
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 export type TaskPriority = (typeof TASK_PRIORITIES)[number];
 export type ActorType = "user" | "agent";
-export type AssigneeTarget = "current-user" | "codex-agent";
+export type AssigneeTarget =
+  | "current-user"
+  | "codex-agent"
+  | "claude-agent"
+  | "dsadv-agent"
+  | "automatix-agent"
+  | "lknorre-agent"
+  | "bicicleta-agent"
+  | "coordenadora-agent"
+  | "dashi-agent";
 export type IssueRelationType = "parent" | "blocks" | "blocked_by" | "related";
 export type IssueRelationOrigin = "manual" | "mention";
 
