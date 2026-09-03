@@ -78,7 +78,17 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - run: npm ci
       - name: Run the Windows Node.js test suite
-        run: npm test
+        shell: bash
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee windows-test-output.log
+      - name: Surface failing tests as annotations
+        if: failure()
+        shell: bash
+        run: |
+          grep -E '^not ok|^# (pass|fail|skipped|tests)|^\s*(error|location|failureType):|FAIL |✖|×' windows-test-output.log \
+            | head -45 | while IFS= read -r line; do echo "::error::${line}"; done
+          echo "::error::exit=$(grep -c '^not ok' windows-test-output.log) failing node tests (see annotations above)"
       - name: Build the unsigned NSIS installer
         run: npm run app:build:windows
       - name: Preserve the unsigned NSIS installer
