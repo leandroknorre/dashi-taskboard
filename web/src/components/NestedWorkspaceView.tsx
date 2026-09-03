@@ -31,6 +31,13 @@ interface NestedWorkspaceViewProps {
   projectBoardContent?: ReactNode;
   /** Physical workflow projection used by the project root List. */
   projectListContent?: ReactNode;
+  /**
+   * Extra controls (search, filters) rendered inline in this workspace's own
+   * toolbar row, next to the view tabs and the "All descendants" toggle.
+   * Only shown for the project root's Board/List, where it actually filters
+   * `projectBoardContent`/`projectListContent`.
+   */
+  toolbarExtra?: ReactNode;
 }
 
 const MACRO_BUCKET_LABELS: Record<NestedWorkspaceItem["macroBucket"], string> = {
@@ -388,6 +395,7 @@ export function NestedWorkspaceView({
   projectExtraContent,
   projectBoardContent,
   projectListContent,
+  toolbarExtra,
 }: NestedWorkspaceViewProps) {
   const { text } = useTaskboardI18n();
   const page = descendants ? workspace.descendants ?? workspace.children : workspace.children;
@@ -409,8 +417,14 @@ export function NestedWorkspaceView({
   const panelLabel = showingProjectExtra
     ? `nested-workspace-extra-${activeProjectExtra}`
     : `nested-workspace-tab-${view}`;
+  // The project root's Board/List is an operational, often-tall board —
+  // it should fill the remaining viewport height instead of pushing the
+  // page into an outer scroll. Every other view (Overview, task workspaces,
+  // Tree/Mind Map/Timeline) keeps the normal flowing layout.
+  const fillsViewport = showingProjectBoard || showingProjectList;
+  const showingDescendantsToggle = !showingProjectExtra && view !== "overview";
   return (
-    <div className="nested-workspace-view">
+    <div className={`nested-workspace-view${fillsViewport ? " nested-workspace-view--fill" : ""}`}>
       <nav className="nested-workspace-breadcrumb" aria-label={text("工作区层级", "Workspace hierarchy")}>
         {workspace.breadcrumb.map((item, index) => (
           <span key={item.id}>
@@ -420,7 +434,10 @@ export function NestedWorkspaceView({
         ))}
       </nav>
 
-      {root.target ? (
+      {/* The project header card is redundant chrome on the Board/List,
+          which already show the project name in the app header above — it
+          only costs vertical space there, so it's skipped, not collapsed. */}
+      {!fillsViewport && (root.target ? (
         <button
           className="nested-workspace-super-card"
           type="button"
@@ -434,7 +451,7 @@ export function NestedWorkspaceView({
         <div className="nested-workspace-super-card is-project-root">
           <span><small>{text("项目", "Project")}</small><strong>{root.title}</strong></span>
         </div>
-      )}
+      ))}
 
       <div className="nested-workspace-toolbar">
         <div className="view-tabs" role="tablist" aria-label={text("工作区视图", "Workspace views")}>
@@ -467,11 +484,16 @@ export function NestedWorkspaceView({
             </button>
           ))}
         </div>
-        {!showingProjectExtra && view !== "overview" && (
-          <label className="nested-workspace-descendants-toggle">
-            <input type="checkbox" checked={descendants} onChange={(event) => onDescendantsChange(event.target.checked)} />
-            {text("全部后代", "All descendants")}
-          </label>
+        {(fillsViewport || showingDescendantsToggle) && (
+          <div className="nested-workspace-toolbar-end">
+            {fillsViewport && toolbarExtra}
+            {showingDescendantsToggle && (
+              <label className="nested-workspace-descendants-toggle">
+                <input type="checkbox" checked={descendants} onChange={(event) => onDescendantsChange(event.target.checked)} />
+                {text("全部后代", "All descendants")}
+              </label>
+            )}
+          </div>
         )}
       </div>
 
