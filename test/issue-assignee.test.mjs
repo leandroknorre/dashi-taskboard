@@ -15,13 +15,18 @@ test("issue model and editor preserve a concrete assignee identity", async () =>
     source("web/src/components/TaskEditor.tsx"),
   ]);
 
-  assert.match(typesSource, /export type AssigneeTarget = "current-user" \| "codex-agent"/);
+  // AssigneeTarget covers the human target plus every session agent (Codex
+  // and the pillar sessions it can be dispatched to) — not just Codex alone.
+  assert.match(
+    typesSource,
+    /export type AssigneeTarget =\s*(?=[\s\S]*?"current-user")(?=[\s\S]*?"codex-agent")(?=[\s\S]*?"dsadv-agent")[\s\S]*?;/,
+  );
   assert.match(typesSource, /assignee: ActorIdentity/);
   assert.match(typesSource, /export interface TaskDraft \{[\s\S]*?assigneeTarget\?: AssigneeTarget/);
   assert.match(appSource, /assigneeTarget/);
   assert.match(editorSource, /currentUser: ActorIdentity/);
   assert.match(editorSource, /ariaLabel=\{text\("负责人", "Assignee"\)\}/);
-  assert.match(editorSource, /CODEX_AGENT_ACTOR/);
+  assert.match(editorSource, /SESSION_AGENT_ACTORS/);
 });
 
 test("issue detail and cards expose the same assignee identity", async () => {
