@@ -79,9 +79,7 @@ jobs:
       - run: npm ci
       - name: Run the Windows Node.js test suite
         shell: bash
-        run: |
-          set -o pipefail
-          npm test 2>&1 | tee windows-test-output.log
+        run: npm test 2>&1 | tee windows-test-output.log; exit "${PIPESTATUS[0]}"
       - name: Surface failing tests as annotations
         if: failure()
         shell: bash
