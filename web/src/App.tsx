@@ -4231,6 +4231,45 @@ export function App() {
           </div>}
         </div>}
 
+        {selectedProjectId && !detailTask && workspaceActive && !workspaceIdentifier
+          && (workspaceView === "board" || workspaceView === "list")
+          && <div className="board-toolbar workspace-board-toolbar">
+          <div className="toolbar-tools">
+            <div className={`search-field${search ? " has-value" : ""}`} title={text("搜索议题 (/)", "Search issues (/)")}>
+              <TaskboardIcon className="search-icon" name="search" />
+              <input
+                id="task-search"
+                type="search"
+                aria-label={text("搜索议题", "Search issues")}
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                placeholder={text("搜索议题…", "Search issues…")}
+              />
+              {!search && <kbd>/</kbd>}
+              {search && (
+                <button
+                  className="search-clear"
+                  type="button"
+                  aria-label={text("清除搜索", "Clear search")}
+                  onClick={() => {
+                    setSearch("");
+                    document.getElementById("task-search")?.focus();
+                  }}
+                >
+                  <LinearIcon name="close" />
+                </button>
+              )}
+            </div>
+            <TaskFilterMenu
+              tasks={tasks}
+              search={search}
+              labels={availableLabels}
+              filters={filters}
+              onChange={setFilters}
+            />
+          </div>
+        </div>}
+
         {(loadError || actionErrorText) && (
           <div className="error-banner" role="alert">
             <span className="error-mark" aria-hidden="true"><LinearIcon name="alert" /></span>
