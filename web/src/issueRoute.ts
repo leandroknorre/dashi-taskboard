@@ -3,6 +3,7 @@ const WORKSPACE_QUERY_PARAM = "workspace";
 const WORKSPACE_ROOT_QUERY_PARAM = "workspaceRoot";
 const WORKSPACE_ROOT_EXTRA_QUERY_PARAM = "workspaceExtra";
 const WORKSPACE_DESCENDANTS_QUERY_PARAM = "descendants";
+const GROUP_BY_PARENT_QUERY_PARAM = "agrupar";
 
 export const WORKSPACE_VIEWS = ["overview", "board", "list", "tree", "mindmap", "timeline"] as const;
 export type WorkspaceView = (typeof WORKSPACE_VIEWS)[number];
@@ -47,6 +48,25 @@ export function writeWorkspaceDescendants(descendants: boolean) {
   const url = new URL(window.location.href);
   if (descendants) url.searchParams.set(WORKSPACE_DESCENDANTS_QUERY_PARAM, "1");
   else url.searchParams.delete(WORKSPACE_DESCENDANTS_QUERY_PARAM);
+  window.history.replaceState(window.history.state, "", url);
+}
+
+/**
+ * Bookmarkable state for the "Group by parent" toggle on the project root's
+ * Board. `null` means no explicit choice was ever made — the caller decides
+ * the default (on once any column has too many cards).
+ */
+export function readGroupByParent(search: string): boolean | null {
+  const value = new URLSearchParams(search).get(GROUP_BY_PARENT_QUERY_PARAM);
+  if (value === "1") return true;
+  if (value === "0") return false;
+  return null;
+}
+
+export function writeGroupByParent(value: boolean | null) {
+  const url = new URL(window.location.href);
+  if (value === null) url.searchParams.delete(GROUP_BY_PARENT_QUERY_PARAM);
+  else url.searchParams.set(GROUP_BY_PARENT_QUERY_PARAM, value ? "1" : "0");
   window.history.replaceState(window.history.state, "", url);
 }
 

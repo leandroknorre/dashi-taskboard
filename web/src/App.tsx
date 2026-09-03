@@ -109,16 +109,19 @@ import {
   buildIssueUrl,
   buildRootWorkspaceUrl,
   buildWorkspaceUrl,
+  readGroupByParent,
   readIssueIdentifier,
   readWorkspaceDescendants,
   readWorkspaceIdentifier,
   readWorkspaceRootExtra,
   readWorkspaceRootProjectId,
   readWorkspaceView,
+  writeGroupByParent,
   writeWorkspaceDescendants,
   type WorkspaceRootExtra,
   type WorkspaceView,
 } from "./issueRoute";
+import { columnCardsToTasks, groupTasksByParent } from "./taskGrouping";
 import {
   getTaskboardI18n,
   resolveTaskboardLanguage,
@@ -812,6 +815,11 @@ export function App() {
   );
   const [workspaceDescendants, setWorkspaceDescendants] = useState(
     () => readWorkspaceDescendants(window.location.search),
+  );
+  // null = no explicit choice yet; the board defaults to grouped once any
+  // column has too many cards (see `groupByParent` below).
+  const [groupByParentPreference, setGroupByParentPreference] = useState<boolean | null>(
+    () => readGroupByParent(window.location.search),
   );
   const [nestedWorkspaceLoad, setNestedWorkspaceLoad] = useState<NestedWorkspaceLoad>(
     EMPTY_NESTED_WORKSPACE_LOAD,
@@ -1986,6 +1994,10 @@ export function App() {
   }, [workspaceDescendants]);
 
   useEffect(() => {
+    writeGroupByParent(groupByParentPreference);
+  }, [groupByParentPreference]);
+
+  useEffect(() => {
     tasksRef.current = tasks;
   }, [tasks]);
 
@@ -2641,6 +2653,32 @@ export function App() {
     if (hasActiveLabelOrSearchFilter || workspaceDescendants) return projectTasks;
     return projectTasks.filter((task) => task.relations.parent === null);
   }, [filteredTasks, hasActiveLabelOrSearchFilter, workspaceDescendants, workspaceRootProjectId]);
+
+  // "Group by parent" collapses a column with too many cards into one card
+  // per nearest shared ancestor. It defaults to on once any column crosses
+  // the threshold, but an explicit toggle (persisted in the URL) always wins.
+  const GROUP_BY_PARENT_THRESHOLD = 5;
+  const tasksById = useMemo(() => new Map(tasks.map((task) => [task.id, task])), [tasks]);
+  const rootBoardColumnKey = (task: Task) => task.stageId ?? task.status;
+  const anyBoardColumnOverThreshold = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const task of rootWorkspaceBoardTasks) {
+      const key = rootBoardColumnKey(task);
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return [...counts.values()].some((count) => count > GROUP_BY_PARENT_THRESHOLD);
+  }, [rootWorkspaceBoardTasks]);
+  const groupByParent = groupByParentPreference ?? anyBoardColumnOverThreshold;
+  const groupedBoardColumns = useMemo(() => {
+    if (!groupByParent) return null;
+    const byColumnKey = new Map<string, ReturnType<typeof columnCardsToTasks>>();
+    const keys = new Set(rootWorkspaceBoardTasks.map((task) => rootBoardColumnKey(task)));
+    for (const key of keys) {
+      const columnTasks = rootWorkspaceBoardTasks.filter((task) => rootBoardColumnKey(task) === key);
+      byColumnKey.set(key, columnCardsToTasks(groupTasksByParent(columnTasks, tasksById, GROUP_BY_PARENT_THRESHOLD)));
+    }
+    return byColumnKey;
+  }, [groupByParent, rootWorkspaceBoardTasks, tasksById]);
 
   useEffect(() => {
     if (!otherTasksAvailable) {
@@ -3956,6 +3994,16 @@ export function App() {
         filters={filters}
         onChange={setFilters}
       />
+      {workspaceView === "board" && (
+        <label className="nested-workspace-descendants-toggle">
+          <input
+            type="checkbox"
+            checked={groupByParent}
+            onChange={(event) => setGroupByParentPreference(event.target.checked)}
+          />
+          {text("按父级分组", "Group by parent")}
+        </label>
+      )}
     </>
   );
 
@@ -4376,6 +4424,7 @@ export function App() {
               onOpenTaskDetail={openTaskDetail}
               onOpenWorkspace={openWorkspaceTarget}
               toolbarExtra={workspaceBoardToolbarExtra}
+              labelFilter={filters.labels}
               projectExtras={activeWorkspaceDescriptor.kind === "project" ? [
                 { id: "gantt", label: "Gantt" },
                 { id: "docs", label: text("项目文档", "Project Docs") },
@@ -4436,6 +4485,11 @@ export function App() {
                       <div className="board">
                         {mainBoardItems.map((item) => {
                           const workflowStage = workflowBoardStages.find((stage) => stage.stageId === item);
+                          const columnKey = workflowStage?.stageId ?? item;
+                          const ungroupedColumnTasks = workflowStage
+                            ? rootWorkspaceBoardTasks.filter((task) => task.stageId === workflowStage.stageId)
+                            : rootWorkspaceBoardTasks.filter((task) => task.status === item);
+                          const groupedColumn = groupedBoardColumns?.get(columnKey);
                           return (
                             <BoardColumn
                               key={item}
@@ -4445,9 +4499,9 @@ export function App() {
                               status={workflowStage?.canonicalStatus ?? item as TaskStatus}
                               stageId={workflowStage?.stageId}
                               label={workflowStage?.name}
-                              tasks={workflowStage
-                                ? rootWorkspaceBoardTasks.filter((task) => task.stageId === workflowStage.stageId)
-                                : rootWorkspaceBoardTasks.filter((task) => task.status === item)}
+                              tasks={groupedColumn ? groupedColumn.tasks : ungroupedColumnTasks}
+                              groupBadges={groupedColumn?.groupBadges}
+                              onOpenGroup={(task) => openNestedWorkspace(task.identifier)}
                               presentations={taskPresentations}
                               now={processingNow}
                               emptyMessage={hasActiveTaskFilters

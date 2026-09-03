@@ -38,6 +38,13 @@ interface NestedWorkspaceViewProps {
    * `projectBoardContent`/`projectListContent`.
    */
   toolbarExtra?: ReactNode;
+  /**
+   * Carries the workspace root's active label filter into a nested task
+   * workspace opened from a grouped board card, so its own child listing
+   * (Board/List/Tree/Mind Map) shows only the matching descendants instead
+   * of the whole subtree.
+   */
+  labelFilter?: string[];
 }
 
 const MACRO_BUCKET_LABELS: Record<NestedWorkspaceItem["macroBucket"], string> = {
@@ -396,11 +403,15 @@ export function NestedWorkspaceView({
   projectBoardContent,
   projectListContent,
   toolbarExtra,
+  labelFilter,
 }: NestedWorkspaceViewProps) {
   const { text } = useTaskboardI18n();
   const page = descendants ? workspace.descendants ?? workspace.children : workspace.children;
-  const items = page.items;
-  const hierarchyItems = workspace.hierarchy?.items ?? items;
+  const matchesLabelFilter = (item: Pick<NestedWorkspaceItem, "labels">) => (
+    !labelFilter?.length || labelFilter.some((label) => item.labels.includes(label))
+  );
+  const items = page.items.filter(matchesLabelFilter);
+  const hierarchyItems = (workspace.hierarchy?.items ?? page.items).filter(matchesLabelFilter);
   const root = workspace.root;
   const showingProjectExtra = workspace.kind === "project"
     && activeProjectExtra !== null

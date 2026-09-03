@@ -42,9 +42,12 @@ interface BoardColumnProps {
   createEnabled?: boolean;
   dropEnabled?: boolean;
   legacy?: boolean;
+  /** Per-task group badge (id -> count + labels), for cards standing in for a grouped ancestor. */
+  groupBadges?: Map<string, { count: number; labels: string[] }>;
   onCreateLabel: (label: string, projectId?: string) => Promise<void>;
   onCreate: (status: TaskStatus, stageId?: string) => void;
   onEdit: (task: Task) => void;
+  onOpenGroup?: (task: Task) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
   onComplete: (task: Task) => void;
   onContextMenu: (task: Task, position: { x: number; y: number }) => void;
@@ -78,9 +81,11 @@ export function BoardColumn({
   createEnabled = true,
   dropEnabled = true,
   legacy = false,
+  groupBadges,
   onCreateLabel,
   onCreate,
   onEdit,
+  onOpenGroup,
   onUpdate,
   onComplete,
   onContextMenu,
@@ -203,8 +208,10 @@ export function BoardColumn({
               currentUser={currentUser}
               showCover={showCover}
               showBody={showBody}
+              groupBadge={groupBadges?.get(task.id) ?? null}
               onCreateLabel={(label) => onCreateLabel(label, task.projectId)}
               onEdit={onEdit}
+              onOpenGroup={onOpenGroup}
               onUpdate={onUpdate}
               onComplete={onComplete}
               onContextMenu={onContextMenu}

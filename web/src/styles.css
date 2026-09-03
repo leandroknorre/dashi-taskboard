@@ -2777,6 +2777,25 @@ kbd {
   border-radius: 50%;
 }
 
+.task-group-badge {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  height: 18px;
+  padding: 0 6px;
+  border: var(--border-hairline) solid var(--accent);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.task-group-labels {
+  cursor: default;
+}
+
 .label-chip,
 .due-date-chip,
 .thread-link {

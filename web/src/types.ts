@@ -471,6 +471,7 @@ export interface NestedWorkspaceItem {
   status: TaskStatus;
   macroBucket: "planned" | "ready" | "active" | "review" | "blocked" | "closed";
   priority: TaskPriority;
+  labels: string[];
   kind?: "work_card" | "source_record";
   readOnly?: boolean;
   sourceSystem?: string | null;

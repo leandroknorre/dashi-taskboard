@@ -44,8 +44,17 @@ interface TaskCardProps {
   currentUser: ActorIdentity;
   showCover: boolean;
   showBody: boolean;
+  /**
+   * Set when the board has grouped several nested cards under this task's
+   * nearest common ancestor (too many cards in one column). The card still
+   * shows the real ancestor task, but with a count and the union of labels
+   * present among the grouped children instead of the ancestor's own.
+   */
+  groupBadge?: { count: number; labels: string[] } | null;
   onCreateLabel: (label: string) => Promise<void>;
   onEdit: (task: Task) => void;
+  /** Opens the grouped task's nested workspace instead of the normal edit action. */
+  onOpenGroup?: (task: Task) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
   onComplete?: (task: Task) => void;
   onContextMenu: (task: Task, position: { x: number; y: number }) => void;
@@ -250,11 +259,11 @@ function ParticipantAvatars({ participants }: { participants: ActorIdentity[] })
   );
 }
 
-function TaskLabels({ task }: { task: Task }) {
+function TaskLabels({ labels }: { labels: string[] }) {
   const { language } = useTaskboardI18n();
   return (
     <>
-      {task.labels.slice(0, 2).map((label) => {
+      {labels.slice(0, 2).map((label) => {
         const presentation = labelPresentation(label, language);
         return (
           <span className={`label-chip${presentation.tone ? ` label-chip-${presentation.tone}` : ""}`} key={label}>
@@ -263,9 +272,9 @@ function TaskLabels({ task }: { task: Task }) {
           </span>
         );
       })}
-      {task.labels.length > 2 && (
-        <span className="label-more" title={task.labels.slice(2).map((label) => labelPresentation(label, language).name).join(", ")}>
-          +{task.labels.length - 2}
+      {labels.length > 2 && (
+        <span className="label-more" title={labels.slice(2).map((label) => labelPresentation(label, language).name).join(", ")}>
+          +{labels.length - 2}
         </span>
       )}
     </>
@@ -400,8 +409,10 @@ export function TaskCard({
   currentUser,
   showCover,
   showBody,
+  groupBadge = null,
   onCreateLabel,
   onEdit,
+  onOpenGroup,
   onUpdate,
   onComplete,
   onContextMenu,
@@ -434,7 +445,10 @@ export function TaskCard({
     () => showBody ? taskBodyText(task.description) : "",
     [showBody, task.description],
   );
-  const hasProperties = task.priority !== "none" || task.labels.length > 0 || task.dueDate;
+  const hasProperties = task.priority !== "none"
+    || task.labels.length > 0
+    || task.dueDate
+    || Boolean(groupBadge?.labels.length);
   const showsProperties = Boolean(projectName)
     || (!processingCard && (hasProperties || showsInlineParticipants || showsConversation));
   const propertyDisabled = savingProperty !== null;
@@ -475,14 +489,21 @@ export function TaskCard({
       <button
         className="task-card-open"
         type="button"
-        aria-label={text(`打开 ${displayIdentifier}: ${task.title}`, `Open ${displayIdentifier}: ${task.title}`)}
-        onClick={() => onEdit(task)}
+        aria-label={groupBadge
+          ? text(`打开分组 ${displayIdentifier}: ${task.title}`, `Open group ${displayIdentifier}: ${task.title}`)
+          : text(`打开 ${displayIdentifier}: ${task.title}`, `Open ${displayIdentifier}: ${task.title}`)}
+        onClick={() => groupBadge && onOpenGroup ? onOpenGroup(task) : onEdit(task)}
       />
 
       <div className="card-topline">
         <span className="card-reference">
           <span className="task-identifier">ID: {displayIdentifier}</span>
           {sourceRecord && <SourceRecordBadge item={task} compact />}
+          {groupBadge && (
+            <span className="task-group-badge" title={text(`${groupBadge.count} 个子项`, `${groupBadge.count} items`)}>
+              {text(`${groupBadge.count} 项`, `${groupBadge.count} items`)}
+            </span>
+          )}
         </span>
         {presentation.unread && <span className="task-unread-dot" aria-label={text("有未读更新", "Unread updates")} />}
         {!sourceRecord && task.status === "in_review" && onComplete && (
@@ -541,19 +562,28 @@ export function TaskCard({
               onChange={(priority) => updateProperty({ priority }, "priority")}
             />
           )}
-          {!sourceRecord && !processingCard && task.labels.length > 0 && (
-            <LabelPicker
-              availableLabels={availableLabels}
-              selectedLabels={task.labels}
-              open={propertyMenu === "labels"}
-              disabled={propertyDisabled}
-              className="card-label-picker card-property-control"
-              triggerClassName="card-label-trigger"
-              triggerContent={<TaskLabels task={task} />}
-              onOpenChange={(open) => setPropertyMenu(open ? "labels" : null)}
-              onChange={(labels) => updateProperty({ labels }, "labels")}
-              onCreateLabel={onCreateLabel}
-            />
+          {!sourceRecord && !processingCard && (groupBadge ? groupBadge.labels.length > 0 : task.labels.length > 0) && (
+            groupBadge ? (
+              // A group card shows the union of labels present among its
+              // grouped children, not the ancestor's own labels — editing
+              // that union doesn't map to a single task, so it's read-only.
+              <span className="card-label-picker card-property-control task-group-labels">
+                <TaskLabels labels={groupBadge.labels} />
+              </span>
+            ) : (
+              <LabelPicker
+                availableLabels={availableLabels}
+                selectedLabels={task.labels}
+                open={propertyMenu === "labels"}
+                disabled={propertyDisabled}
+                className="card-label-picker card-property-control"
+                triggerClassName="card-label-trigger"
+                triggerContent={<TaskLabels labels={task.labels} />}
+                onOpenChange={(open) => setPropertyMenu(open ? "labels" : null)}
+                onChange={(labels) => updateProperty({ labels }, "labels")}
+                onCreateLabel={onCreateLabel}
+              />
+            )
           )}
           {!sourceRecord && !processingCard && (
             <DueDateControl

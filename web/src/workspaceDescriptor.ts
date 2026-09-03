@@ -74,6 +74,7 @@ function workspaceItemFromTask(
     status: task.status,
     macroBucket: macroBucketForStatus(task.status),
     priority: task.priority,
+    labels: task.labels,
     kind: task.kind,
     readOnly: task.readOnly,
     sourceSystem: task.sourceSystem,

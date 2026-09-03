@@ -21,6 +21,9 @@ export function workspaceItemFromRow(row, { parentId = null, depth = 0, path = [
     status: row.status,
     macroBucket: macroBucketForStatus(row.status),
     priority: row.priority,
+    // Included so a workspace-root filter (e.g. a label) can carry into a
+    // nested workspace's own child listing without a second task fetch.
+    labels: JSON.parse(row.labels),
     archivedAt: row.archived_at,
     // Temporal fields are persisted task facts, included so read-only timeline projections
     // never need to fetch a second task collection.

@@ -25,14 +25,14 @@ const workspace: WorkspaceDescriptor = {
   ],
   children: {
     items: [
-      { id: "child", identifier: "TASK-2", projectId: "project-1", title: "Build board", status: "in_progress", macroBucket: "active", priority: "high", archivedAt: null, parentId: "root", depth: 1, path: ["root", "child"], startDate: null, dueDate: null, createdAt: "2026-08-25T00:00:00.000Z", updatedAt: "2026-08-25T00:00:00.000Z" },
+      { id: "child", identifier: "TASK-2", projectId: "project-1", title: "Build board", status: "in_progress", macroBucket: "active", priority: "high", labels: [], archivedAt: null, parentId: "root", depth: 1, path: ["root", "child"], startDate: null, dueDate: null, createdAt: "2026-08-25T00:00:00.000Z", updatedAt: "2026-08-25T00:00:00.000Z" },
     ],
     nextCursor: "workspace:child",
   },
   descendants: {
     items: [
-      { id: "child", identifier: "TASK-2", projectId: "project-1", title: "Build board", status: "in_progress", macroBucket: "active", priority: "high", archivedAt: null, parentId: "root", depth: 1, path: ["root", "child"], startDate: null, dueDate: null, createdAt: "2026-08-25T00:00:00.000Z", updatedAt: "2026-08-25T00:00:00.000Z" },
-      { id: "grandchild", identifier: "TASK-3", projectId: "project-1", title: "Verify list", status: "in_review", macroBucket: "review", priority: "none", archivedAt: null, parentId: "child", depth: 2, path: ["root", "child", "grandchild"], startDate: null, dueDate: null, createdAt: "2026-08-25T00:00:00.000Z", updatedAt: "2026-08-25T00:00:00.000Z" },
+      { id: "child", identifier: "TASK-2", projectId: "project-1", title: "Build board", status: "in_progress", macroBucket: "active", priority: "high", labels: [], archivedAt: null, parentId: "root", depth: 1, path: ["root", "child"], startDate: null, dueDate: null, createdAt: "2026-08-25T00:00:00.000Z", updatedAt: "2026-08-25T00:00:00.000Z" },
+      { id: "grandchild", identifier: "TASK-3", projectId: "project-1", title: "Verify list", status: "in_review", macroBucket: "review", priority: "none", labels: [], archivedAt: null, parentId: "child", depth: 2, path: ["root", "child", "grandchild"], startDate: null, dueDate: null, createdAt: "2026-08-25T00:00:00.000Z", updatedAt: "2026-08-25T00:00:00.000Z" },
     ],
     nextCursor: null,
   },
