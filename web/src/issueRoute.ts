@@ -2,6 +2,7 @@ const ISSUE_QUERY_PARAM = "issue";
 const WORKSPACE_QUERY_PARAM = "workspace";
 const WORKSPACE_ROOT_QUERY_PARAM = "workspaceRoot";
 const WORKSPACE_ROOT_EXTRA_QUERY_PARAM = "workspaceExtra";
+const WORKSPACE_DESCENDANTS_QUERY_PARAM = "descendants";
 
 export const WORKSPACE_VIEWS = ["overview", "board", "list", "tree", "mindmap", "timeline"] as const;
 export type WorkspaceView = (typeof WORKSPACE_VIEWS)[number];
@@ -35,6 +36,18 @@ export function readWorkspaceRootExtra(search: string): WorkspaceRootExtra | nul
 export function readWorkspaceView(search: string): WorkspaceView {
   const value = new URLSearchParams(search).get("view");
   return WORKSPACE_VIEWS.includes(value as WorkspaceView) ? value as WorkspaceView : "overview";
+}
+
+/** Bookmarkable state for the "All descendants" toggle on a nested workspace's Board/List. */
+export function readWorkspaceDescendants(search: string): boolean {
+  return new URLSearchParams(search).get(WORKSPACE_DESCENDANTS_QUERY_PARAM) === "1";
+}
+
+export function writeWorkspaceDescendants(descendants: boolean) {
+  const url = new URL(window.location.href);
+  if (descendants) url.searchParams.set(WORKSPACE_DESCENDANTS_QUERY_PARAM, "1");
+  else url.searchParams.delete(WORKSPACE_DESCENDANTS_QUERY_PARAM);
+  window.history.replaceState(window.history.state, "", url);
 }
 
 /** Changes nested-workspace route state, preserving project and host context.

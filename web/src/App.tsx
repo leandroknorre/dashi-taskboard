@@ -110,10 +110,12 @@ import {
   buildRootWorkspaceUrl,
   buildWorkspaceUrl,
   readIssueIdentifier,
+  readWorkspaceDescendants,
   readWorkspaceIdentifier,
   readWorkspaceRootExtra,
   readWorkspaceRootProjectId,
   readWorkspaceView,
+  writeWorkspaceDescendants,
   type WorkspaceRootExtra,
   type WorkspaceView,
 } from "./issueRoute";
@@ -808,7 +810,9 @@ export function App() {
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>(
     () => readWorkspaceView(window.location.search),
   );
-  const [workspaceDescendants, setWorkspaceDescendants] = useState(false);
+  const [workspaceDescendants, setWorkspaceDescendants] = useState(
+    () => readWorkspaceDescendants(window.location.search),
+  );
   const [nestedWorkspaceLoad, setNestedWorkspaceLoad] = useState<NestedWorkspaceLoad>(
     EMPTY_NESTED_WORKSPACE_LOAD,
   );
@@ -1759,7 +1763,11 @@ export function App() {
       setWorkspaceRootProjectId(routeWorkspaceRootProjectId);
       setWorkspaceRootExtra(routeWorkspaceRootExtra);
       setWorkspaceView(readWorkspaceView(url.search));
-      if (routeWorkspaceKey !== currentWorkspaceKey) setWorkspaceDescendants(false);
+      setWorkspaceDescendants(
+        routeWorkspaceKey === currentWorkspaceKey
+          ? readWorkspaceDescendants(url.search)
+          : false,
+      );
       if (routeIssueIdentifier && boardView === "list" && issueListRef.current) {
         pendingDetailSourceScrollRef.current = {
           projectId: selectedProjectId,
@@ -1972,6 +1980,10 @@ export function App() {
   useEffect(() => {
     writeTaskFilters(filters);
   }, [filters]);
+
+  useEffect(() => {
+    writeWorkspaceDescendants(workspaceDescendants);
+  }, [workspaceDescendants]);
 
   useEffect(() => {
     tasksRef.current = tasks;
@@ -2618,10 +2630,17 @@ export function App() {
   // roots of the project hierarchy, and its columns are the project's actual
   // active, visible workflow stages. Nested task workspaces intentionally use
   // the macro buckets supplied by their read model instead.
-  const rootWorkspaceBoardTasks = useMemo(() => filteredTasks.filter((task) => (
-    task.projectId === workspaceRootProjectId
-    && task.relations.parent === null
-  )), [filteredTasks, workspaceRootProjectId]);
+  // Searching or filtering by label is a project-wide question ("where is
+  // everything tagged #hoje?"), so it always searches every task in the
+  // project regardless of nesting. With no such filter, the "All
+  // descendants" toggle governs whether only the roots or the whole project
+  // shows.
+  const hasActiveLabelOrSearchFilter = Boolean(search.trim()) || filters.labels.length > 0;
+  const rootWorkspaceBoardTasks = useMemo(() => {
+    const projectTasks = filteredTasks.filter((task) => task.projectId === workspaceRootProjectId);
+    if (hasActiveLabelOrSearchFilter || workspaceDescendants) return projectTasks;
+    return projectTasks.filter((task) => task.relations.parent === null);
+  }, [filteredTasks, hasActiveLabelOrSearchFilter, workspaceDescendants, workspaceRootProjectId]);
 
   useEffect(() => {
     if (!otherTasksAvailable) {
