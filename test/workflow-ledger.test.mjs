@@ -31,11 +31,26 @@ const ledgerColumns = [
 ];
 
 afterEach(async () => {
+  // Close every connection FIRST, then remove directories in a second pass.
+  // The competing-connections test opens two separate DatabaseSync handles
+  // onto the same on-disk ledger.sqlite; if a directory is rm()'d while the
+  // *other* fixture's connection to that same file is still open, Windows
+  // refuses the unlink (EBUSY: resource busy or locked) because it doesn't
+  // allow deleting a file that still has an open handle — Linux/macOS allow
+  // it (the inode is unlinked but stays alive until the last fd closes), so
+  // this only surfaced on the Windows runner. Closing all connections before
+  // any rm() removes the open-handle race on every OS.
+  const popped = [];
   while (fixtures.length > 0) {
     const fixture = fixtures.pop();
+    popped.push(fixture);
     fixture.database?.close();
-    if (fixture.directory) await rm(fixture.directory, { recursive: true, force: true });
     await fixture.cloud?.dispose();
+  }
+  for (const fixture of popped) {
+    if (fixture.directory) {
+      await rm(fixture.directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+    }
   }
 });
 
