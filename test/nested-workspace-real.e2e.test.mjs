@@ -378,7 +378,7 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
       await attempt(() => proxy?.close());
       await attempt(() => app?.server.closeAllConnections?.());
       await attempt(() => app?.close());
-      await attempt(() => rm(directory, { recursive: true, force: true }));
+      await attempt(() => rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
       if (firstError) throw firstError;
     })();
     return cleanupPromise;

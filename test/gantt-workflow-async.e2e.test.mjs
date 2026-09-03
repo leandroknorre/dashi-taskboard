@@ -413,7 +413,7 @@ test("App repaints real DHTMLX Gantt when the project workflow arrives late", { 
       await attempt(() => proxy?.close());
       await attempt(() => app?.server.closeAllConnections?.());
       await attempt(() => app?.close());
-      await attempt(() => rm(directory, { recursive: true, force: true }));
+      await attempt(() => rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
       if (firstError) throw firstError;
     })();
     return cleanupPromise;
