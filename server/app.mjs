@@ -3639,6 +3639,9 @@ export function createTaskboardServer(options = {}) {
         }
         const attachment = database.getAttachment(id) ?? database.getProjectReadmeAttachment(id);
         if (!attachment) throw new ApiError(404, "ATTACHMENT_NOT_FOUND", `Attachment '${id}' does not exist`);
+        // A project readme attachment has no taskId - the pillar model is
+        // task-scoped, so it stays outside this guard (same as project docs).
+        if (scope.restricted && attachment.taskId) assertTaskPilarInScope(scope, attachment.taskId);
         const body = await readFile(path.join(resolved.attachmentsDirectory, attachment.id));
         const encodedFilename = encodeURIComponent(attachment.filename).replace(/['()*]/g, (character) => (
           `%${character.charCodeAt(0).toString(16).toUpperCase()}`
@@ -3673,6 +3676,7 @@ export function createTaskboardServer(options = {}) {
         if (request.method !== "DELETE") return methodNotAllowed(response, ["DELETE"]);
         const attachment = database.getAttachment(id);
         if (!attachment) throw new ApiError(404, "ATTACHMENT_NOT_FOUND", `Attachment '${id}' does not exist`);
+        if (scope.restricted) assertTaskPilarInScope(scope, attachment.taskId);
         database.deleteAttachment(id);
         try {
           await unlink(path.join(resolved.attachmentsDirectory, attachment.id));
@@ -3863,14 +3867,19 @@ export function createTaskboardServer(options = {}) {
         if ([...url.searchParams.keys()].length > 0) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Automation run routes do not accept query parameters");
         }
+        // Every action on this route resolves to one run's task, so fetch
+        // it once, gate on its pillar, and reuse it below instead of
+        // re-querying the same run per branch.
+        const automationRun = automationRuns.get(runId);
+        if (scope.restricted) assertTaskPilarInScope(scope, automationRun.taskId);
         const action = automationRunRoute[2];
         if (!action) {
           if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
-          return sendJson(response, 200, { run: automationRuns.get(runId) });
+          return sendJson(response, 200, { run: automationRun });
         }
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         if (action === "dispatch") {
-          database.assertTaskWritable(automationRuns.get(runId).taskId);
+          database.assertTaskWritable(automationRun.taskId);
           const result = automationRuns.dispatch(
             runId,
             parseAutomationRunDispatch(await readJson(request), requestHeader(request, "idempotency-key")),
@@ -3883,7 +3892,7 @@ export function createTaskboardServer(options = {}) {
             idempotent: result.idempotent,
           });
         }
-        database.assertTaskWritable(automationRuns.get(runId).taskId);
+        database.assertTaskWritable(automationRun.taskId);
         const result = automationRuns.recordResult(
           runId,
           parseAutomationRunResult(await readJson(request), requestHeader(request, "idempotency-key")),

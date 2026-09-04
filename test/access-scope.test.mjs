@@ -75,6 +75,22 @@ async function createTask(baseUrl, { title, labels = [] }) {
   return result.body.task;
 }
 
+async function startServerWithApp(extraEnv = {}) {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-access-scope-test-"));
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    processEnv: {
+      ...process.env,
+      TASKBOARD_OWNER_EMAIL: OWNER,
+      TASKBOARD_USER_SCOPES: SCOPES,
+      ...extraEnv,
+    },
+  });
+  const address = await app.listen({ host: "127.0.0.1", port: 0 });
+  runningApps.push({ app, directory });
+  return { app, baseUrl: `http://127.0.0.1:${address.port}` };
+}
+
 async function linkParent(baseUrl, child, parentId) {
   const result = await request(baseUrl, `/api/tasks/${child.id}/relations/parent/${parentId}`, {
     method: "POST",
@@ -232,4 +248,77 @@ test("without TASKBOARD_OWNER_EMAIL/TASKBOARD_USER_SCOPES configured, behavior i
   const list = await request(baseUrl, "/api/tasks", { headers: asEmail("anyone@example.com") });
   assert.equal(list.response.status, 200);
   assert.ok(list.body.tasks.some((row) => row.id === task.id));
+});
+
+test("scoped write: deleting/reading an attachment on a task outside the pillar is refused (403)", async () => {
+  const baseUrl = await startServer();
+  const automatixRoot = await createTask(baseUrl, { title: "Automatix root", labels: ["pilar:automatix"] });
+
+  const contents = "attachment contents\n";
+  const upload = await fetch(`${baseUrl}/api/tasks/${automatixRoot.id}/attachments`, {
+    method: "POST",
+    headers: {
+      ...AGENT_HEADERS,
+      "content-type": "text/plain; charset=utf-8",
+      "x-taskboard-filename": encodeURIComponent("nota.txt"),
+      "x-taskboard-attachment-kind": "attachment",
+    },
+    body: contents,
+  });
+  assert.equal(upload.status, 201);
+  const attachment = (await upload.json()).attachment;
+
+  // Ardelita is scoped to dSAdv; this attachment belongs to an Automatix task.
+  const readOutside = await fetch(`${baseUrl}/api/attachments/${attachment.id}/content`, {
+    headers: asEmail(ARDELITA),
+  });
+  assert.equal(readOutside.status, 403);
+  assert.equal((await readOutside.json()).error.code, "SCOPE_FORBIDDEN");
+
+  const deleteOutside = await fetch(`${baseUrl}/api/attachments/${attachment.id}`, {
+    method: "DELETE",
+    headers: asEmail(ARDELITA),
+  });
+  assert.equal(deleteOutside.status, 403);
+  assert.equal((await deleteOutside.json()).error.code, "SCOPE_FORBIDDEN");
+
+  // Felipe (Automatix) can still reach it - the guard is per-pillar, not a blanket lock.
+  const readInside = await fetch(`${baseUrl}/api/attachments/${attachment.id}/content`, {
+    headers: asEmail(FELIPE),
+  });
+  assert.equal(readInside.status, 200);
+});
+
+test("scoped write: an automation run on a task outside the pillar is refused (403)", async () => {
+  const { app, baseUrl } = await startServerWithApp();
+  const automatixRoot = await createTask(baseUrl, { title: "Automatix root", labels: ["pilar:automatix"] });
+
+  const { TransitionService } = await import("../server/transition-service.mjs");
+  const transitions = new TransitionService(app.database);
+  const action = transitions.listActions(automatixRoot.id).find((candidate) => candidate.toTerminalKind === "none");
+  assert.ok(action, "fixture must expose a non-terminal action");
+
+  const created = await request(baseUrl, `/api/tasks/${automatixRoot.id}/transitions`, {
+    method: "POST",
+    headers: { ...AGENT_HEADERS, "idempotency-key": "access-scope-automation-run" },
+    body: { expectedStateVersion: automatixRoot.version, actionKey: action.actionKey, gateEvidence: [] },
+  });
+  assert.equal(created.response.status, 200, JSON.stringify(created.body));
+  const runId = created.body.automationRun.runId;
+
+  // Ardelita (dSAdv) cannot see or act on an automation run tied to an Automatix task.
+  const readOutside = await request(baseUrl, `/api/automation-runs/${runId}`, { headers: asEmail(ARDELITA) });
+  assert.equal(readOutside.response.status, 403);
+  assert.equal(readOutside.body.error.code, "SCOPE_FORBIDDEN");
+
+  const dispatchOutside = await request(baseUrl, `/api/automation-runs/${runId}/dispatch`, {
+    method: "POST",
+    headers: asEmail(ARDELITA),
+    body: { leaseDurationMs: 60_000 },
+  });
+  assert.equal(dispatchOutside.response.status, 403);
+
+  // Felipe (Automatix) can still read it.
+  const readInside = await request(baseUrl, `/api/automation-runs/${runId}`, { headers: asEmail(FELIPE) });
+  assert.equal(readInside.response.status, 200);
 });
