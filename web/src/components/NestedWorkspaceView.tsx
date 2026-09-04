@@ -24,12 +24,14 @@ interface NestedWorkspaceViewProps {
   onProjectExtraChange?: (extra: WorkspaceRootExtra) => void;
   projectExtraContent?: ReactNode;
   /**
-   * The project root is the one workspace whose Board is an operational
-   * projection: physical workflow stages, draggable cards and per-rail
-   * scrolling. Task workspaces deliberately retain the macro-bucket Board.
+   * The operational Board projection: physical workflow stages, draggable
+   * cards and per-rail scrolling. Supplied for the project root and for a
+   * task workspace drilled into from a grouped board card, scoped to that
+   * card's own children/descendants. Left undefined only where the caller
+   * has no workflow to project (falls back to the macro-bucket Board below).
    */
   projectBoardContent?: ReactNode;
-  /** Physical workflow projection used by the project root List. */
+  /** Physical workflow projection used by the List, same scoping as above. */
   projectListContent?: ReactNode;
   /**
    * Extra controls (search, filters) rendered inline in this workspace's own
@@ -416,12 +418,13 @@ export function NestedWorkspaceView({
   const showingProjectExtra = workspace.kind === "project"
     && activeProjectExtra !== null
     && projectExtraContent !== undefined;
-  const showingProjectBoard = workspace.kind === "project"
-    && view === "board"
-    && projectBoardContent !== undefined;
-  const showingProjectList = workspace.kind === "project"
-    && view === "list"
-    && projectListContent !== undefined;
+  // Board/List are an operational projection (physical workflow stages) for
+  // both the project root and a task workspace drilled into from a grouped
+  // board card — the caller decides per workspace.kind whether to supply
+  // this content; only the root-only extras (Gantt, project docs) stay
+  // gated on workspace.kind above.
+  const showingProjectBoard = view === "board" && projectBoardContent !== undefined;
+  const showingProjectList = view === "list" && projectListContent !== undefined;
   const panelId = showingProjectExtra
     ? `nested-workspace-panel-extra-${activeProjectExtra}`
     : `nested-workspace-panel-${view}`;

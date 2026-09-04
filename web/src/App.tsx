@@ -2638,21 +2638,30 @@ export function App() {
     : boardDisplaySettings.sidebarStatuses;
   const otherTaskTabsKey = otherTaskTabs.join(",");
   const otherTasksAvailable = otherTaskTabs.length > 0;
-  // A project root is an operational board. Its cards are only the direct
-  // roots of the project hierarchy, and its columns are the project's actual
-  // active, visible workflow stages. Nested task workspaces intentionally use
-  // the macro buckets supplied by their read model instead.
-  // Searching or filtering by label is a project-wide question ("where is
-  // everything tagged #hoje?"), so it always searches every task in the
-  // project regardless of nesting. With no such filter, the "All
-  // descendants" toggle governs whether only the roots or the whole project
-  // shows.
+  // Every workspace shown as a Board/List is an operational projection: its
+  // columns are the project's actual active, visible workflow stages. The
+  // project root's cards are the direct roots of the project hierarchy; a
+  // task workspace's cards are that card's own children/descendants instead
+  // (drilling into a card is still bounded by that card's subtree).
+  // Searching or filtering by label is a "where is everything tagged #hoje?"
+  // question, so it always searches every task in the current scope (whole
+  // project at the root, or the drilled-down card's subtree) regardless of
+  // nesting. With no such filter, the "All descendants" toggle governs
+  // whether only the direct children or the whole scope shows.
   const hasActiveLabelOrSearchFilter = Boolean(search.trim()) || filters.labels.length > 0;
-  const rootWorkspaceBoardTasks = useMemo(() => {
-    const projectTasks = filteredTasks.filter((task) => task.projectId === workspaceRootProjectId);
-    if (hasActiveLabelOrSearchFilter || workspaceDescendants) return projectTasks;
-    return projectTasks.filter((task) => task.relations.parent === null);
-  }, [filteredTasks, hasActiveLabelOrSearchFilter, workspaceDescendants, workspaceRootProjectId]);
+  const activeWorkspaceBoardTasks = useMemo(() => {
+    if (!activeWorkspaceDescriptor) return [];
+    if (activeWorkspaceDescriptor.kind === "project") {
+      const projectTasks = filteredTasks.filter((task) => task.projectId === workspaceRootProjectId);
+      if (hasActiveLabelOrSearchFilter || workspaceDescendants) return projectTasks;
+      return projectTasks.filter((task) => task.relations.parent === null);
+    }
+    const page = hasActiveLabelOrSearchFilter || workspaceDescendants
+      ? activeWorkspaceDescriptor.descendants ?? activeWorkspaceDescriptor.children
+      : activeWorkspaceDescriptor.children;
+    const identifiers = new Set(page.items.map((item) => item.identifier));
+    return filteredTasks.filter((task) => identifiers.has(task.identifier));
+  }, [activeWorkspaceDescriptor, filteredTasks, hasActiveLabelOrSearchFilter, workspaceDescendants, workspaceRootProjectId]);
 
   // "Group by parent" collapses a column with too many cards into one card
   // per nearest shared ancestor. It defaults to on once any column crosses
@@ -2662,23 +2671,23 @@ export function App() {
   const rootBoardColumnKey = (task: Task) => task.stageId ?? task.status;
   const anyBoardColumnOverThreshold = useMemo(() => {
     const counts = new Map<string, number>();
-    for (const task of rootWorkspaceBoardTasks) {
+    for (const task of activeWorkspaceBoardTasks) {
       const key = rootBoardColumnKey(task);
       counts.set(key, (counts.get(key) ?? 0) + 1);
     }
     return [...counts.values()].some((count) => count > GROUP_BY_PARENT_THRESHOLD);
-  }, [rootWorkspaceBoardTasks]);
+  }, [activeWorkspaceBoardTasks]);
   const groupByParent = groupByParentPreference ?? anyBoardColumnOverThreshold;
   const groupedBoardColumns = useMemo(() => {
     if (!groupByParent) return null;
     const byColumnKey = new Map<string, ReturnType<typeof columnCardsToTasks>>();
-    const keys = new Set(rootWorkspaceBoardTasks.map((task) => rootBoardColumnKey(task)));
+    const keys = new Set(activeWorkspaceBoardTasks.map((task) => rootBoardColumnKey(task)));
     for (const key of keys) {
-      const columnTasks = rootWorkspaceBoardTasks.filter((task) => rootBoardColumnKey(task) === key);
+      const columnTasks = activeWorkspaceBoardTasks.filter((task) => rootBoardColumnKey(task) === key);
       byColumnKey.set(key, columnCardsToTasks(groupTasksByParent(columnTasks, tasksById, GROUP_BY_PARENT_THRESHOLD)));
     }
     return byColumnKey;
-  }, [groupByParent, rootWorkspaceBoardTasks, tasksById]);
+  }, [groupByParent, activeWorkspaceBoardTasks, tasksById]);
 
   useEffect(() => {
     if (!otherTasksAvailable) {
@@ -4462,7 +4471,7 @@ export function App() {
                     onError={setActionError}
                   />
                 ) : undefined}
-              projectBoardContent={activeWorkspaceDescriptor.kind !== "project" ? undefined : (
+              projectBoardContent={(
                 <div
                   className="issue-board-layout nested-workspace-physical-board"
                   data-main-columns={mainBoardItems.length}
@@ -4481,14 +4490,19 @@ export function App() {
                       ))}
                     </div>
                   ) : (
-                    <div className="board-scroll" aria-label={text("项目根看板", "Project root board")}>
+                    <div
+                      className="board-scroll"
+                      aria-label={activeWorkspaceDescriptor.kind === "project"
+                        ? text("项目根看板", "Project root board")
+                        : text("卡片看板", "Card board")}
+                    >
                       <div className="board">
                         {mainBoardItems.map((item) => {
                           const workflowStage = workflowBoardStages.find((stage) => stage.stageId === item);
                           const columnKey = workflowStage?.stageId ?? item;
                           const ungroupedColumnTasks = workflowStage
-                            ? rootWorkspaceBoardTasks.filter((task) => task.stageId === workflowStage.stageId)
-                            : rootWorkspaceBoardTasks.filter((task) => task.status === item);
+                            ? activeWorkspaceBoardTasks.filter((task) => task.stageId === workflowStage.stageId)
+                            : activeWorkspaceBoardTasks.filter((task) => task.status === item);
                           const groupedColumn = groupedBoardColumns?.get(columnKey);
                           return (
                             <BoardColumn
@@ -4539,10 +4553,10 @@ export function App() {
                   )}
                 </div>
               )}
-              projectListContent={activeWorkspaceDescriptor.kind !== "project" ? undefined : (
+              projectListContent={(
                 <IssueListView
                   scrollRef={issueListRef}
-                  tasks={rootWorkspaceBoardTasks}
+                  tasks={activeWorkspaceBoardTasks}
                   presentations={taskPresentations}
                   currentUser={currentUser}
                   workflowStages={workflowStages}
