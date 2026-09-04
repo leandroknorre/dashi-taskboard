@@ -1942,7 +1942,7 @@ test("Codex-hosted user mutations persist the current account identity and avata
 
 test("a Cloudflare Access proxy email resolves the actor, and only wins over the client's own local-user identity", async () => {
   const baseUrl = await startServer();
-  const proxyHeader = { "cf-access-authenticated-user-email": "leandro@desantanna.com.br" };
+  const proxyHeader = { "cf-access-authenticated-user-email": "leandro@example.com" };
 
   const noExplicitIdentityResult = await request(baseUrl, "/api/tasks", {
     method: "POST",
@@ -1950,8 +1950,8 @@ test("a Cloudflare Access proxy email resolves the actor, and only wins over the
     body: { title: "No explicit identity headers" },
   });
   assert.equal(noExplicitIdentityResult.response.status, 201);
-  assert.equal(noExplicitIdentityResult.body.task.creatorId, "leandro@desantanna.com.br");
-  assert.equal(noExplicitIdentityResult.body.task.creatorName, "leandro@desantanna.com.br");
+  assert.equal(noExplicitIdentityResult.body.task.creatorId, "leandro@example.com");
+  assert.equal(noExplicitIdentityResult.body.task.creatorName, "leandro@example.com");
 
   const explicitLocalUserResult = await request(baseUrl, "/api/tasks", {
     method: "POST",
@@ -1963,8 +1963,8 @@ test("a Cloudflare Access proxy email resolves the actor, and only wins over the
     body: { title: "Explicit local-user identity from the web client" },
   });
   assert.equal(explicitLocalUserResult.response.status, 201);
-  assert.equal(explicitLocalUserResult.body.task.creatorId, "leandro@desantanna.com.br");
-  assert.equal(explicitLocalUserResult.body.task.creatorName, "leandro@desantanna.com.br");
+  assert.equal(explicitLocalUserResult.body.task.creatorId, "leandro@example.com");
+  assert.equal(explicitLocalUserResult.body.task.creatorName, "leandro@example.com");
 
   const explicitOtherIdentityResult = await request(baseUrl, "/api/tasks", {
     method: "POST",
