@@ -3783,6 +3783,15 @@ kbd {
   white-space: nowrap;
 }
 
+.issue-relation-create-label {
+  grid-column: 2 / -1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .issue-relation-option-check {
   display: grid;
   place-items: center;

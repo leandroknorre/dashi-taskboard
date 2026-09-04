@@ -6,6 +6,7 @@ import {
   type CSSProperties,
 } from "react";
 
+import { createTask } from "../api";
 import type {
   IssueRelationType,
   Task,
@@ -32,17 +33,28 @@ export function IssuePickerContent({
   disabled,
   onSelect,
   onEscape,
+  onCreate,
+  createLabel,
 }: {
   candidates: Task[];
   selectedIds?: ReadonlySet<string>;
   disabled?: boolean;
   onSelect: (task: Task) => void | Promise<void>;
   onEscape: () => void;
+  /**
+   * When present, a query that doesn't (or does — it's always offered as
+   * the first row) match an existing issue can create one instead. Only
+   * wired up where "search or create" makes sense (sub-issues today) — a
+   * picker without this prop keeps its old, selection-only behavior.
+   */
+  onCreate?: (title: string) => void | Promise<void>;
+  createLabel?: (title: string) => string;
 }) {
   const { text } = useTaskboardI18n();
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
   const [savingId, setSavingId] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const results = useMemo(() => {
@@ -72,6 +84,21 @@ export function IssuePickerContent({
     }
   }
 
+  const trimmedQuery = query.trim();
+  const showCreateOption = Boolean(onCreate) && trimmedQuery.length > 0;
+  const totalOptions = (showCreateOption ? 1 : 0) + results.length;
+
+  async function create() {
+    if (!onCreate || creating) return;
+    setCreating(true);
+    try {
+      await onCreate(trimmedQuery);
+    } catch {
+    } finally {
+      setCreating(false);
+    }
+  }
+
   return (
     <>
       <div className="issue-relation-search">
@@ -82,7 +109,13 @@ export function IssuePickerContent({
           role="combobox"
           aria-expanded="true"
           aria-controls="issue-relation-results"
-          aria-activedescendant={results[activeIndex] ? `relation-option-${results[activeIndex].id}` : undefined}
+          aria-activedescendant={
+            showCreateOption && activeIndex === 0
+              ? "relation-option-create"
+              : results[showCreateOption ? activeIndex - 1 : activeIndex]
+                ? `relation-option-${results[showCreateOption ? activeIndex - 1 : activeIndex].id}`
+                : undefined
+          }
           placeholder={text("搜索议题…", "Search issues…")}
           onChange={(event) => {
             setQuery(event.target.value);
@@ -93,17 +126,21 @@ export function IssuePickerContent({
             if (event.key === "Enter") {
               if (event.metaKey || event.ctrlKey) return;
               event.preventDefault();
-              const activeResult = results[activeIndex];
+              if (showCreateOption && activeIndex === 0) {
+                void create();
+                return;
+              }
+              const activeResult = results[showCreateOption ? activeIndex - 1 : activeIndex];
               if (activeResult) void choose(activeResult);
             } else if (event.key === "Escape") {
               event.preventDefault();
               onEscape();
-            } else if (event.key === "ArrowDown" && results.length > 0) {
+            } else if (event.key === "ArrowDown" && totalOptions > 0) {
               event.preventDefault();
-              setActiveIndex((index) => (index + 1) % results.length);
-            } else if (event.key === "ArrowUp" && results.length > 0) {
+              setActiveIndex((index) => (index + 1) % totalOptions);
+            } else if (event.key === "ArrowUp" && totalOptions > 0) {
               event.preventDefault();
-              setActiveIndex((index) => (index - 1 + results.length) % results.length);
+              setActiveIndex((index) => (index - 1 + totalOptions) % totalOptions);
             }
           }}
         />
@@ -113,25 +150,46 @@ export function IssuePickerContent({
         id="issue-relation-results"
         role="listbox"
       >
+        {showCreateOption && (
+          <button
+            ref={(element) => {
+              optionRefs.current[0] = element;
+            }}
+            id="relation-option-create"
+            className={`issue-relation-create${activeIndex === 0 ? " is-active" : ""}`}
+            type="button"
+            role="option"
+            aria-selected={activeIndex === 0}
+            disabled={disabled || creating || savingId !== null}
+            onMouseEnter={() => setActiveIndex(0)}
+            onClick={() => void create()}
+          >
+            <PlusIcon color="currentColor" size={14} />
+            <span className="issue-relation-create-label">
+              {createLabel?.(trimmedQuery) ?? text(`创建"${trimmedQuery}"`, `Create "${trimmedQuery}"`)}
+            </span>
+          </button>
+        )}
         {results.length > 0 ? results.map((candidate, index) => {
+          const optionIndex = showCreateOption ? index + 1 : index;
           const selected = selectedIds?.has(candidate.id) ?? false;
           const className = [
-            index === activeIndex ? "is-active" : "",
+            optionIndex === activeIndex ? "is-active" : "",
             selected ? "is-selected" : "",
           ].filter(Boolean).join(" ");
           return (
             <button
               ref={(element) => {
-                optionRefs.current[index] = element;
+                optionRefs.current[optionIndex] = element;
               }}
               id={`relation-option-${candidate.id}`}
               className={className}
               type="button"
               role="option"
-              aria-selected={selectedIds ? selected : index === activeIndex}
+              aria-selected={selectedIds ? selected : optionIndex === activeIndex}
               disabled={disabled || savingId !== null}
               key={candidate.id}
-              onMouseEnter={() => setActiveIndex(index)}
+              onMouseEnter={() => setActiveIndex(optionIndex)}
               onClick={() => void choose(candidate)}
             >
               <StatusIcon status={candidate.status} size={14} />
@@ -144,7 +202,7 @@ export function IssuePickerContent({
               )}
             </button>
           );
-        }) : (
+        }) : !showCreateOption && (
           <p className="issue-relation-empty">{text("没有匹配的议题", "No matching issues")}</p>
         )}
       </div>
@@ -173,11 +231,15 @@ export function IssuePicker({
   candidates,
   disabled,
   onSelect,
+  onCreate,
+  createLabel,
 }: {
   label: string;
   candidates: Task[];
   disabled?: boolean;
   onSelect: (task: Task) => Promise<void>;
+  onCreate?: (title: string) => Promise<void>;
+  createLabel?: (title: string) => string;
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -214,6 +276,11 @@ export function IssuePicker({
               await onSelect(task);
               setOpen(false);
             }}
+            onCreate={onCreate && (async (title) => {
+              await onCreate(title);
+              setOpen(false);
+            })}
+            createLabel={createLabel}
           />
         </div>
       )}
@@ -382,6 +449,26 @@ export function IssueSubIssues({
               setSavingId(null);
             }
           }}
+          onCreate={async (title) => {
+            setSavingId("creating-sub-issue");
+            try {
+              const created = await createTask(task.projectId, {
+                title,
+                description: "",
+                status: "todo",
+                priority: "none",
+                labels: [],
+                developmentContext: null,
+                startDate: null,
+                dueDate: null,
+                recurrence: null,
+              });
+              await onAddRelation(created, "parent", task.id);
+            } finally {
+              setSavingId(null);
+            }
+          }}
+          createLabel={(title) => text(`创建"${title}"为子议题`, `Create "${title}" as sub-issue`)}
         />
       </header>
       {subIssues.length > 0 && (
