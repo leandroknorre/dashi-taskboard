@@ -5,6 +5,7 @@ import {
   type KeyboardEvent,
   type MouseEvent,
 } from "react";
+import { createPortal } from "react-dom";
 import { taskboardStorage } from "../storage";
 import {
   ApiError,
@@ -2080,7 +2081,7 @@ function EditableTaskDetail({
         </div>
       </div>
 
-      {citeSelection && (
+      {citeSelection && createPortal(
         <button
           type="button"
           className="quote-selection-button"
@@ -2091,7 +2092,8 @@ function EditableTaskDetail({
         >
           <QuoteIcon color="currentColor" />
           {text("引用到评论", "Quote in comment")}
-        </button>
+        </button>,
+        document.body,
       )}
 
       {pendingDelete && (

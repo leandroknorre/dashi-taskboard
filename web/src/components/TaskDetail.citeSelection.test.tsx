@@ -208,6 +208,11 @@ describe("TaskDetail quote-in-comment selection", () => {
     selectTextWithin(commentBody, "important detail worth quoting");
 
     const quoteButton = await screen.findByRole("button", { name: /quote in comment/i });
+    // The button is portaled straight to document.body so its `position: fixed`
+    // coordinates resolve against the real viewport, not against `.workspace`
+    // (which establishes CSS layout containment via `container-type`, making
+    // it the containing block for any fixed-position descendant left inline).
+    expect(quoteButton.parentElement).toBe(document.body);
     fireEvent.mouseDown(quoteButton);
     fireEvent.click(quoteButton);
 
