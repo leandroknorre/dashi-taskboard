@@ -218,7 +218,7 @@ test("legacy stages remain read projections but never become movement targets", 
   assert.match(issueListSource, /stage\.active \|\| stage\.legacy/);
   assert.match(ganttSource, /stage\.active \|\| stage\.legacy/);
   assert.match(nestedWorkspaceSource, /showingProjectList \? projectListContent/);
-  assert.match(appSource, /projectListContent=\{[\s\S]*?<IssueListView[\s\S]*?tasks=\{rootWorkspaceBoardTasks\}[\s\S]*?workflowStages=\{workflowStages\}/);
+  assert.match(appSource, /projectListContent=\{[\s\S]*?<IssueListView[\s\S]*?tasks=\{activeWorkspaceBoardTasks\}[\s\S]*?workflowStages=\{workflowStages\}/);
   assert.match(editorSource, /\.filter\(\(stage\) => stage\.active\)/);
   assert.match(detailSource, /workflowStages\?\.filter\(\(stage\) => stage\.active\)/);
   assert.match(contextMenuSource, /workflowStages\?\.filter\(\(stage\) => stage\.active\)/);

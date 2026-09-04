@@ -24,8 +24,8 @@ function cssBlock(selector) {
 }
 
 test("the issue workspace keeps display settings for cards while project workflows own stages", () => {
-  assert.deepEqual(statusList("MAIN_STATUSES"), ["todo", "in_progress", "blocked", "in_review"]);
-  assert.deepEqual(statusList("SECONDARY_STATUSES"), ["backlog", "done", "canceled"]);
+  assert.deepEqual(statusList("MAIN_STATUSES"), ["todo", "in_progress", "blocked", "in_review", "done", "canceled"]);
+  assert.deepEqual(statusList("SECONDARY_STATUSES"), ["backlog"]);
   assert.match(statusSource, /satisfies readonly TaskStatus\[\]/);
   assert.match(appSource, /const workflowStages = useMemo\(\(\) => workflowDisplayStages\(stageWorkflow\), \[stageWorkflow\]\)/);
   assert.match(appSource, /const hasMaterializedWorkflow = workflowStages\.length > 0/);
