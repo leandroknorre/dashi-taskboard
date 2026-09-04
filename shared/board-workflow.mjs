@@ -10,9 +10,9 @@ const DEFAULT_STAGE_DETAILS = [
   ["in_progress", "In progress", true],
   ["blocked", "Blocked", true],
   ["in_review", "In review", true],
+  ["done", "Done", true],
+  ["canceled", "Canceled", true],
   ["backlog", "Backlog", false],
-  ["done", "Done", false],
-  ["canceled", "Canceled", false],
 ];
 
 export function defaultBoardWorkflowDefinition() {
