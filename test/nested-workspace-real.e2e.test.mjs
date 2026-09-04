@@ -476,7 +476,7 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     ].map((node) => node.textContent?.trim())`);
     assert.deepEqual(
       rootTabOrder,
-      ["Overview", "Board", "List", "Tree", "Mind Map", "Timeline", "Gantt", "Project Docs"],
+      ["Overview", "Board", "List", "Tree", "Mind Map", "Timeline", "Gantt", "Matriz", "Project Docs"],
       "Root-only extras must follow, not replace, the canonical six workspace tabs",
     );
     await cdp.evaluate(`document.querySelector("#nested-workspace-extra-docs")?.click(); true`);
