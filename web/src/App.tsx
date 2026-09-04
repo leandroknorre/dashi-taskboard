@@ -1719,11 +1719,6 @@ export function App() {
   }
 
   function openTaskOrWorkspace(task: Pick<Task, "identifier" | "projectId">) {
-    const fullTask = tasksRef.current.find((candidate) => candidate.identifier === task.identifier);
-    if (fullTask && !isSourceRecord(fullTask) && fullTask.relations.subIssues.length) {
-      openNestedWorkspace(fullTask.identifier);
-      return;
-    }
     openTaskDetail(task);
   }
 
@@ -4585,7 +4580,6 @@ export function App() {
                               label={workflowStage?.name}
                               tasks={groupedColumn ? groupedColumn.tasks : ungroupedColumnTasks}
                               groupBadges={groupedColumn?.groupBadges}
-                              onOpenGroup={(task) => openNestedWorkspace(task.identifier)}
                               presentations={taskPresentations}
                               now={processingNow}
                               emptyMessage={hasActiveTaskFilters

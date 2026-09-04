@@ -53,8 +53,6 @@ interface TaskCardProps {
   groupBadge?: { count: number; labels: string[] } | null;
   onCreateLabel: (label: string) => Promise<void>;
   onEdit: (task: Task) => void;
-  /** Opens the grouped task's nested workspace instead of the normal edit action. */
-  onOpenGroup?: (task: Task) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
   onComplete?: (task: Task) => void;
   onContextMenu: (task: Task, position: { x: number; y: number }) => void;
@@ -412,7 +410,6 @@ export function TaskCard({
   groupBadge = null,
   onCreateLabel,
   onEdit,
-  onOpenGroup,
   onUpdate,
   onComplete,
   onContextMenu,
@@ -489,10 +486,8 @@ export function TaskCard({
       <button
         className="task-card-open"
         type="button"
-        aria-label={groupBadge
-          ? text(`打开分组 ${displayIdentifier}: ${task.title}`, `Open group ${displayIdentifier}: ${task.title}`)
-          : text(`打开 ${displayIdentifier}: ${task.title}`, `Open ${displayIdentifier}: ${task.title}`)}
-        onClick={() => groupBadge && onOpenGroup ? onOpenGroup(task) : onEdit(task)}
+        aria-label={text(`打开 ${displayIdentifier}: ${task.title}`, `Open ${displayIdentifier}: ${task.title}`)}
+        onClick={() => onEdit(task)}
       />
 
       <div className="card-topline">

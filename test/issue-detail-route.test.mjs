@@ -126,11 +126,16 @@ test("the app restores issue detail from the URL and follows browser history", (
   assert.match(appSource, /onOpenWorkspace=\{openNestedWorkspaceFromDetail\}/);
 });
 
-test("normal supra-card clicks use their workspace while leaves retain the detail route", async () => {
+test("every card click opens the detail route, even for tasks with sub-issues", async () => {
   const workspaceSource = await readFile(new URL("../web/src/components/NestedWorkspaceView.tsx", import.meta.url), "utf8");
   const ganttSource = await readFile(new URL("../web/src/components/GanttView.tsx", import.meta.url), "utf8");
 
-  assert.match(appSource, /function openTaskOrWorkspace\([\s\S]*?relations\.subIssues\.length[\s\S]*?openNestedWorkspace\(fullTask\.identifier\)/);
+  const openTaskOrWorkspaceSource = appSource.slice(
+    appSource.indexOf("function openTaskOrWorkspace"),
+    appSource.indexOf("function openTaskOrWorkspace") + 200,
+  );
+  assert.doesNotMatch(openTaskOrWorkspaceSource, /relations\.subIssues\.length/);
+  assert.doesNotMatch(openTaskOrWorkspaceSource, /openNestedWorkspace\(/);
   assert.match(appSource, /function openTaskOrWorkspace[\s\S]*?openTaskDetail\(task\)/);
   assert.match(appSource, /onOpenTask=\{openTaskOrWorkspace\}/);
   assert.match(workspaceSource, /className="nested-workspace-item-detail"[\s\S]*?onClick=\{\(\) => onOpenTaskDetail\(item\)\}/);
