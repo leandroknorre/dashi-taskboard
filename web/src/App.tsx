@@ -27,6 +27,7 @@ import {
   getAiChatCatalog,
   getCodexThreadProgress,
   getHostRuntime,
+  getLocalSessionAgents,
   getLocalWhoami,
   getNestedWorkspace,
   getTaskRollup,
@@ -59,6 +60,7 @@ import {
   actorKey,
   actorForAssigneeTarget,
   assigneeTargetForActor,
+  hydrateSessionAgents,
 } from "./actors";
 import { BoardColumn } from "./components/BoardColumn";
 import { BoardWorkflowDialog } from "./components/BoardWorkflowDialog";
@@ -767,6 +769,10 @@ export function App() {
   const [theme, setTheme] = useState<Theme>(getInitialTheme);
   const [hostContext, setHostContext] = useState<HostContext | null>(null);
   const [localWhoamiUser, setLocalWhoamiUser] = useState<ActorIdentity | null>(null);
+  // Bumped once hydrateSessionAgents resolves, purely to force any assignee
+  // picker already rendered to re-read the (module-level) session agent
+  // list actors.ts just replaced - see the effect below.
+  const [, forceSessionAgentsRerender] = useState(0);
   const language = resolveTaskboardLanguage(
     hostContext?.language ?? query.get("lang") ?? navigator.language,
   );
@@ -2150,6 +2156,24 @@ export function App() {
         const user = await getLocalWhoami();
         if (disposed || user.id === "local-user" || hostContextRef.current?.user) return;
         setLocalWhoamiUser(user);
+      } catch {}
+    })();
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    // Unlike the whoami effect above, this always runs: the session agent
+    // roster (this deployment's own TASKBOARD_SESSION_AGENTS) is useful
+    // regardless of whether a real proxy identity is present.
+    let disposed = false;
+    void (async () => {
+      try {
+        const sessionAgents = await getLocalSessionAgents();
+        if (disposed) return;
+        hydrateSessionAgents(sessionAgents);
+        forceSessionAgentsRerender((value) => value + 1);
       } catch {}
     })();
     return () => {

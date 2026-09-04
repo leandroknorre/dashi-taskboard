@@ -12,16 +12,18 @@ export const TASK_PRIORITIES = ["none", "urgent", "high", "medium", "low"] as co
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 export type TaskPriority = (typeof TASK_PRIORITIES)[number];
 export type ActorType = "user" | "agent";
+// The generic targets are named here so editors keep autocompleting them;
+// a deployment's own configured session agents (TASKBOARD_SESSION_AGENTS on
+// the server, see actors.ts's hydrateSessionAgents) are additional ids this
+// type also has to accept, so it stays open via the `string & {}` branch
+// rather than a closed union.
 export type AssigneeTarget =
   | "current-user"
   | "codex-agent"
   | "claude-agent"
-  | "dsadv-agent"
-  | "automatix-agent"
-  | "lknorre-agent"
-  | "bicicleta-agent"
   | "coordenadora-agent"
-  | "dashi-agent";
+  | "dashi-agent"
+  | (string & {});
 export type IssueRelationType = "parent" | "blocks" | "blocked_by" | "related";
 export type IssueRelationOrigin = "manual" | "mention";
 

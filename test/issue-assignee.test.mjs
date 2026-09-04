@@ -16,10 +16,14 @@ test("issue model and editor preserve a concrete assignee identity", async () =>
   ]);
 
   // AssigneeTarget covers the human target plus every session agent (Codex
-  // and the pillar sessions it can be dispatched to) — not just Codex alone.
+  // and the generic pillar sessions it can be dispatched to) — not just
+  // Codex alone. It also stays open (string & {}) rather than a closed
+  // union, since a deployment's own configured session agents (see
+  // actors.ts's hydrateSessionAgents) are additional ids this type has to
+  // accept without hardcoding this repo's own session names here.
   assert.match(
     typesSource,
-    /export type AssigneeTarget =\s*(?=[\s\S]*?"current-user")(?=[\s\S]*?"codex-agent")(?=[\s\S]*?"dsadv-agent")[\s\S]*?;/,
+    /export type AssigneeTarget =\s*(?=[\s\S]*?"current-user")(?=[\s\S]*?"codex-agent")(?=[\s\S]*?"claude-agent")(?=[\s\S]*?\(string & \{\}\))[\s\S]*?;/,
   );
   assert.match(typesSource, /assignee: ActorIdentity/);
   assert.match(typesSource, /export interface TaskDraft \{[\s\S]*?assigneeTarget\?: AssigneeTarget/);

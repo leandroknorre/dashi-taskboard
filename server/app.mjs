@@ -68,25 +68,54 @@ const CODEX_AGENT_ACTOR = {
   name: "Codex Agent",
   avatarUrl: null,
 };
-// Non-human assignees a card can be dispatched to besides Codex: each one
-// routes the task to a specific pillar/session rather than a person, and
-// its id doubles as the `assigneeTarget` value the client sends.
-const SESSION_AGENTS = [
+// Non-human assignees a card can be dispatched to besides Codex, generic
+// across any deployment of this project.
+const GENERIC_SESSION_AGENTS = [
   { id: "claude-agent", name: "Claude ad hoc" },
-  { id: "dsadv-agent", name: "Sessão dSAdv" },
-  { id: "automatix-agent", name: "Sessão Automatix" },
-  { id: "lknorre-agent", name: "Sessão Pessoal/UDV" },
-  { id: "bicicleta-agent", name: "Sessão Infra (bicicleta)" },
   { id: "coordenadora-agent", name: "Coordenadora" },
   { id: "dashi-agent", name: "Sessão Dashi" },
 ];
-const SESSION_AGENT_ACTORS = new Map([
-  [CODEX_AGENT_ACTOR.id, CODEX_AGENT_ACTOR],
-  ...SESSION_AGENTS.map((agent) => [
+// Deployment-specific session/pillar targets (e.g. one per business unit or
+// team) are never hardcoded here — they're private to whoever runs this
+// server. Configure them via TASKBOARD_SESSION_AGENTS in the service's own
+// environment, formatted as "id=Display Name,id2=Display Name 2,...".
+const SESSION_AGENT_ENV = "TASKBOARD_SESSION_AGENTS";
+const SESSION_AGENT_ID_PATTERN = /^[a-z][a-z0-9-]{0,62}$/;
+
+export function parseConfiguredSessionAgents(value) {
+  if (!value) return [];
+  const seen = new Set();
+  const agents = [];
+  for (const rawEntry of value.split(",")) {
+    const entry = rawEntry.trim();
+    if (!entry) continue;
+    const separatorIndex = entry.indexOf("=");
+    const id = separatorIndex > 0 ? entry.slice(0, separatorIndex).trim() : "";
+    const name = separatorIndex > 0 ? entry.slice(separatorIndex + 1).trim() : "";
+    if (!SESSION_AGENT_ID_PATTERN.test(id) || !name || seen.has(id)) {
+      console.error(`${SESSION_AGENT_ENV}: ignoring invalid entry '${entry}'`);
+      continue;
+    }
+    seen.add(id);
+    agents.push({ id, name });
+  }
+  return agents;
+}
+
+function buildSessionAgentRoster(configuredAgents) {
+  const [beforeGeneric, ...restGeneric] = GENERIC_SESSION_AGENTS;
+  const sessionAgents = [
+    { id: CODEX_AGENT_ACTOR.id, name: CODEX_AGENT_ACTOR.name },
+    beforeGeneric,
+    ...configuredAgents,
+    ...restGeneric,
+  ];
+  const sessionAgentActors = new Map(sessionAgents.map((agent) => [
     agent.id,
-    { type: "agent", id: agent.id, name: agent.name, avatarUrl: null },
-  ]),
-]);
+    agent.id === CODEX_AGENT_ACTOR.id ? CODEX_AGENT_ACTOR : { type: "agent", id: agent.id, name: agent.name, avatarUrl: null },
+  ]));
+  return { sessionAgents, sessionAgentActors };
+}
 const CONTENT_TYPES = new Map([
   [".css", "text/css; charset=utf-8"],
   [".html", "text/html; charset=utf-8"],
@@ -744,17 +773,17 @@ function explicitHumanActorFromRequest(request) {
   return actorFromRequest(request);
 }
 
-function parseAssigneeTarget(value) {
+function parseAssigneeTarget(sessionAgentActors, value) {
   if (value === undefined) return undefined;
-  if (value !== "current-user" && !SESSION_AGENT_ACTORS.has(value)) {
+  if (value !== "current-user" && !sessionAgentActors.has(value)) {
     throw new ApiError(400, "INVALID_FIELD", "'assigneeTarget' must be current-user or a known agent id");
   }
   return value;
 }
 
-function resolveAssignee(target, actor) {
+function resolveAssignee(sessionAgentActors, target, actor) {
   if (target === undefined) return actor;
-  const agentActor = SESSION_AGENT_ACTORS.get(target);
+  const agentActor = sessionAgentActors.get(target);
   if (agentActor) return agentActor;
   if (actor.type !== "user") {
     throw new ApiError(400, "INVALID_FIELD", "'current-user' requires a user request identity");
@@ -762,7 +791,7 @@ function resolveAssignee(target, actor) {
   return actor;
 }
 
-function parseTaskCreate(body) {
+function parseTaskCreate(sessionAgentActors, body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
     "projectId", "title", "description", "status", "stageId", "priority", "labels", "sortOrder", "threadId", "threadBinding",
@@ -780,7 +809,7 @@ function parseTaskCreate(body) {
     sortOrder: body.sortOrder === undefined ? undefined : parseSortOrder(body.sortOrder),
     threadId: parseThreadId(body.threadId),
     threadBinding: parseThreadBinding(body.threadBinding),
-    assigneeTarget: parseAssigneeTarget(body.assigneeTarget),
+    assigneeTarget: parseAssigneeTarget(sessionAgentActors, body.assigneeTarget),
     developmentContext: parseDevelopmentContext(body.developmentContext ?? null),
     startDate: parseDueDate(body.startDate ?? null, "startDate"),
     dueDate: parseDueDate(body.dueDate ?? null),
@@ -852,7 +881,7 @@ function parseSourceCandidateMutation(action, body, idempotencyHeader) {
   return result;
 }
 
-function parseTaskPatch(body) {
+function parseTaskPatch(sessionAgentActors, body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
     "version", "projectId", "title", "description", "status", "stageId", "priority", "labels", "threadId", "threadBinding",
@@ -861,7 +890,7 @@ function parseTaskPatch(body) {
   const version = parseVersion(body.version);
   const threadId = parseThreadId(body.threadId);
   const threadBinding = parseThreadBinding(body.threadBinding);
-  const assigneeTarget = parseAssigneeTarget(body.assigneeTarget);
+  const assigneeTarget = parseAssigneeTarget(sessionAgentActors, body.assigneeTarget);
   const changes = {};
   if (body.projectId !== undefined) changes.projectId = validateProjectId(body.projectId);
   if (body.title !== undefined) changes.title = stringField(body.title, "title", { required: true, maxLength: 240 });
@@ -1982,6 +2011,9 @@ export function createTaskboardServer(options = {}) {
   const codexProcessEnvironment = withoutTaskboardLauncherEnvironment(
     options.processEnv ?? process.env,
   );
+  const configuredSessionAgents = options.sessionAgents
+    ?? parseConfiguredSessionAgents((options.processEnv ?? process.env)[SESSION_AGENT_ENV]);
+  const { sessionAgents, sessionAgentActors } = buildSessionAgentRoster(configuredSessionAgents);
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath);
   const humanAcceptanceProvider = options.humanAcceptanceProvider ?? null;
@@ -2486,7 +2518,7 @@ export function createTaskboardServer(options = {}) {
         if ([...url.searchParams.keys()].length > 0) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/local/whoami takes no query parameters");
         }
-        return sendJson(response, 200, { user: actorFromRequest(request) });
+        return sendJson(response, 200, { user: actorFromRequest(request), sessionAgents });
       }
 
       if (pathname === "/api/local/host-runtime") {
@@ -3206,7 +3238,7 @@ export function createTaskboardServer(options = {}) {
         }
         if (request.method === "POST") {
           const actor = actorFromRequest(request);
-          const { assigneeTarget, ...parsedInput } = parseTaskCreate(await readJson(request));
+          const { assigneeTarget, ...parsedInput } = parseTaskCreate(sessionAgentActors, await readJson(request));
           const input = resolveInputThreadBinding(parsedInput);
           if (input.projectId === JIRA_PROJECT_ID) {
             throw new ApiError(
@@ -3218,7 +3250,7 @@ export function createTaskboardServer(options = {}) {
           const task = database.createTask({
             ...input,
             actor,
-            assignee: resolveAssignee(assigneeTarget, actor),
+            assignee: resolveAssignee(sessionAgentActors, assigneeTarget, actor),
           });
           events.emit("task.created", { task });
           return sendJson(response, 201, { task });
@@ -3806,7 +3838,7 @@ export function createTaskboardServer(options = {}) {
             threadId,
             threadBinding,
             assigneeTarget,
-          } = resolveInputThreadBinding(parseTaskPatch(await readJson(request)));
+          } = resolveInputThreadBinding(parseTaskPatch(sessionAgentActors, await readJson(request)));
           const current = database.getTask(id);
           if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
           database.assertTaskWritable(id);
@@ -3905,7 +3937,7 @@ export function createTaskboardServer(options = {}) {
             jiraChanged = await jira.updateTask(current, changes);
           }
           if (assigneeTarget !== undefined) {
-            changes.assignee = resolveAssignee(assigneeTarget, actor);
+            changes.assignee = resolveAssignee(sessionAgentActors, assigneeTarget, actor);
           }
           let task;
           try {

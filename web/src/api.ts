@@ -271,6 +271,21 @@ export async function getLocalWhoami(signal?: AbortSignal): Promise<ActorIdentit
   return data.user;
 }
 
+/**
+ * The non-human assignee targets this server is configured with (besides
+ * Codex), fetched from the server rather than hardcoded in the client so a
+ * deployment's own session/pillar names never need to live in this repo.
+ */
+export async function getLocalSessionAgents(
+  signal?: AbortSignal,
+): Promise<ReadonlyArray<{ id: string; name: string }>> {
+  const data = await request<{ sessionAgents: ReadonlyArray<{ id: string; name: string }> }>(
+    "/api/local/whoami",
+    { signal },
+  );
+  return data.sessionAgents;
+}
+
 export async function getCodexThreadProgress(
   threadIds: string[],
   signal?: AbortSignal,
