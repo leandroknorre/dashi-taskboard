@@ -468,6 +468,27 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
       await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-${panel}") instanceof HTMLElement`), `${label} panel did not render`);
     }
 
+    // Every card click opens the task detail route now, never auto-jumping
+    // to the nested workspace (7d21b47) - reaching the workspace from a
+    // board card goes through the detail's "Abrir fluxo aninhado" button.
+    async function openNestedWorkspaceFromBoardCard(label) {
+      const opened = await cdp.evaluate(`(() => {
+        const item = [...document.querySelectorAll("#nested-workspace-panel-board button.task-card-open")].find((node) => node.getAttribute("aria-label")?.includes(${JSON.stringify(label)}));
+        if (!(item instanceof HTMLButtonElement)) return false;
+        item.click();
+        return true;
+      })()`);
+      assert.equal(opened, true, `Normal click on the ${label} board card must open its task detail`);
+      await eventually(() => cdp.evaluate(`document.querySelector(".issue-detail")?.textContent?.includes(${JSON.stringify(label)})`), `${label} board card click did not open the task detail route`);
+      const clickedNestedWorkspace = await cdp.evaluate(`(() => {
+        const button = [...document.querySelectorAll(".issue-nested-workspace-action button")].find((node) => node.textContent?.includes("Abrir fluxo aninhado"));
+        if (!(button instanceof HTMLButtonElement)) return false;
+        button.click();
+        return true;
+      })()`);
+      assert.equal(clickedNestedWorkspace, true, `${label} task detail must expose the nested-workspace action`);
+    }
+
     for (const label of ["Overview", "Board", "List", "Tree", "Mind Map", "Timeline"]) {
       await selectWorkspaceTab(label);
     }
@@ -532,13 +553,25 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     await cdp.evaluate(`history.back(); true`);
     await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-list")?.textContent?.includes("Vision")`), "Back did not restore the root List workspace");
 
+    // Every card click opens the task detail route now, never auto-jumping
+    // to the nested workspace (7d21b47) - reaching the workspace from a
+    // parent card goes through the detail's "Abrir fluxo aninhado" button.
     const openedVisionFromList = await cdp.evaluate(`(() => {
       const item = [...document.querySelectorAll("#nested-workspace-panel-list .issue-list-row")].find((node) => node.textContent?.includes("Vision"));
       if (!(item instanceof HTMLElement)) return false;
       item.click();
       return true;
     })()`);
-    assert.equal(openedVisionFromList, true, "Normal click on a root List parent-card must open its nested workspace");
+    assert.equal(openedVisionFromList, true, "Normal click on a root List parent-card must open its detail route");
+    await eventually(() => cdp.evaluate(`document.querySelector(".issue-detail")?.textContent?.includes("Vision")`), "Root List parent-card click did not open the task detail route");
+    const openedNestedWorkspaceFromDetail = await cdp.evaluate(`(() => {
+      const button = [...document.querySelectorAll(".issue-nested-workspace-action button")]
+        .find((node) => node.textContent?.includes("Abrir fluxo aninhado"));
+      if (!(button instanceof HTMLButtonElement)) return false;
+      button.click();
+      return true;
+    })()`);
+    assert.equal(openedNestedWorkspaceFromDetail, true, "Task detail must expose the nested-workspace action for a card with sub-issues");
     await eventually(() => cdp.evaluate(`new URL(location.href).searchParams.get("workspace") === ${JSON.stringify(fixture.vision.identifier)}`), "Root List parent-card did not open its nested workspace");
     await cdp.evaluate(`history.back(); true`);
     await eventually(() => cdp.evaluate(`new URL(location.href).searchParams.get("workspaceRoot") === "alpha" && new URL(location.href).searchParams.get("workspace") === null && document.querySelector("#nested-workspace-panel-list") instanceof HTMLElement`), "Browser Back did not restore the root List workspace");
@@ -556,13 +589,7 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     assert.equal(physicalRootBoard.vision, true, "Root Board must project its parent-less card");
     assert.equal(physicalRootBoard.program, false, "Root Board must not duplicate descendants as project-root cards");
     assert.ok(physicalRootBoard.rails.some((label) => label?.includes("To do")), "Root Board must use physical workflow stage rails");
-    const openedVision = await cdp.evaluate(`(() => {
-      const item = [...document.querySelectorAll("#nested-workspace-panel-board button.task-card-open")].find((node) => node.getAttribute("aria-label")?.includes("Vision"));
-      if (!(item instanceof HTMLButtonElement)) return false;
-      item.click();
-      return true;
-    })()`);
-    assert.equal(openedVision, true, "Normal click on a root supra-card must open its nested workspace");
+    await openNestedWorkspaceFromBoardCard("Vision");
     await eventually(() => cdp.evaluate(`new URL(location.href).searchParams.get("workspace") === ${JSON.stringify(fixture.vision.identifier)}`), "Root supra-card did not open its child workspace");
 
     await eventually(() => cdp.evaluate(`[
@@ -580,29 +607,18 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     assert.equal(breadcrumbToRoot, true, `Nested workspace must expose the root breadcrumb (found: ${breadcrumbLabels.join(", ")})`);
     await eventually(() => cdp.evaluate(`new URL(location.href).searchParams.get("workspaceRoot") === "alpha" && new URL(location.href).searchParams.get("workspace") === null`), "Root breadcrumb did not return to the root workspace");
     await selectWorkspaceTab("Board");
-    const reopenedVision = await cdp.evaluate(`(() => {
-      const item = [...document.querySelectorAll("#nested-workspace-panel-board button.task-card-open")].find((node) => node.getAttribute("aria-label")?.includes("Vision"));
-      if (!(item instanceof HTMLButtonElement)) return false;
-      item.click();
-      return true;
-    })()`);
-    assert.equal(reopenedVision, true);
+    await openNestedWorkspaceFromBoardCard("Vision");
     await eventually(() => cdp.evaluate(`new URL(location.href).searchParams.get("workspace") === ${JSON.stringify(fixture.vision.identifier)}`), "Root Board did not reopen Vision after breadcrumb return");
 
     // A task workspace's Board is now the same operational, physical-stage
     // projection as the project root's (sub-boards render real workflow
     // columns instead of the old Ready/Blocked macro buckets), so each step
     // here is opened the same way "Vision" was above: a real board card
-    // (button.task-card-open), not the old macro-bucket .nested-workspace-item.
+    // (button.task-card-open) via its task detail's nested-workspace action,
+    // not the old macro-bucket .nested-workspace-item nor a direct jump.
     for (const title of ["Program", "Area", "Portfolio", "Release workspace"]) {
       await selectWorkspaceTab("Board");
-      const opened = await cdp.evaluate(`(() => {
-        const item = [...document.querySelectorAll("#nested-workspace-panel-board button.task-card-open")].find((node) => node.getAttribute("aria-label")?.includes(${JSON.stringify(title)}));
-        if (!(item instanceof HTMLButtonElement)) return false;
-        item.click();
-        return true;
-      })()`);
-      assert.equal(opened, true, `${title} must be a direct nested-workspace step`);
+      await openNestedWorkspaceFromBoardCard(title);
       await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-super-card")?.textContent?.includes(${JSON.stringify(title)})`), `${title} workspace did not open`);
     }
 
