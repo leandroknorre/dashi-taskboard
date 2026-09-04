@@ -140,11 +140,115 @@ export class WorkflowAuthoringService {
       }
 
       this.transitionService.publishRevision(plan.revision, { transaction: false });
+      this.#backfillSupersededRevisions(plan);
       this.database.exec("COMMIT");
       return this.get(projectId);
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
+    }
+  }
+
+  /**
+   * A task's workflow pin (`workflow_task_pins`) is immutable by design — it
+   * is never UPDATEd or DELETEd while the task exists, so a card pinned to an
+   * older revision cannot simply be re-pinned onto this new one. But
+   * `workflow_revision_stage_bindings` and `workflow_transition_rules` are
+   * only immutable against UPDATE/DELETE: a revision that has already been
+   * published can still receive *new* rows, as long as they don't collide
+   * with what it already has.
+   *
+   * So when this publish only ADDS stage(s) — every stage id the previous
+   * revisions already bound is still bound here — we additively backfill
+   * those still-pinned older revisions with a binding for the new stage(s)
+   * plus legacy (free-move) transition rules to/from every stage they can
+   * already reach. That makes the new stage reachable from an old card's
+   * pinned revision without touching a single immutable row: no UPDATE, no
+   * DELETE, no re-pin, no migration. A revision whose stage set was actually
+   * narrowed (a stage removed/renamed away) is left untouched — the superset
+   * guarantee doesn't hold for it, so its pinned cards keep exactly the
+   * reachability they had before this publish.
+   */
+  #backfillSupersededRevisions(plan) {
+    const newlyAddedStages = plan.stages.filter((stage) => !stage.existing);
+    if (newlyAddedStages.length === 0) return;
+    const activeStageIds = new Set(plan.stages.filter((stage) => stage.active).map((stage) => stage.stageId));
+    const activeNewStages = newlyAddedStages.filter((stage) => activeStageIds.has(stage.stageId));
+    if (activeNewStages.length === 0) return;
+    const newBoundStageIds = new Set(plan.stages.map((stage) => stage.stageId));
+
+    const workflowId = plan.revision.definition.workflowId;
+    const newRevisionId = plan.revision.definition.revisionId;
+    const pinnedRevisionIds = this.database.prepare(`
+      SELECT DISTINCT pins.revision_id AS revision_id
+      FROM workflow_task_pins AS pins
+      JOIN workflow_revisions AS revisions ON revisions.revision_id = pins.revision_id
+      WHERE revisions.workflow_id = ? AND pins.revision_id != ?
+    `).all(workflowId, newRevisionId).map((row) => row.revision_id);
+
+    const insertBinding = this.database.prepare(`
+      INSERT INTO workflow_revision_stage_bindings (
+        revision_id, contract_stage_id, task_stage_id, canonical_status, terminal_kind, stage_order
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    const insertRule = this.database.prepare(`
+      INSERT INTO workflow_transition_rules (
+        revision_id, action_key, transition_id, from_task_stage_id, to_task_stage_id,
+        from_contract_stage_id, to_contract_stage_id, to_terminal_kind, legacy
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+    `);
+    // action_key/transition_id must be lowercase identifiers (IDENTIFIER in
+    // shared/workflow-control.mjs), not raw UUIDs — a UUID can start with a
+    // digit and fail that pattern.
+    const backfillId = (role) => `backfill_${role}_${this.idFactory().replaceAll("-", "")}`;
+    const addRule = (revisionId, from, to, toTerminalKind) => {
+      insertRule.run(
+        revisionId, backfillId("action"), backfillId("transition"),
+        from.stageId, to.stageId, from.contractStageId, to.contractStageId, toTerminalKind,
+      );
+    };
+
+    for (const oldRevisionId of pinnedRevisionIds) {
+      const oldBindings = this.database.prepare(`
+        SELECT contract_stage_id, task_stage_id, canonical_status, terminal_kind, stage_order
+        FROM workflow_revision_stage_bindings WHERE revision_id = ?
+      `).all(oldRevisionId);
+      // Only extend a revision whose full stage set the new revision still
+      // covers — nothing it already bound was removed or renamed away.
+      if (!oldBindings.every((binding) => newBoundStageIds.has(binding.task_stage_id))) continue;
+      const oldActiveStages = oldBindings
+        .filter((binding) => activeStageIds.has(binding.task_stage_id))
+        .map((binding) => ({
+          stageId: binding.task_stage_id,
+          contractStageId: binding.contract_stage_id,
+          terminalKind: binding.terminal_kind, // already contract form
+        }));
+
+      for (const stage of activeNewStages) {
+        insertBinding.run(
+          oldRevisionId,
+          stage.contractStageId,
+          stage.stageId,
+          stage.canonicalStatus,
+          contractTerminalKind(stage.terminalKind),
+          stage.order,
+        );
+      }
+      for (const newStage of activeNewStages) {
+        const newStageRef = { stageId: newStage.stageId, contractStageId: newStage.contractStageId };
+        const newTerminalKind = contractTerminalKind(newStage.terminalKind);
+        for (const oldStage of oldActiveStages) {
+          addRule(oldRevisionId, oldStage, newStageRef, newTerminalKind);
+          addRule(oldRevisionId, newStageRef, oldStage, oldStage.terminalKind);
+        }
+      }
+      // Multiple stages added in the same publish also connect to each other.
+      for (const from of activeNewStages) {
+        for (const to of activeNewStages) {
+          if (from.stageId === to.stageId) continue;
+          addRule(oldRevisionId, from, to, contractTerminalKind(to.terminalKind));
+        }
+      }
     }
   }
 

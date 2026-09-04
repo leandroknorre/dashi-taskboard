@@ -534,7 +534,69 @@ export class TransitionService {
     if (!pin) throw new ApiError(409, TRANSITION_ERROR_CODES.WORKFLOW_PIN_MISSING, "Task has no pinned workflow revision");
     const revision = this.database.prepare("SELECT * FROM workflow_revisions WHERE revision_id = ?").get(pin.revision_id);
     if (!revision) throw new ApiError(409, TRANSITION_ERROR_CODES.WORKFLOW_PIN_MISSING, "Pinned workflow revision is unavailable");
-    return { task, pin, revision, definition: normalizeWorkflowRevision(JSON.parse(revision.definition_json)) };
+    const rawDefinition = this.#withBackfilledStagesAndTransitions(pin.revision_id, JSON.parse(revision.definition_json));
+    return { task, pin, revision, definition: normalizeWorkflowRevision(rawDefinition) };
+  }
+
+  /**
+   * `workflow_revisions.definition_json` is genuinely immutable — no row is
+   * ever UPDATEd, by design (it's the audit-grade contract a pinned task
+   * transitions against). But WorkflowAuthoringService can additively INSERT
+   * new rows into an already-published revision's
+   * `workflow_revision_stage_bindings`/`workflow_transition_rules` when a
+   * later publish only adds stage(s) — a superset of what that revision
+   * already had (see its #backfillSupersededRevisions). Those extra SQL rows
+   * are what a card's stage-move menu (listActions/getLegacyAction) already
+   * reads directly. This folds the same rows into an in-memory copy of the
+   * frozen definition before it's evaluated, so an actual transition into a
+   * backfilled stage is accepted too — without ever touching the stored
+   * JSON. Returns the input unchanged when nothing was backfilled.
+   */
+  #withBackfilledStagesAndTransitions(revisionId, rawDefinition) {
+    const knownStageIds = new Set(rawDefinition.stages.map((stage) => stage.stageId));
+    const extraBindings = this.database.prepare(`
+      SELECT contract_stage_id, terminal_kind FROM workflow_revision_stage_bindings
+      WHERE revision_id = ?
+    `).all(revisionId).filter((binding) => !knownStageIds.has(binding.contract_stage_id));
+
+    const knownTransitionIds = new Set(rawDefinition.transitions.map((transition) => transition.transitionId));
+    const extraRules = this.database.prepare(`
+      SELECT transition_id, from_contract_stage_id, to_contract_stage_id, to_terminal_kind
+      FROM workflow_transition_rules WHERE revision_id = ? AND legacy = 1
+    `).all(revisionId).filter((rule) => !knownTransitionIds.has(rule.transition_id));
+
+    if (extraBindings.length === 0 && extraRules.length === 0) return rawDefinition;
+
+    const baseAgentProfileRevisionId = rawDefinition.agentProfileRevisions[0].agentProfileRevisionId;
+    const extraStages = extraBindings.map((binding) => ({
+      stageId: binding.contract_stage_id,
+      // Display facts (name/order/board placement) live on workflow_stages
+      // and are read from there by the board/list, not from this frozen
+      // copy — only reachability/gating is evaluated against it.
+      name: binding.contract_stage_id,
+      terminalKind: binding.terminal_kind,
+      agentProfileRevisionId: baseAgentProfileRevisionId,
+    }));
+
+    const acceptanceGate = rawDefinition.gates.find((gate) => gate.kind === "acceptance") ?? null;
+    const extraTransitions = extraRules.map((rule) => {
+      const requiresAcceptance = rule.to_terminal_kind === "completed";
+      return {
+        transitionId: rule.transition_id,
+        fromStageId: rule.from_contract_stage_id,
+        toStageId: rule.to_contract_stage_id,
+        requiresAcceptance,
+        irreversible: false,
+        gateIds: requiresAcceptance && acceptanceGate ? [acceptanceGate.gateId] : [],
+        authorization: { required: false, action: null },
+      };
+    });
+
+    return {
+      ...rawDefinition,
+      stages: [...rawDefinition.stages, ...extraStages],
+      transitions: [...rawDefinition.transitions, ...extraTransitions],
+    };
   }
 
   #idempotentResult(row, taskId, command, requestFingerprint) {
