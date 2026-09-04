@@ -59,7 +59,7 @@ export function normalizeTransitionCommand(value) {
 
 export function assertRequiredDescendantsCompleted(descendants) {
   const incomplete = descendants.filter((descendant) => (
-    descendant.required === true && descendant.status !== "done"
+    descendant.required === true && descendant.status !== "done" && descendant.status !== "canceled"
   ));
   if (incomplete.length > 0) {
     throw new TransitionServiceError(

@@ -310,6 +310,59 @@ test("a real API parent completion stays blocked while a required descendant is 
   assert.equal(app.database.database.prepare("SELECT COUNT(*) AS count FROM workflow_transition_requests").get().count, 0);
 });
 
+test("a real API parent completion succeeds once its only required descendant is canceled", async () => {
+  const { app, baseUrl } = await start();
+  const parent = createTask(app, "Parent with a discarded child");
+  const child = createTask(app, "Required child to be discarded");
+  app.database.addTaskRelation(
+    child.id,
+    child.version,
+    "parent",
+    parent.id,
+    undefined,
+    undefined,
+    actor,
+    "manual",
+    { required: true, rollup: true },
+  );
+  const transitions = new TransitionService(app.database);
+  const refreshedChild = app.database.getTask(child.id);
+  const cancellation = actionTo(transitions, refreshedChild.id, "canceled");
+  const canceled = await request(baseUrl, `/api/tasks/${refreshedChild.id}/transitions`, {
+    method: "POST",
+    headers: { "idempotency-key": "api-required-child-cancel" },
+    body: {
+      expectedStateVersion: refreshedChild.version,
+      actionKey: cancellation.actionKey,
+      gateEvidence: [],
+    },
+  });
+  assert.equal(canceled.response.status, 200, JSON.stringify(canceled.body));
+  assert.equal(canceled.body.task.status, "canceled");
+
+  const refreshedParent = app.database.getTask(parent.id);
+  const completion = actionTo(transitions, refreshedParent.id, "completed");
+  const minted = await request(baseUrl, `/api/tasks/${refreshedParent.id}/evidence`, {
+    method: "POST",
+    headers: { "idempotency-key": "api-required-parent-evidence-after-cancel" },
+    body: { expectedStateVersion: refreshedParent.version, actionKey: completion.actionKey },
+  });
+  assert.equal(minted.response.status, 201, JSON.stringify(minted.body));
+
+  const completed = await request(baseUrl, `/api/tasks/${refreshedParent.id}/transitions`, {
+    method: "POST",
+    headers: { "idempotency-key": "api-required-parent-completion-after-cancel" },
+    body: {
+      expectedStateVersion: refreshedParent.version,
+      actionKey: completion.actionKey,
+      gateEvidence: [minted.body.evidence],
+    },
+  });
+
+  assert.equal(completed.response.status, 200, JSON.stringify(completed.body));
+  assert.equal(completed.body.task.status, "done");
+});
+
 test("HTTP transition consumption binds provider-attested evidence to the same human actor", async () => {
   let authenticatedActor = "alpha";
   const authenticatedRequests = new WeakMap();

@@ -228,6 +228,72 @@ test("completion needs valid human acceptance and every required descendant, but
   assert.equal(workflowCounts(fixture.database).events, 5);
 });
 
+test("a canceled required descendant satisfies completion, but an in-progress one still blocks", async () => {
+  const fixture = await createFixture();
+  let parent = createTask(fixture, "Parent with a discarded child");
+  const canceledChild = createTask(fixture, "Required child to be discarded");
+  const pendingChild = createTask(fixture, "Required child still open");
+  fixture.database.addTaskRelation(
+    canceledChild.id, canceledChild.version, "parent", parent.id,
+    undefined, undefined, actor, "manual", { required: true, rollup: true },
+  );
+  fixture.database.addTaskRelation(
+    pendingChild.id, pendingChild.version, "parent", parent.id,
+    undefined, undefined, actor, "manual", { required: true, rollup: true },
+  );
+
+  const refreshedCanceledChild = fixture.database.getTask(canceledChild.id);
+  const cancellation = cancellationAction(fixture.service, refreshedCanceledChild.id);
+  fixture.service.transition(refreshedCanceledChild.id, command(
+    refreshedCanceledChild,
+    cancellation,
+    "canceled-child-discard",
+  ), { actor });
+
+  parent = fixture.database.getTask(parent.id);
+  const parentCompletion = completionAction(fixture.service, parent.id);
+  const withOnlyPendingOpenEvidence = await validAcceptance(
+    fixture, parent, parentCompletion, "parent-with-pending-open",
+  );
+  assert.throws(
+    () => fixture.service.transition(parent.id, command(
+      parent,
+      parentCompletion,
+      "parent-still-blocked-by-pending",
+      { gateEvidence: [withOnlyPendingOpenEvidence] },
+    ), { actor }),
+    (error) => error?.status === 409
+      && error?.code === "REQUIRED_DESCENDANT_INCOMPLETE"
+      && error?.details?.taskIds?.length === 1
+      && error.details.taskIds[0] === pendingChild.id,
+  );
+
+  const refreshedPendingChild = fixture.database.getTask(pendingChild.id);
+  const pendingChildCompletion = completionAction(fixture.service, refreshedPendingChild.id);
+  const pendingChildEvidence = await validAcceptance(
+    fixture, refreshedPendingChild, pendingChildCompletion, "pending-child-evidence",
+  );
+  fixture.service.transition(refreshedPendingChild.id, command(
+    refreshedPendingChild,
+    pendingChildCompletion,
+    "pending-child-complete",
+    { gateEvidence: [pendingChildEvidence] },
+  ), { actor });
+
+  const refreshedParent = fixture.database.getTask(parent.id);
+  const parentEvidence = await validAcceptance(
+    fixture, refreshedParent, parentCompletion, "parent-after-all-descendants-resolved-evidence",
+  );
+  const completedParent = fixture.service.transition(parent.id, command(
+    refreshedParent,
+    parentCompletion,
+    "parent-after-all-descendants-resolved",
+    { gateEvidence: [parentEvidence] },
+  ), { actor });
+  assert.equal(completedParent.task.status, "done");
+  assert.equal(fixture.database.getTask(canceledChild.id).status, "canceled");
+});
+
 test("revoked and narrowly mismatched authorization records cannot cancel a pinned task", async () => {
   const fixture = await createFixture();
   const originalTask = createTask(fixture, "Original revision task");

@@ -2233,7 +2233,7 @@ function assertTransitionPolicy(context, rule, command, authorization, descendan
     if (authorization.expiresAt && Date.parse(occurredAt) > Date.parse(authorization.expiresAt)) throw transitionError("HUMAN_AUTH_REQUIRED", "Human authorization is expired for this action");
   }
   if (rule.to_terminal_kind === "completed") {
-    const incomplete = descendants.filter((item) => item.required && item.status !== "done");
+    const incomplete = descendants.filter((item) => item.required && item.status !== "done" && item.status !== "canceled");
     if (incomplete.length) throw transitionError("REQUIRED_DESCENDANT_INCOMPLETE", "A completed task requires every required descendant to be done", { taskIds: incomplete.map((item) => item.task_id) });
   }
 }
