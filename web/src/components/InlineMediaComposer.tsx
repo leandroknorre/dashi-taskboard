@@ -495,6 +495,25 @@ export function serializeInlineMedia(segments: InlineMediaSegment[]): string {
   }).join("");
 }
 
+/**
+ * Appends plain text to the end of a composer's segments without reparsing
+ * markdown structure — merges into a trailing text segment when one exists,
+ * otherwise appends a new one. Used to programmatically insert content (e.g.
+ * a quoted excerpt) at the end of the composer, mirroring what typing at the
+ * end of the field would produce.
+ */
+export function appendInlineMediaText(
+  segments: InlineMediaSegment[],
+  text: string,
+): InlineMediaSegment[] {
+  if (!text) return segments;
+  const last = segments.at(-1);
+  if (last?.type === "text") {
+    return [...segments.slice(0, -1), { ...last, text: last.text + text }];
+  }
+  return [...segments, textSegment(text)];
+}
+
 export function resolveInlineMediaMarkdown(
   value: string,
   images: PendingInlineImage[],

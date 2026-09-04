@@ -4365,6 +4365,36 @@ kbd {
   stroke-width: 1.3;
 }
 
+.quote-selection-button {
+  position: fixed;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: var(--border-hairline) solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  box-shadow: var(--dialog-shadow);
+  transform: translate(-50%, calc(-100% - 8px));
+  animation: context-menu-in 90ms ease-out both;
+}
+
+.quote-selection-button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.quote-selection-button svg {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
 .comment-body {
   min-height: 30px;
   padding: 10px 16px 16px;

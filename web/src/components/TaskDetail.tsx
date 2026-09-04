@@ -71,6 +71,7 @@ import {
   MoreIcon,
   PriorityIcon,
   ProjectIcon,
+  QuoteIcon,
   RecurrenceIcon,
   RelationIcon,
   StatusIcon,
@@ -81,6 +82,7 @@ import {
   PendingAttachments,
 } from "./PendingAttachments";
 import {
+  appendInlineMediaText,
   createInlineMediaSegments,
   InlineMediaComposer,
   inlineMediaImages,
@@ -106,6 +108,14 @@ import { SourceRecordBadge } from "./SourceRecordBadge";
 import { SourceRecordDetail } from "./SourceRecordDetail";
 
 type TaskDetailError = string | readonly [string, string];
+
+interface CiteSelection {
+  text: string;
+  top: number;
+  left: number;
+  authorId?: string;
+  createdAt?: string;
+}
 
 interface TaskDetailProps {
   task: Task;
@@ -195,6 +205,22 @@ function fileSize(value: number): string {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(value < 10 * 1024 ? 1 : 0)} KB`;
   return `${(value / (1024 * 1024)).toFixed(value < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
+
+function quoteTimestamp(value: string): string {
+  const date = new Date(value);
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  return `${hours}h${minutes}`;
+}
+
+function quoteBlockMarkdown(selection: CiteSelection): string {
+  const lines = selection.text.replace(/\r\n/g, "\n").split("\n").map((line) => line.trimEnd());
+  const quotedLines = lines.map((line) => line ? `> ${line}` : ">");
+  if (selection.authorId && selection.createdAt) {
+    quotedLines.unshift(`> **@${selection.authorId}, ${quoteTimestamp(selection.createdAt)}:**`);
+  }
+  return quotedLines.join("\n");
 }
 
 async function downloadAttachmentFile(attachment: Attachment) {
@@ -461,6 +487,10 @@ function EditableTaskDetail({
   const composerRef = useRef<InlineMediaComposerHandle>(null);
   const editingComposerRef = useRef<InlineMediaComposerHandle>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
+  const [citeSelection, setCiteSelection] = useState<CiteSelection | null>(null);
+  const citeSelectionRef = useRef<CiteSelection | null>(null);
+  const detailScrollRef = useRef<HTMLDivElement>(null);
+  const commentComposerFormRef = useRef<HTMLFormElement>(null);
   const commentAttachmentInputRef = useRef<HTMLInputElement>(null);
   const editCommentAttachmentInputRef = useRef<HTMLInputElement>(null);
   const editingUploadedAttachmentsRef = useRef<Map<string, Attachment>>(new Map());
@@ -571,6 +601,85 @@ function EditableTaskDetail({
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
   }, []);
+
+  useEffect(() => {
+    citeSelectionRef.current = citeSelection;
+  }, [citeSelection]);
+
+  useEffect(() => {
+    function handleSelectionChange() {
+      const root = detailScrollRef.current;
+      const selection = window.getSelection();
+      if (!root || !selection || selection.isCollapsed || selection.rangeCount === 0) {
+        setCiteSelection(null);
+        return;
+      }
+      const range = selection.getRangeAt(0);
+      if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) {
+        setCiteSelection(null);
+        return;
+      }
+      const startElement = range.startContainer instanceof Element
+        ? range.startContainer
+        : range.startContainer.parentElement;
+      const endElement = range.endContainer instanceof Element
+        ? range.endContainer
+        : range.endContainer.parentElement;
+      const source = startElement?.closest<HTMLElement>("[data-quote-source]");
+      const endSource = endElement?.closest<HTMLElement>("[data-quote-source]");
+      if (!source || source !== endSource) {
+        setCiteSelection(null);
+        return;
+      }
+      const text = selection.toString();
+      if (!text.trim()) {
+        setCiteSelection(null);
+        return;
+      }
+      const rect = range.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) {
+        setCiteSelection(null);
+        return;
+      }
+      setCiteSelection({
+        text,
+        top: rect.top,
+        left: rect.left + rect.width / 2,
+        authorId: source.dataset.quoteAuthorId,
+        createdAt: source.dataset.quoteCreatedAt,
+      });
+    }
+    document.addEventListener("selectionchange", handleSelectionChange);
+    return () => document.removeEventListener("selectionchange", handleSelectionChange);
+  }, []);
+
+  useEffect(() => {
+    function handleQuoteShortcut(event: globalThis.KeyboardEvent) {
+      if (event.key.toLowerCase() !== "q" || !event.shiftKey || !(event.ctrlKey || event.metaKey)) return;
+      if (!citeSelectionRef.current) return;
+      event.preventDefault();
+      insertQuote(citeSelectionRef.current);
+    }
+    window.addEventListener("keydown", handleQuoteShortcut);
+    return () => window.removeEventListener("keydown", handleQuoteShortcut);
+  }, []);
+
+  function insertQuote(selection: CiteSelection) {
+    const block = quoteBlockMarkdown(selection);
+    setCommentSegments((current) => {
+      const existing = serializeInlineMedia(current);
+      const separator = existing.length === 0
+        ? ""
+        : existing.endsWith("\n\n") ? "" : existing.endsWith("\n") ? "\n" : "\n\n";
+      return appendInlineMediaText(current, `${separator}${block}\n\n`);
+    });
+    setCiteSelection(null);
+    window.getSelection()?.removeAllRanges();
+    requestAnimationFrame(() => {
+      composerRef.current?.focus();
+      commentComposerFormRef.current?.scrollIntoView?.({ behavior: "smooth", block: "center" });
+    });
+  }
 
   useEffect(() => {
     if (!activeMenuId) return;
@@ -1057,7 +1166,11 @@ function EditableTaskDetail({
       className="issue-detail"
       aria-label={text(`${displayIdentifier} 议题详情`, `${displayIdentifier} issue details`)}
     >
-      <div className="issue-detail-scroll">
+      <div
+        className="issue-detail-scroll"
+        ref={detailScrollRef}
+        onScroll={() => setCiteSelection(null)}
+      >
         <div className="issue-detail-layout">
           <div className="issue-detail-main">
             <article className="issue-editor" aria-label={text("议题内容", "Issue content")}>
@@ -1127,6 +1240,7 @@ function EditableTaskDetail({
                     className={`issue-description-read${description ? "" : " empty"}`}
                     role="button"
                     tabIndex={0}
+                    data-quote-source={description ? "description" : undefined}
                     aria-label={text("编辑议题描述", "Edit issue description")}
                     onClick={() => {
                       if (window.getSelection()?.isCollapsed === false) return;
@@ -1517,7 +1631,12 @@ function EditableTaskDetail({
                         </div>
                       ) : (
                         comment.body && (
-                          <div className="comment-body">
+                          <div
+                            className="comment-body"
+                            data-quote-source="comment"
+                            data-quote-author-id={comment.authorId}
+                            data-quote-created-at={comment.createdAt}
+                          >
                             <DescriptionDocument
                               value={comment.body}
                               referenceTasks={referenceTasks}
@@ -1582,7 +1701,11 @@ function EditableTaskDetail({
                 </div>
               )}
 
-              <form className="comment-composer" onSubmit={(event) => { event.preventDefault(); void submitComment(); }}>
+              <form
+                className="comment-composer"
+                ref={commentComposerFormRef}
+                onSubmit={(event) => { event.preventDefault(); void submitComment(); }}
+              >
                 <div className="composer-author">
                   <ActorAvatar
                     className="comment-avatar"
@@ -1956,6 +2079,20 @@ function EditableTaskDetail({
           </aside>
         </div>
       </div>
+
+      {citeSelection && (
+        <button
+          type="button"
+          className="quote-selection-button"
+          style={{ top: citeSelection.top, left: citeSelection.left }}
+          title={text("在评论中引用 (Ctrl+Shift+Q)", "Quote in comment (Ctrl+Shift+Q)")}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => insertQuote(citeSelection)}
+        >
+          <QuoteIcon color="currentColor" />
+          {text("引用到评论", "Quote in comment")}
+        </button>
+      )}
 
       {pendingDelete && (
         <div className="delete-backdrop" role="presentation" onMouseDown={(event) => {

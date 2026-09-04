@@ -204,6 +204,14 @@ export function CodexResumeIcon({ color = "#5D5D5F", ...props }: BasicIconProps)
   );
 }
 
+export function QuoteIcon(props: BasicIconProps) {
+  return (
+    <SvgIcon {...props} fill="none">
+      <path d="M5.5 4.25h-2A1.75 1.75 0 0 0 1.75 6v1.5A1.75 1.75 0 0 0 3.5 9.25H4c0 1.567-.657 2.65-2.1 3.394a.5.5 0 0 0 .459.888C4.383 12.5 5.5 10.883 5.5 8.75V6a1.75 1.75 0 0 0-1.75-1.75Zm7 0h-2A1.75 1.75 0 0 0 8.75 6v1.5A1.75 1.75 0 0 0 10.5 9.25H11c0 1.567-.657 2.65-2.1 3.394a.5.5 0 0 0 .459.888c2.024-1.032 3.141-2.649 3.141-4.782V6a1.75 1.75 0 0 0-1.75-1.75Z" stroke="currentColor" strokeWidth=".2" strokeLinecap="round" strokeLinejoin="round" />
+    </SvgIcon>
+  );
+}
+
 export function RelationIcon(props: BasicIconProps) {
   return (
     <SvgIcon {...props} fill="none">
