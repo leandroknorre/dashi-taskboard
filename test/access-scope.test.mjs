@@ -322,3 +322,28 @@ test("scoped write: an automation run on a task outside the pillar is refused (4
   const readInside = await request(baseUrl, `/api/automation-runs/${runId}`, { headers: asEmail(FELIPE) });
   assert.equal(readInside.response.status, 200);
 });
+
+test("the x-taskboard-proxy-user-email dev alias is ignored unless TASKBOARD_TRUST_PROXY_EMAIL_HEADER=1", async () => {
+  // Nothing upstream of this origin (Cloudflare Access, this deployment's
+  // runner) strips a client-supplied x-taskboard-proxy-user-email header, so
+  // trusting it the same as the real cf-access-authenticated-user-email
+  // header would let anyone claim to be the owner just by sending it.
+  const untrusted = await startServer();
+  const impersonate = { "x-taskboard-proxy-user-email": OWNER };
+
+  const whoamiUntrusted = await request(untrusted, "/api/local/whoami", { headers: impersonate });
+  assert.equal(whoamiUntrusted.response.status, 200);
+  assert.notEqual(whoamiUntrusted.body.user.id, OWNER);
+  assert.equal(whoamiUntrusted.body.user.id, "local-user");
+
+  // The scope computation never even sees an email, so it treats the
+  // request the same as any unauthenticated agent/script call - not as
+  // the owner specifically, and not as any scoped pillar identity either.
+  const listUntrusted = await request(untrusted, "/api/tasks", { headers: impersonate });
+  assert.equal(listUntrusted.response.status, 200);
+
+  const trusted = await startServer({ TASKBOARD_TRUST_PROXY_EMAIL_HEADER: "1" });
+  const whoamiTrusted = await request(trusted, "/api/local/whoami", { headers: impersonate });
+  assert.equal(whoamiTrusted.response.status, 200);
+  assert.equal(whoamiTrusted.body.user.id, OWNER);
+});

@@ -685,16 +685,38 @@ function requestHeader(request, name) {
 }
 
 const PROXY_EMAIL_PATTERN = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+const TRUST_PROXY_EMAIL_HEADER_ENV = "TASKBOARD_TRUST_PROXY_EMAIL_HEADER";
+// Per-request flag stashed by the request handler (see createTaskboardServer)
+// so this module-level function can see the server instance's
+// TRUST_PROXY_EMAIL_HEADER_ENV setting without threading it through every
+// actorFromRequest/proxyAuthenticatedEmail call site.
+const TRUST_PROXY_EMAIL_HEADER_REQUEST_KEY = Symbol("trustProxyEmailHeader");
 
 /**
  * Production sits behind cloudflared, which forwards Cloudflare Access
  * requests to this origin with `Cf-Access-Authenticated-User-Email` set to
- * the verified identity. `x-taskboard-proxy-user-email` is accepted too, so
- * a local reverse proxy can be exercised the same way in dev/tests.
+ * the verified identity. `x-taskboard-proxy-user-email` is a DEV-ONLY alias
+ * so a local reverse proxy can be exercised the same way in dev/tests - it
+ * is honored ONLY when TASKBOARD_TRUST_PROXY_EMAIL_HEADER=1, because nothing
+ * upstream (Cloudflare Access, this deployment's runner) strips arbitrary
+ * client-supplied headers, so trusting it unconditionally would let any
+ * caller impersonate an owner/scoped identity by just sending the header.
  */
 function proxyAuthenticatedEmail(request) {
-  const raw = requestHeader(request, "cf-access-authenticated-user-email")
-    ?? requestHeader(request, "x-taskboard-proxy-user-email");
+  const cfAccessValue = requestHeader(request, "cf-access-authenticated-user-email");
+  let raw = cfAccessValue;
+  if (raw === undefined) {
+    const devAliasValue = requestHeader(request, "x-taskboard-proxy-user-email");
+    if (devAliasValue !== undefined) {
+      if (request[TRUST_PROXY_EMAIL_HEADER_REQUEST_KEY]) {
+        raw = devAliasValue;
+      } else {
+        console.warn(
+          `${TRUST_PROXY_EMAIL_HEADER_ENV} is not "1" - ignoring untrusted x-taskboard-proxy-user-email header`,
+        );
+      }
+    }
+  }
   if (typeof raw !== "string") return null;
   const value = raw.trim();
   if (value.length === 0 || value.length > 254 || !PROXY_EMAIL_PATTERN.test(value)) return null;
@@ -2027,6 +2049,10 @@ export function createTaskboardServer(options = {}) {
   const ownerEmail = normalizeOwnerEmail(options.ownerEmail ?? scopeEnvironment[OWNER_EMAIL_ENV]);
   const configuredUserScopes = options.userScopes
     ?? parseConfiguredUserScopes(scopeEnvironment[USER_SCOPES_ENV]);
+  // The dev-only x-taskboard-proxy-user-email alias (see proxyAuthenticatedEmail
+  // below) is otherwise indistinguishable from the real Cloudflare Access
+  // header to any caller that reaches this origin - untrusted by default.
+  const trustProxyEmailHeader = scopeEnvironment[TRUST_PROXY_EMAIL_HEADER_ENV] === "1";
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath);
   const humanAcceptanceProvider = options.humanAcceptanceProvider ?? null;
@@ -2420,6 +2446,7 @@ export function createTaskboardServer(options = {}) {
   }
 
   const server = createServer(async (request, response) => {
+    request[TRUST_PROXY_EMAIL_HEADER_REQUEST_KEY] = trustProxyEmailHeader;
     response.setHeader("x-content-type-options", "nosniff");
     response.setHeader("referrer-policy", "no-referrer");
     try {
