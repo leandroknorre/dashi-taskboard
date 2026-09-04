@@ -589,10 +589,15 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     assert.equal(reopenedVision, true);
     await eventually(() => cdp.evaluate(`new URL(location.href).searchParams.get("workspace") === ${JSON.stringify(fixture.vision.identifier)}`), "Root Board did not reopen Vision after breadcrumb return");
 
+    // A task workspace's Board is now the same operational, physical-stage
+    // projection as the project root's (sub-boards render real workflow
+    // columns instead of the old Ready/Blocked macro buckets), so each step
+    // here is opened the same way "Vision" was above: a real board card
+    // (button.task-card-open), not the old macro-bucket .nested-workspace-item.
     for (const title of ["Program", "Area", "Portfolio", "Release workspace"]) {
       await selectWorkspaceTab("Board");
       const opened = await cdp.evaluate(`(() => {
-        const item = [...document.querySelectorAll(".nested-workspace-item")].find((node) => node.textContent?.includes(${JSON.stringify(title)}));
+        const item = [...document.querySelectorAll("#nested-workspace-panel-board button.task-card-open")].find((node) => node.getAttribute("aria-label")?.includes(${JSON.stringify(title)}));
         if (!(item instanceof HTMLButtonElement)) return false;
         item.click();
         return true;
@@ -601,11 +606,16 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
       await eventually(() => cdp.evaluate(`document.querySelector(".nested-workspace-super-card")?.textContent?.includes(${JSON.stringify(title)})`), `${title} workspace did not open`);
     }
 
+    // The List tab is likewise now the operational IssueListView for a task
+    // workspace, not the old macro-bucket WorkspaceList — its row is a
+    // role="button" div (.issue-list-row), not a <button>, and its explicit
+    // "open details" action is .issue-list-detail rather than the old
+    // .nested-workspace-item-detail.
     await selectWorkspaceTab("List");
     await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-list")?.textContent?.includes("Direct child 02")`), "Release workspace did not list a fixture leaf");
     const leafOpened = await cdp.evaluate(`(() => {
-      const item = [...document.querySelectorAll(".nested-workspace-item")].find((node) => node.textContent?.includes("Direct child 02"));
-      if (!(item instanceof HTMLButtonElement)) return false;
+      const item = [...document.querySelectorAll("#nested-workspace-panel-list .issue-list-row")].find((node) => node.textContent?.includes("Direct child 02"));
+      if (!(item instanceof HTMLElement)) return false;
       item.click();
       return true;
     })()`);
@@ -615,7 +625,7 @@ test("nested workspace reads a deep real hierarchy without mutating it", { timeo
     await eventually(() => cdp.evaluate(`document.querySelector("#nested-workspace-panel-list")?.textContent?.includes("Direct child 02")`), "Back did not restore the release List workspace");
 
     const leafDetail = await cdp.evaluate(`(() => {
-      const button = [...document.querySelectorAll(".nested-workspace-item-detail")].find((node) => node.getAttribute("aria-label")?.endsWith(${JSON.stringify(fixture.direct[1].identifier)}));
+      const button = [...document.querySelectorAll(".issue-list-detail")].find((node) => node.getAttribute("aria-label")?.endsWith(${JSON.stringify(fixture.direct[1].identifier)}));
       if (!(button instanceof HTMLButtonElement)) return false;
       button.click();
       return true;
