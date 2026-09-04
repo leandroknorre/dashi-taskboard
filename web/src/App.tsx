@@ -253,6 +253,8 @@ interface EditorState {
   status: TaskStatus;
   stageId?: string;
   projectId?: string | null;
+  /** Default parent for a new task created from inside a task-owned workspace. */
+  parentId?: string | null;
 }
 
 interface ContextMenuState {
@@ -4603,7 +4605,16 @@ export function App() {
                               dropEnabled={!workflowStage?.legacy}
                               legacy={workflowStage?.legacy}
                               onCreateLabel={persistProjectLabel}
-                              onCreate={(initialStatus, stageId) => setEditor({ task: null, status: initialStatus, stageId })}
+                              onCreate={(initialStatus, stageId) => setEditor({
+                                task: null,
+                                status: initialStatus,
+                                stageId,
+                                // A card created from inside a task-owned workspace is a
+                                // child of that workspace's root, not a new project root.
+                                parentId: activeWorkspaceDescriptor?.kind === "task"
+                                  ? activeWorkspaceDescriptor.root.id
+                                  : null,
+                              })}
                               onEdit={openTaskOrWorkspace}
                               onUpdate={updateTaskProperties}
                               onComplete={(task) => void moveTask(task, "done")}
@@ -5111,6 +5122,7 @@ export function App() {
           referenceTasks={referenceTasks.filter((task) => task.projectId === editorProjectId)}
           initialStatus={editor.status}
           initialStageId={editor.stageId}
+          initialParentId={editor.task ? undefined : editor.parentId}
           initialDraft={editor.task || newTaskDraft?.projectId !== selectedProjectId
             ? null
             : newTaskDraft.draft}

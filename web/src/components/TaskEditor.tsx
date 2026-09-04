@@ -111,6 +111,8 @@ interface TaskEditorProps {
   referenceTasks: Task[];
   initialStatus: TaskStatus;
   initialStageId?: string;
+  /** Default parent for a brand-new task (e.g. the root of the workspace it was created from). Ignored once a draft or the task itself supplies its own parent. */
+  initialParentId?: string | null;
   initialDraft: NewTaskEditorDraft | null;
   labels: string[];
   currentUser: ActorIdentity;
@@ -172,6 +174,7 @@ export function TaskEditor({
   referenceTasks,
   initialStatus,
   initialStageId,
+  initialParentId,
   initialDraft,
   labels: availableLabels,
   currentUser,
@@ -207,7 +210,9 @@ export function TaskEditor({
   const [startDate] = useState(task?.startDate ?? initialDraft?.startDate ?? "");
   const [dueDate, setDueDate] = useState(task?.dueDate ?? initialDraft?.dueDate ?? "");
   const [recurrence, setRecurrence] = useState<Recurrence | null>(task?.recurrence ?? initialDraft?.recurrence ?? null);
-  const [parentId, setParentId] = useState<string | null>(initialDraft?.relations.parentId ?? null);
+  const [parentId, setParentId] = useState<string | null>(
+    initialDraft?.relations.parentId ?? initialParentId ?? null,
+  );
   const [relatedIds, setRelatedIds] = useState<string[]>(initialDraft?.relations.relatedIds ?? []);
   const [subIssueIds, setSubIssueIds] = useState<string[]>(initialDraft?.relations.subIssueIds ?? []);
   const [createMore, setCreateMore] = useState(false);
