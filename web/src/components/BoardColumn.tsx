@@ -47,7 +47,6 @@ interface BoardColumnProps {
   onCreateLabel: (label: string, projectId?: string) => Promise<void>;
   onCreate: (status: TaskStatus, stageId?: string) => void;
   onEdit: (task: Task) => void;
-  onOpenGroup?: (task: Task) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
   onComplete: (task: Task) => void;
   onContextMenu: (task: Task, position: { x: number; y: number }) => void;
@@ -85,7 +84,6 @@ export function BoardColumn({
   onCreateLabel,
   onCreate,
   onEdit,
-  onOpenGroup,
   onUpdate,
   onComplete,
   onContextMenu,
@@ -99,6 +97,9 @@ export function BoardColumn({
   const details = STATUS_DETAILS[status];
   const label = suppliedLabel ?? taskStatusLabel(language, status);
   const [dropBeforeTaskId, setDropBeforeTaskId] = useState<string | null | undefined>();
+  // Defensive: a column's task list must never render the same task id
+  // twice, no matter what upstream grouping/filtering produced it.
+  tasks = [...new Map(tasks.map((task) => [task.id, task])).values()];
   const taskIndexes = new Map(tasks.map((task, index) => [task.id, index]));
   const remainingTasks = tasks.filter((task) => task.id !== draggedTaskId);
   const remainingIndexes = new Map(remainingTasks.map((task, index) => [task.id, index]));
@@ -211,7 +212,6 @@ export function BoardColumn({
               groupBadge={groupBadges?.get(task.id) ?? null}
               onCreateLabel={(label) => onCreateLabel(label, task.projectId)}
               onEdit={onEdit}
-              onOpenGroup={onOpenGroup}
               onUpdate={onUpdate}
               onComplete={onComplete}
               onContextMenu={onContextMenu}

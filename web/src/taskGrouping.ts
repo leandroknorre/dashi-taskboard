@@ -45,6 +45,7 @@ export function groupTasksByParent(
     return chain;
   }
 
+  const visibleTaskIds = new Set(visibleTasks.map((task) => task.id));
   const chainByTaskId = new Map<string, string[]>();
   for (const task of visibleTasks) {
     if (task.relations.parent) chainByTaskId.set(task.id, ancestorChain(task));
@@ -61,6 +62,20 @@ export function groupTasksByParent(
   for (const [taskId, chain] of chainByTaskId) {
     const nearestSharedAncestor = chain.find((ancestorId) => (visibleDescendantCount.get(ancestorId) ?? 0) >= 2);
     groupKeyByTaskId.set(taskId, nearestSharedAncestor ?? chain[0]);
+  }
+
+  // An ancestor that is itself directly visible in this column (a project-root
+  // "theme" card sharing a status/stage with its own descendant, for example)
+  // renders as its own single card below. Using it as a group stand-in too
+  // would render the same task twice — so descendants whose group key
+  // resolves to such an ancestor stay ungrouped instead.
+  const standaloneAncestorIds = new Set(
+    [...groupKeyByTaskId.values()].filter((groupKey) => (
+      visibleTaskIds.has(groupKey) && !groupKeyByTaskId.has(groupKey)
+    )),
+  );
+  for (const [taskId, groupKey] of [...groupKeyByTaskId]) {
+    if (standaloneAncestorIds.has(groupKey)) groupKeyByTaskId.delete(taskId);
   }
 
   const groups = new Map<string, { taskIds: string[]; labels: Set<string> }>();
@@ -104,8 +119,14 @@ export interface ColumnCardsAsTasks {
 /** Flattens grouped column cards back into a plain task list plus a lookup of which tasks stand in for a group. */
 export function columnCardsToTasks(cards: TaskColumnCard[]): ColumnCardsAsTasks {
   const tasks: Task[] = [];
+  const seenTaskIds = new Set<string>();
   const groupBadges = new Map<string, { count: number; labels: string[] }>();
   for (const card of cards) {
+    // Defensive: never render the same task id twice in one column, even if
+    // a future grouping edge case slips a task into more than one card.
+    const cardTaskId = card.kind === "single" ? card.task.id : card.parent.id;
+    if (seenTaskIds.has(cardTaskId)) continue;
+    seenTaskIds.add(cardTaskId);
     if (card.kind === "single") {
       tasks.push(card.task);
     } else {
