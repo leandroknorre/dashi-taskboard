@@ -270,6 +270,75 @@ kbd {
   overflow: hidden;
 }
 
+.eisenhower-matrix {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+  gap: 14px;
+  min-height: 640px;
+}
+
+.eisenhower-quadrant {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--column-header);
+  overflow: hidden;
+}
+
+.eisenhower-quadrant header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.eisenhower-quadrant header h3 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.eisenhower-quadrant-count {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+}
+
+.eisenhower-quadrant-urgente-importante header h3 { color: var(--danger, #c0362c); }
+.eisenhower-quadrant-importante-nao-urgente header h3 { color: var(--accent, #3b6fd6); }
+.eisenhower-quadrant-urgente-nao-importante header h3 { color: var(--warning, #b8860b); }
+
+.eisenhower-quadrant-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  overflow-y: auto;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+  scrollbar-width: thin;
+}
+
+.eisenhower-quadrant-empty {
+  margin: 0;
+  padding: 10px 2px;
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+
+@media (max-width: 900px) {
+  .eisenhower-matrix {
+    grid-template-columns: 1fr;
+    grid-template-rows: none;
+  }
+}
+
 .nested-workspace-breadcrumb {
   display: flex;
   flex-wrap: wrap;

@@ -4,10 +4,11 @@ const WORKSPACE_ROOT_QUERY_PARAM = "workspaceRoot";
 const WORKSPACE_ROOT_EXTRA_QUERY_PARAM = "workspaceExtra";
 const WORKSPACE_DESCENDANTS_QUERY_PARAM = "descendants";
 const GROUP_BY_PARENT_QUERY_PARAM = "agrupar";
+const PRIORIZAR_QUERY_PARAM = "priorizar";
 
 export const WORKSPACE_VIEWS = ["overview", "board", "list", "tree", "mindmap", "timeline"] as const;
 export type WorkspaceView = (typeof WORKSPACE_VIEWS)[number];
-export const WORKSPACE_ROOT_EXTRAS = ["gantt", "docs"] as const;
+export const WORKSPACE_ROOT_EXTRAS = ["gantt", "docs", "matrix"] as const;
 export type WorkspaceRootExtra = (typeof WORKSPACE_ROOT_EXTRAS)[number];
 
 export function readIssueIdentifier(search: string): string | null {
@@ -67,6 +68,18 @@ export function writeGroupByParent(value: boolean | null) {
   const url = new URL(window.location.href);
   if (value === null) url.searchParams.delete(GROUP_BY_PARENT_QUERY_PARAM);
   else url.searchParams.set(GROUP_BY_PARENT_QUERY_PARAM, value ? "1" : "0");
+  window.history.replaceState(window.history.state, "", url);
+}
+
+/** Bookmarkable state for the Board's "Priorizar" (Pareto ordering) toggle. */
+export function readPriorizar(search: string): boolean {
+  return new URLSearchParams(search).get(PRIORIZAR_QUERY_PARAM) === "1";
+}
+
+export function writePriorizar(value: boolean) {
+  const url = new URL(window.location.href);
+  if (value) url.searchParams.set(PRIORIZAR_QUERY_PARAM, "1");
+  else url.searchParams.delete(PRIORIZAR_QUERY_PARAM);
   window.history.replaceState(window.history.state, "", url);
 }
 

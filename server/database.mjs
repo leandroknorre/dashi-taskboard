@@ -18,6 +18,7 @@ import {
   workspaceOverviewFromTask,
 } from "../shared/nested-workspace.mjs";
 import { migrateLocalWorkflowLedger } from "./workflow-ledger.mjs";
+import { PILAR_LABEL_PREFIX } from "./access-scope.mjs";
 import { migrateLocalAutomationRuns } from "./workflow-automation-run-schema.mjs";
 import {
   ensureLocalWorkflowTransitionForProject,
@@ -2480,6 +2481,32 @@ export class TaskboardDatabase {
       activitiesByTask.get(row.id) ?? [],
       previewImagesByTask.get(row.id) ?? null,
     ));
+  }
+
+  /**
+   * The `pilar:<name>` label that governs this task: its own label if it has
+   * one, else the nearest ancestor's (walking the single-parent chain).
+   * Returns `undefined` when the task does not exist, `null` when neither
+   * the task nor any ancestor carries a pilar label.
+   */
+  effectivePilarLabel(id) {
+    let row = this.database.prepare("SELECT id, labels FROM tasks WHERE id = ? OR identifier = ?").get(id, id);
+    if (!row) return undefined;
+    const seen = new Set();
+    while (row && !seen.has(row.id)) {
+      seen.add(row.id);
+      const labels = JSON.parse(row.labels);
+      const pilarLabel = labels.find((label) => label.startsWith(PILAR_LABEL_PREFIX));
+      if (pilarLabel) return pilarLabel.slice(PILAR_LABEL_PREFIX.length);
+      row = this.database.prepare(`
+        SELECT tasks.id, tasks.labels
+        FROM task_relations
+        JOIN tasks ON tasks.id = task_relations.source_task_id
+        WHERE task_relations.relation_type = 'parent'
+          AND task_relations.target_task_id = ?
+      `).get(row.id) ?? null;
+    }
+    return null;
   }
 
   getTask(id) {

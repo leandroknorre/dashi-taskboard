@@ -22,6 +22,15 @@ import { normalizeStageWorkflowDefinition } from "../shared/board-workflow.mjs";
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
 import { normalizeParentRelationMetadata } from "../shared/relation-metadata.mjs";
 import { parseNestedWorkspaceQuery } from "../shared/nested-workspace.mjs";
+import {
+  OWNER_EMAIL_ENV,
+  PILAR_LABEL_PREFIX,
+  USER_SCOPES_ENV,
+  computeUserScope,
+  normalizeOwnerEmail,
+  parseConfiguredUserScopes,
+  scopeAllowsPilar,
+} from "./access-scope.mjs";
 import { AiChatService } from "./ai-chat.mjs";
 import { AutomationRunService } from "./automation-run-service.mjs";
 import { resolveAiWorkspace, resolveMappedAiWorkspace } from "./ai-chat-catalog.mjs";
@@ -2014,6 +2023,10 @@ export function createTaskboardServer(options = {}) {
   const configuredSessionAgents = options.sessionAgents
     ?? parseConfiguredSessionAgents((options.processEnv ?? process.env)[SESSION_AGENT_ENV]);
   const { sessionAgents, sessionAgentActors } = buildSessionAgentRoster(configuredSessionAgents);
+  const scopeEnvironment = options.processEnv ?? process.env;
+  const ownerEmail = normalizeOwnerEmail(options.ownerEmail ?? scopeEnvironment[OWNER_EMAIL_ENV]);
+  const configuredUserScopes = options.userScopes
+    ?? parseConfiguredUserScopes(scopeEnvironment[USER_SCOPES_ENV]);
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath);
   const humanAcceptanceProvider = options.humanAcceptanceProvider ?? null;
@@ -2378,6 +2391,34 @@ export function createTaskboardServer(options = {}) {
     return state;
   }
 
+  /**
+   * Human identities verified by Cloudflare Access (see
+   * `proxyAuthenticatedEmail`) are the only ones ever scoped by pillar;
+   * scripts/agents using `x-taskboard-user-id` are unaffected. An email with
+   * no configured scope, and that isn't TASKBOARD_OWNER_EMAIL, is denied
+   * outright rather than falling back to full access.
+   */
+  function requestUserScope(request) {
+    return computeUserScope(proxyAuthenticatedEmail(request), {
+      ownerEmail,
+      userScopes: configuredUserScopes,
+    });
+  }
+
+  /**
+   * Throws 403 when `scope` is restricted and `taskId` is outside its
+   * allowed pillars. A nonexistent task id is left alone so the caller's own
+   * 404 handling still applies.
+   */
+  function assertTaskPilarInScope(scope, taskId) {
+    if (!scope.restricted) return;
+    const pilar = database.effectivePilarLabel(taskId);
+    if (pilar === undefined) return;
+    if (!scopeAllowsPilar(scope, pilar)) {
+      throw new ApiError(403, "SCOPE_FORBIDDEN", "This task is outside your assigned pillar");
+    }
+  }
+
   const server = createServer(async (request, response) => {
     response.setHeader("x-content-type-options", "nosniff");
     response.setHeader("referrer-policy", "no-referrer");
@@ -2434,6 +2475,10 @@ export function createTaskboardServer(options = {}) {
       }
       const url = new URL(request.url, "http://127.0.0.1");
       const pathname = url.pathname;
+      const scope = requestUserScope(request);
+      if (scope.denied && /^\/api\/(tasks|comments|source-records)(\/|$)/.test(pathname)) {
+        throw new ApiError(403, "SCOPE_UNKNOWN_USER", "This identity has no configured pillar access");
+      }
       const isDevelopmentContextsRoute = /^\/api\/projects\/[^/]+\/development-contexts$/.test(pathname);
       if (
         configuredTrustedRequest
@@ -3234,7 +3279,10 @@ export function createTaskboardServer(options = {}) {
         if (request.method === "GET") {
           const filters = parseTaskFilters(url.searchParams);
           if (!filters.projectId || filters.projectId === JIRA_PROJECT_ID) await jira.sync();
-          return sendJson(response, 200, { tasks: database.listTasks(filters) });
+          const tasks = database.listTasks(filters).filter((task) => (
+            scopeAllowsPilar(scope, database.effectivePilarLabel(task.id) ?? null)
+          ));
+          return sendJson(response, 200, { tasks });
         }
         if (request.method === "POST") {
           const actor = actorFromRequest(request);
@@ -3246,6 +3294,13 @@ export function createTaskboardServer(options = {}) {
               "JIRA_CREATE_UNAVAILABLE",
               "请在 Jira 中新建议题，Taskboard 当前只同步已分配给你的任务",
             );
+          }
+          if (scope.restricted) {
+            const pilarLabel = input.labels.find((label) => label.startsWith(PILAR_LABEL_PREFIX));
+            const pilar = pilarLabel ? pilarLabel.slice(PILAR_LABEL_PREFIX.length) : null;
+            if (pilar !== null && !scopeAllowsPilar(scope, pilar)) {
+              throw new ApiError(403, "SCOPE_FORBIDDEN", "Cannot create a task labeled with a pillar outside your access");
+            }
           }
           const task = database.createTask({
             ...input,
@@ -3265,6 +3320,21 @@ export function createTaskboardServer(options = {}) {
         }
         events.connect(request, response);
         return;
+      }
+
+      // Every /api/tasks/:id... sub-route (this task itself, its comments,
+      // relations, activities, tree, rollup, workspace, automation runs)
+      // shares this prefix, so one check here covers all of them; the
+      // relations route additionally checks its second (related) task id.
+      const scopedSingleTaskRoute = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/|$)/);
+      if (scopedSingleTaskRoute && scope.restricted) {
+        let scopedTaskId;
+        try {
+          scopedTaskId = decodeURIComponent(scopedSingleTaskRoute[1]);
+        } catch {
+          scopedTaskId = null;
+        }
+        if (scopedTaskId) assertTaskPilarInScope(scope, scopedTaskId);
       }
 
       const taskRelationRoute = pathname.match(
@@ -3292,6 +3362,11 @@ export function createTaskboardServer(options = {}) {
         if ([...url.searchParams.keys()].length > 0) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Issue relation routes do not accept query parameters");
         }
+        // taskId was already checked by the generic scoped-route guard
+        // above; the related task on the other end of the relation (e.g.
+        // the candidate new parent) needs its own check so a card can't be
+        // relinked across a pillar boundary.
+        assertTaskPilarInScope(scope, relatedTaskId);
         const relationType = parseIssueRelationType(type);
         if (request.method === "POST") {
           const { version, threadId, threadBinding, origin, metadata } = resolveInputThreadBinding(
@@ -3418,6 +3493,10 @@ export function createTaskboardServer(options = {}) {
         if ([...url.searchParams.keys()].length > 0) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Comment routes do not accept query parameters");
         }
+        if (scope.restricted) {
+          const commentTaskId = database.getComment(id)?.taskId;
+          if (commentTaskId) assertTaskPilarInScope(scope, commentTaskId);
+        }
         if (request.method === "PATCH") {
           const patch = resolveInputThreadBinding(parseCommentPatch(await readJson(request)));
           const comment = database.updateComment(
@@ -3458,6 +3537,10 @@ export function createTaskboardServer(options = {}) {
         }
         if (commentId.length === 0 || commentId.length > 128) {
           throw new ApiError(400, "INVALID_PATH", "Comment id is invalid");
+        }
+        if (scope.restricted) {
+          const commentTaskId = database.getComment(commentId)?.taskId;
+          if (commentTaskId) assertTaskPilarInScope(scope, commentTaskId);
         }
         if (request.method === "GET") {
           const after = parseAfterCursor(url.searchParams, "Attachment routes");

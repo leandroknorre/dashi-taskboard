@@ -71,6 +71,7 @@ import {
   type BoardDisplaySettings,
 } from "./components/BoardCardDisplayMenu";
 import { DashboardView } from "./components/DashboardView";
+import { EisenhowerMatrix } from "./components/EisenhowerMatrix";
 import { ProjectReadmeView } from "./components/ProjectReadmeView";
 import { IssueListView } from "./components/IssueListView";
 import { NestedWorkspaceView } from "./components/NestedWorkspaceView";
@@ -113,17 +114,20 @@ import {
   buildWorkspaceUrl,
   readGroupByParent,
   readIssueIdentifier,
+  readPriorizar,
   readWorkspaceDescendants,
   readWorkspaceIdentifier,
   readWorkspaceRootExtra,
   readWorkspaceRootProjectId,
   readWorkspaceView,
   writeGroupByParent,
+  writePriorizar,
   writeWorkspaceDescendants,
   type WorkspaceRootExtra,
   type WorkspaceView,
 } from "./issueRoute";
 import { columnCardsToTasks, groupTasksByParent } from "./taskGrouping";
+import { prioritizeTasks } from "./taskPriority";
 import {
   getTaskboardI18n,
   resolveTaskboardLanguage,
@@ -827,6 +831,9 @@ export function App() {
   const [groupByParentPreference, setGroupByParentPreference] = useState<boolean | null>(
     () => readGroupByParent(window.location.search),
   );
+  // "Priorizar" reorders each Board column (Pareto): impreterivel, then top20,
+  // then rapido-facil, then everything else, as a cascade of label presence.
+  const [priorizar, setPriorizar] = useState<boolean>(() => readPriorizar(window.location.search));
   const [nestedWorkspaceLoad, setNestedWorkspaceLoad] = useState<NestedWorkspaceLoad>(
     EMPTY_NESTED_WORKSPACE_LOAD,
   );
@@ -2004,6 +2011,10 @@ export function App() {
   }, [groupByParentPreference]);
 
   useEffect(() => {
+    writePriorizar(priorizar);
+  }, [priorizar]);
+
+  useEffect(() => {
     tasksRef.current = tasks;
   }, [tasks]);
 
@@ -2707,11 +2718,15 @@ export function App() {
     const byColumnKey = new Map<string, ReturnType<typeof columnCardsToTasks>>();
     const keys = new Set(activeWorkspaceBoardTasks.map((task) => rootBoardColumnKey(task)));
     for (const key of keys) {
-      const columnTasks = activeWorkspaceBoardTasks.filter((task) => rootBoardColumnKey(task) === key);
+      let columnTasks = activeWorkspaceBoardTasks.filter((task) => rootBoardColumnKey(task) === key);
+      // Sorting before grouping orders the children within each group too;
+      // which real ancestor stands in as a group's badge is structural
+      // (nearest shared ancestor), so it never changes with this order.
+      if (priorizar) columnTasks = prioritizeTasks(columnTasks);
       byColumnKey.set(key, columnCardsToTasks(groupTasksByParent(columnTasks, tasksById, GROUP_BY_PARENT_THRESHOLD)));
     }
     return byColumnKey;
-  }, [groupByParent, activeWorkspaceBoardTasks, tasksById]);
+  }, [groupByParent, activeWorkspaceBoardTasks, tasksById, priorizar]);
 
   useEffect(() => {
     if (!otherTasksAvailable) {
@@ -4037,6 +4052,16 @@ export function App() {
           {text("按父级分组", "Group by parent")}
         </label>
       )}
+      {workspaceView === "board" && (
+        <label className="nested-workspace-descendants-toggle">
+          <input
+            type="checkbox"
+            checked={priorizar}
+            onChange={(event) => setPriorizar(event.target.checked)}
+          />
+          {text("按优先级排序", "Priorizar")}
+        </label>
+      )}
     </>
   );
 
@@ -4460,6 +4485,7 @@ export function App() {
               labelFilter={filters.labels}
               projectExtras={activeWorkspaceDescriptor.kind === "project" ? [
                 { id: "gantt", label: "Gantt" },
+                { id: "matrix", label: text("矩阵", "Matriz") },
                 { id: "docs", label: text("项目文档", "Project Docs") },
               ] : undefined}
               activeProjectExtra={workspaceRootExtra}
@@ -4484,7 +4510,24 @@ export function App() {
                       onUpdate={updateTaskProperties}
                     />
                   </Suspense>
-                ) : selectedProject ? (
+                ) : workspaceRootExtra === "matrix" ? (
+                  <EisenhowerMatrix
+                    tasks={activeWorkspaceBoardTasks}
+                    presentations={taskPresentations}
+                    now={processingNow}
+                    availableLabels={availableLabels}
+                    currentUser={currentUser}
+                    showCover={boardDisplaySettings.cover}
+                    showBody={boardDisplaySettings.body}
+                    contextMenuTaskId={contextMenu?.taskId ?? null}
+                    onCreateLabel={persistProjectLabel}
+                    onEdit={openTaskOrWorkspace}
+                    onUpdate={updateTaskProperties}
+                    onComplete={(task) => void moveTask(task, "done")}
+                    onContextMenu={openTaskContextMenu}
+                    onOpenConversation={openTaskConversation}
+                  />
+                ) : workspaceRootExtra === "docs" && selectedProject ? (
                   <ProjectReadmeView
                     key={selectedProjectId}
                     project={selectedProject}
@@ -4524,9 +4567,10 @@ export function App() {
                         {mainBoardItems.map((item) => {
                           const workflowStage = workflowBoardStages.find((stage) => stage.stageId === item);
                           const columnKey = workflowStage?.stageId ?? item;
-                          const ungroupedColumnTasks = workflowStage
+                          const rawColumnTasks = workflowStage
                             ? activeWorkspaceBoardTasks.filter((task) => task.stageId === workflowStage.stageId)
                             : activeWorkspaceBoardTasks.filter((task) => task.status === item);
+                          const ungroupedColumnTasks = priorizar ? prioritizeTasks(rawColumnTasks) : rawColumnTasks;
                           const groupedColumn = groupedBoardColumns?.get(columnKey);
                           return (
                             <BoardColumn
