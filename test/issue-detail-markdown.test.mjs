@@ -37,7 +37,7 @@ test("issue detail renders descriptions and comments with GFM markdown", () => {
   );
   assert.match(
     detailSource,
-    /comment\.body && \(\s*<div className="comment-body">\s*<DescriptionDocument\s*value=\{comment\.body\}\s*referenceTasks=\{referenceTasks\}\s*onOpenTask=\{onOpenTask\}\s*\/>\s*<\/div>\s*\)/s,
+    /comment\.body && \(\s*<div\s+className="comment-body"[^>]*>\s*<DescriptionDocument\s*value=\{comment\.body\}\s*referenceTasks=\{referenceTasks\}\s*onOpenTask=\{onOpenTask\}\s*\/>\s*<\/div>\s*\)/s,
   );
   assert.doesNotMatch(detailSource, /value\.split\("\\n"\)/);
 });
